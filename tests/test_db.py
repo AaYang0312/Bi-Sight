@@ -547,5 +547,286 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(requests[0]["asVersion"], "2")
 
 
+
+
+# ---------------------------------------------------------------------------
+# 任务5合成数据集（人工答案基准，无PII），供指标测试与验收脚本共用
+# ---------------------------------------------------------------------------
+
+FROZEN_NOW = datetime(2026, 9, 8, 9, 0, tzinfo=BEIJING)
+FROZEN_CUTOFF = datetime(2026, 9, 8, 0, 0, tzinfo=BEIJING)
+COVERAGE_START = datetime(2026, 8, 25, 0, 0, tzinfo=BEIJING)
+COVERAGE_END = datetime(2026, 9, 8, 0, 0, tzinfo=BEIJING)
+
+
+def seed_business_case(conn) -> None:
+    """冻结时刻2026-09-08 09:00+08；覆盖2026-08-25至2026-09-08；金额均为元。"""
+    conn.execute(
+        "INSERT INTO bi.shops(shop_id, platform, display_name) VALUES "
+        "('S1','fxg','店铺A'), ('S2','fxg','店铺B') "
+        "ON CONFLICT (shop_id) DO NOTHING")
+
+    def pay_time(day: int, hour: int) -> datetime:
+        return datetime(2026, 9, day, hour, tzinfo=BEIJING)
+
+    def aug(day: int, hour: int) -> datetime:
+        return datetime(2026, 8, day, hour, tzinfo=BEIJING)
+
+    trades = [
+        # C0 08-31 500：A 1件500
+        {"sid": "E0", "userId": "S1", "tid": "C0", "payAmount": "500.00",
+         "payTime": _ms(aug(31, 12)), "updTime": _ms(aug(31, 13)),
+         "orders": [{"oid": "E0-1", "tid": "C0", "itemSysId": "P_A", "num": "1",
+                      "payAmount": "500.00"}]},
+        # C1 09-01 300：A 2件200 + B 1件100
+        {"sid": "E1", "userId": "S1", "tid": "C1", "payAmount": "300.00",
+         "payTime": _ms(pay_time(1, 10)), "updTime": _ms(pay_time(1, 11)),
+         "orders": [{"oid": "E1-1", "tid": "C1", "itemSysId": "P_A", "num": "2",
+                      "payAmount": "200.00"},
+                     {"oid": "E1-2", "tid": "C1", "itemSysId": "P_B", "num": "1",
+                      "payAmount": "100.00"}]},
+        # C2 09-01 200：A 2件200
+        {"sid": "E2", "userId": "S1", "tid": "C2", "payAmount": "200.00",
+         "payTime": _ms(pay_time(1, 15)), "updTime": _ms(pay_time(1, 16)),
+         "orders": [{"oid": "E2-1", "tid": "C2", "itemSysId": "P_A", "num": "2",
+                      "payAmount": "200.00"}]},
+        # C3 09-02 100：拆为E3/E4
+        {"sid": "E3", "userId": "S1", "tid": "C3", "payAmount": "40.00",
+         "payTime": _ms(pay_time(2, 11)), "updTime": _ms(pay_time(2, 12)),
+         "orders": [{"oid": "E3-1", "tid": "C3", "itemSysId": "P_A", "num": "1",
+                      "payAmount": "40.00"}]},
+        {"sid": "E4", "userId": "S1", "tid": "C3", "payAmount": "60.00",
+         "payTime": _ms(pay_time(2, 11)), "updTime": _ms(pay_time(2, 12)),
+         "orders": [{"oid": "E4-1", "tid": "C3", "itemSysId": "P_B", "num": "1",
+                      "payAmount": "60.00"}]},
+        # C4/C5 09-03：合入E5
+        {"sid": "E5", "userId": "S1", "tid": "C4", "tids": "C4,C5",
+         "payAmount": "200.00", "payTime": _ms(pay_time(3, 9)),
+         "updTime": _ms(pay_time(3, 10)),
+         "orders": [{"oid": "E5-1", "tid": "C4", "itemSysId": "P_A", "num": "1",
+                      "payAmount": "80.00"},
+                     {"oid": "E5-2", "tid": "C5", "itemSysId": "P_B", "num": "1",
+                      "payAmount": "120.00"}]},
+        # C6 09-05 200：A 1件80 + B 1件120
+        {"sid": "E6", "userId": "S1", "tid": "C6", "payAmount": "200.00",
+         "payTime": _ms(pay_time(5, 20)), "updTime": _ms(pay_time(5, 21)),
+         "orders": [{"oid": "E6-1", "tid": "C6", "itemSysId": "P_A", "num": "1",
+                      "payAmount": "80.00"},
+                     {"oid": "E6-2", "tid": "C6", "itemSysId": "P_B", "num": "1",
+                      "payAmount": "120.00"}]},
+    ]
+    from bi_agent.sync import apply_trade, normalise_trade
+
+    for raw in trades:
+        trade = normalise_trade(raw)
+        assert trade["normalization_status"] == "normal", raw
+        assert apply_trade(conn, trade, batch_id="seed")
+
+    from bi_agent.sync import apply_aftersale, normalise_aftersale
+
+    def refund(aid: str, tid: str | None, refund_id: str, amount: str,
+               complete: datetime | None, online_status: int, status: int,
+               modified: datetime) -> None:
+        raw = {"aftersaleId": aid, "userId": "S1", "rawRefundMoney": amount,
+               "onlineStatus": online_status, "status": status, "modified": _ms(modified)}
+        if tid:
+            raw["tid"] = tid
+        if refund_id:
+            raw["refundId"] = refund_id
+        if complete is not None:
+            raw["platformCompleteTime"] = _ms(complete)
+        record = normalise_aftersale(raw)
+        assert apply_aftersale(conn, record, batch_id="seed")
+
+    refund("R1", "C1", "PR1", "30.00", pay_time(2, 8), 7, 9, pay_time(2, 8))
+    refund("R2", "C1", "PR2", "20.00", pay_time(4, 8), 7, 9, pay_time(4, 8))
+    refund("R3", "C0", "PR3", "50.00", pay_time(3, 8), 7, 9, pay_time(3, 8))
+    # R4 09-09超过本次截止，不能计入
+    refund("R4", "C2", "PR4", "40.00",
+           datetime(2026, 9, 9, 8, tzinfo=BEIJING), 7, 9,
+           datetime(2026, 9, 9, 8, tzinfo=BEIJING))
+    # R5 待处理退款10；R6 工单已解决但线上退款关闭20：均不计
+    refund("R5", "C3", "PR5", "10.00", None, 2, 2, pay_time(5, 8))
+    refund("R6", "C2", "PR6", "20.00", None, 6, 9, pay_time(6, 8))
+
+    for entity, source in (("orders", "erp.trade.list.query"),
+                           ("aftersales_occurrence", "erp.aftersale.list.query"),
+                           ("aftersales_cohort", "erp.aftersale.list.query")):
+        conn.execute(
+            "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered, "
+            "data_as_of, quality_ok) VALUES (%s, %s, 'S1', %s, "
+            "tstzmultirange(tstzrange(%s, %s, '[)')), %s, true) "
+            "ON CONFLICT (source, entity, shop_id) DO UPDATE SET covered = "
+            "EXCLUDED.covered, data_as_of = EXCLUDED.data_as_of, quality_ok = true",
+            (source, entity, COVERAGE_END, COVERAGE_START, COVERAGE_END, FROZEN_CUTOFF))
+
+
+class MetricsTests(unittest.TestCase):
+    """5.2/5.6：人工金额断言与业务风险检查，reader角色只读执行。"""
+
+    def setUp(self):
+        if not os.getenv("BI_TEST_ADMIN_DSN"):
+            self.skipTest("未配置独立测试数据库")
+        self.conn = psycopg.connect(os.environ["BI_TEST_ADMIN_DSN"])
+        if not self.conn.info.dbname.endswith("_test"):
+            self.fail(f"测试必须连接 *_test 数据库，实际 {self.conn.info.dbname}")
+        seed_business_case(self.conn)
+        self.conn.execute("SET LOCAL ROLE bi_reader")
+
+    def tearDown(self):
+        self.conn.rollback()
+        self.conn.close()
+
+    def _query(self, **overrides):
+        import time as time_module
+
+        from bi_agent.metrics import QueryRequest, query_business
+
+        defaults = dict(start="2026-09-01", end="2026-09-08", shop_ids=["S1"],
+                        metrics=["paid_amount"])
+        defaults.update(overrides)
+        request = QueryRequest(**defaults)
+        return query_business(self.conn, request, allowed_shop_ids=frozenset({"S1"}),
+                              now=FROZEN_NOW, deadline=time_module.monotonic() + 30)
+
+    def test_period_totals_match_manual_answers(self):
+        result = self._query(metrics=["paid_amount", "paid_orders", "refund_amount",
+                                      "cash_difference", "cohort_refund_rate"])
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(result.coverage.status, "complete")
+        row = result.data[0]
+        self.assertEqual(Decimal(row["paid_amount"]), Decimal("1000"))
+        self.assertEqual(row["paid_orders"], 6)
+        self.assertEqual(Decimal(row["refund_amount"]), Decimal("100"))
+        self.assertEqual(Decimal(row["cash_difference"]), Decimal("900"))
+        self.assertEqual(Decimal(row["cohort_refund_rate"]), Decimal("0.05"))
+        self.assertEqual(result.data_as_of, FROZEN_CUTOFF)
+
+    def test_aov_uses_commercial_orders(self):
+        result = self._query(metrics=["paid_amount", "paid_orders", "aov"])
+        row = result.data[0]
+        self.assertEqual(Decimal(row["aov"]), (Decimal("1000") / Decimal("6")))
+        # ERP单据数同样是6（E1..E6），不能以此替代商业单分母检验
+        self.assertNotIn("erp_documents", row)
+
+    def test_sep02_granularity_distinct(self):
+        """09-02单独看：ERP单2、商业单1，证明没有混淆粒度。"""
+        result = self._query(start="2026-09-02", end="2026-09-03",
+                             metrics=["paid_amount", "paid_orders", "erp_documents"],
+                             group_by="day")
+        row = result.data[0]
+        self.assertEqual(Decimal(row["paid_amount"]), Decimal("100"))
+        self.assertEqual(row["paid_orders"], 1)
+        self.assertEqual(row["erp_documents"], 2)
+
+    def test_day_trend_zero_fills_only_covered_days(self):
+        result = self._query(metrics=["paid_amount"], group_by="day")
+        self.assertEqual(result.status, "ok", result.limitations)
+        by_day = {row["day"]: Decimal(row["paid_amount"]) for row in result.data}
+        expected = {"2026-09-01": "500", "2026-09-02": "100", "2026-09-03": "200",
+                    "2026-09-04": "0", "2026-09-05": "200", "2026-09-06": "0",
+                    "2026-09-07": "0"}
+        self.assertEqual(len(result.data), 7)
+        for day, value in expected.items():
+            self.assertEqual(by_day[day], Decimal(value))
+
+    def test_product_ranking(self):
+        result = self._query(metrics=["product_paid_amount", "quantity"],
+                             group_by="product", top_n=2)
+        self.assertEqual(result.status, "ok", result.limitations)
+        rows = {row["product_id"]: row for row in result.data}
+        self.assertEqual(Decimal(rows["P_A"]["product_paid_amount"]), Decimal("600"))
+        self.assertEqual(Decimal(rows["P_A"]["quantity"]), Decimal("7"))
+        self.assertEqual(Decimal(rows["P_B"]["product_paid_amount"]), Decimal("400"))
+        self.assertEqual(Decimal(rows["P_B"]["quantity"]), Decimal("4"))
+        self.assertTrue(all(row["allocation_verified"] == 1 for row in rows.values()))
+
+    def test_compare_previous_period(self):
+        result = self._query(metrics=["paid_amount"], compare="previous_period")
+        row = result.data[0]
+        self.assertEqual(Decimal(row["paid_amount"]), Decimal("1000"))
+        self.assertEqual(Decimal(row["paid_amount_previous"]), Decimal("500"))
+        self.assertEqual(Decimal(row["paid_amount_change"]), Decimal("500"))
+        self.assertEqual(Decimal(row["paid_amount_change_ratio"]), Decimal("1"))
+
+    def test_cross_period_refund_and_partial_refunds_counted(self):
+        """R3跨期退款计入期间退款发生；C1两次部分退款都计入。"""
+        result = self._query(metrics=["refund_amount"])
+        self.assertEqual(Decimal(result.data[0]["refund_amount"]), Decimal("100"))
+
+    def test_refund_after_cutoff_excluded(self):
+        """R4于09-09退款：窗口与截止都不含。"""
+        result = self._query(start="2026-09-01", end="2026-09-10",
+                             metrics=["refund_amount"])
+        self.assertEqual(result.status, "missing_data")
+
+    def test_pending_and_closed_refunds_not_counted(self):
+        result = self._query(metrics=["refund_amount", "cash_difference"])
+        self.assertEqual(Decimal(result.data[0]["refund_amount"]), Decimal("100"))
+
+    def test_unmatched_refund_degrades_to_missing_data(self):
+        """另加一条未匹配成功退款：退款归属未确认，返回缺数据并显示数量。"""
+        from bi_agent.sync import apply_aftersale, normalise_aftersale
+
+        self.conn.execute("RESET ROLE")
+        record = normalise_aftersale({
+            "aftersaleId": "R7", "userId": "S1", "refundId": "PR7",
+            "rawRefundMoney": "25.00", "onlineStatus": 7, "status": 9,
+            "platformCompleteTime": _ms(datetime(2026, 9, 5, 8, tzinfo=BEIJING)),
+            "modified": _ms(datetime(2026, 9, 5, 8, tzinfo=BEIJING)),
+        })
+        self.assertTrue(apply_aftersale(self.conn, record, batch_id="seed2"))
+        self.conn.execute("SET LOCAL ROLE bi_reader")
+        result = self._query(metrics=["refund_amount", "cohort_refund_rate"])
+        self.assertEqual(result.status, "missing_data")
+        self.assertTrue(any("未匹配" in item for item in result.limitations))
+        # 纯支付指标不受影响
+        paid = self._query(metrics=["paid_amount"])
+        self.assertEqual(paid.status, "ok")
+        self.assertEqual(Decimal(paid.data[0]["paid_amount"]), Decimal("1000"))
+
+    def test_unauthorized_shop_forbidden(self):
+        result = self._query(shop_ids=["S1", "S2"], metrics=["paid_amount"])
+        self.assertEqual(result.status, "forbidden")
+
+    def test_injection_style_shop_id_rejected(self):
+        result = self._query(shop_ids=["S1; DROP TABLE bi.orders; --"],
+                             metrics=["paid_amount"])
+        self.assertEqual(result.status, "forbidden")
+        self.conn.execute("RESET ROLE")
+        remaining = self.conn.execute(
+            "SELECT count(*) FROM bi.orders").fetchone()[0]
+        self.assertGreater(remaining, 0)
+
+    def test_true_zero_vs_missing_day(self):
+        """09-04覆盖完整且无支付：真实0；超出覆盖的日期：missing_data。"""
+        covered = self._query(start="2026-09-04", end="2026-09-05",
+                              metrics=["paid_amount"], group_by="day")
+        self.assertEqual(covered.status, "ok")
+        self.assertEqual(Decimal(covered.data[0]["paid_amount"]), Decimal("0"))
+        beyond = self._query(start="2026-09-09", end="2026-09-10",
+                             metrics=["paid_amount"])
+        self.assertEqual(beyond.status, "missing_data")
+        self.assertEqual(beyond.coverage.status, "missing")
+
+    def test_zero_denominator_not_computable(self):
+        result = self._query(start="2026-09-06", end="2026-09-07",
+                             metrics=["aov", "cohort_refund_rate"])
+        self.assertEqual(result.status, "ok")
+        self.assertIsNone(result.data[0]["aov"])
+        self.assertIsNone(result.data[0]["cohort_refund_rate"])
+        self.assertTrue(any("不可计算" in item for item in result.limitations))
+
+    def test_fan_out_guard_amounts_not_inflated(self):
+        """多商品行+多笔退款+同日多单：各自聚合，金额不被连接放大。"""
+        result = self._query(metrics=["paid_amount", "paid_orders", "refund_amount",
+                                      "cohort_refund_rate", "erp_documents"])
+        row = result.data[0]
+        self.assertEqual(Decimal(row["paid_amount"]), Decimal("1000"))
+        self.assertEqual(row["paid_orders"], 6)
+        self.assertEqual(Decimal(row["refund_amount"]), Decimal("100"))
+        self.assertEqual(row["erp_documents"], 6)
+
+
 if __name__ == "__main__":
     unittest.main()

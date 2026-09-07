@@ -183,6 +183,51 @@ CREATE OR REPLACE VIEW reporting.v_shops AS
 SELECT shop_id, platform, display_name, currency, enabled, capabilities
 FROM bi.shops;
 
+-- 日聚合：金额事实分开聚合后再连接；先覆盖/质量检查，再允许缺交易日补0
+CREATE OR REPLACE VIEW reporting.v_shop_daily AS
+WITH payments AS (
+  SELECT shop_id, (paid_at AT TIME ZONE 'Asia/Shanghai')::date AS day,
+         currency, sum(amount) AS paid_amount, count(*) AS paid_orders
+  FROM bi.order_payments WHERE verified
+  GROUP BY shop_id, day, currency
+), documents AS (
+  SELECT shop_id, (paid_at AT TIME ZONE 'Asia/Shanghai')::date AS day,
+         count(*) AS erp_documents
+  FROM bi.orders WHERE active AND paid_at IS NOT NULL
+  GROUP BY shop_id, day
+), refunds AS (
+  SELECT shop_id, (platform_completed_at AT TIME ZONE 'Asia/Shanghai')::date AS day,
+         sum(raw_platform_amount) AS refund_amount
+  FROM bi.aftersales WHERE platform_success AND refund_canonical
+  GROUP BY shop_id, day
+)
+SELECT coalesce(p.shop_id, d.shop_id, r.shop_id) AS shop_id,
+       coalesce(p.day, d.day, r.day) AS day,
+       coalesce(p.currency, 'CNY') AS currency,
+       coalesce(p.paid_amount, 0) AS paid_amount,
+       coalesce(p.paid_orders, 0) AS paid_orders,
+       coalesce(d.erp_documents, 0) AS erp_documents,
+       coalesce(r.refund_amount, 0) AS refund_amount,
+       coalesce(p.paid_amount, 0) - coalesce(r.refund_amount, 0) AS cash_difference
+FROM payments p
+FULL JOIN documents d ON p.shop_id = d.shop_id AND p.day = d.day
+FULL JOIN refunds r ON coalesce(p.shop_id, d.shop_id) = r.shop_id
+                   AND coalesce(p.day, d.day) = r.day;
+
+-- 商品日聚合：仅有效销售父行及已核验的行金额；赠品数量区分展示
+CREATE OR REPLACE VIEW reporting.v_product_daily AS
+SELECT shop_id,
+       (paid_at AT TIME ZONE 'Asia/Shanghai')::date AS day,
+       product_id,
+       sum(quantity) AS quantity,
+       sum(gift_quantity) AS gift_quantity,
+       sum(allocated_paid_amount) AS product_paid_amount,
+       bool_and(allocation_verified) AS allocation_verified
+FROM bi.order_items
+WHERE active AND line_kind = 'sale' AND product_id IS NOT NULL
+  AND allocated_paid_amount IS NOT NULL
+GROUP BY shop_id, day, product_id;
+
 -- ---------------------------------------------------------------------------
 -- 权限：bi_sync 事实表读写，不能建表/角色；bi_reader 仅 reporting 指定视图
 -- ---------------------------------------------------------------------------
@@ -191,4 +236,5 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA bi TO bi_sync;
 
 GRANT USAGE ON SCHEMA reporting TO bi_reader;
 GRANT SELECT ON reporting.v_payments, reporting.v_refunds,
-                reporting.v_coverage, reporting.v_shops TO bi_reader;
+                reporting.v_coverage, reporting.v_shops,
+                reporting.v_shop_daily, reporting.v_product_daily TO bi_reader;

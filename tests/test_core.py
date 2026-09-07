@@ -5,7 +5,7 @@ import hmac
 import json
 import logging
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
@@ -200,6 +200,63 @@ class KuaimaiPageTests(unittest.TestCase):
         self.assertEqual(page.rows[0]["sid"], "E1")
         self.assertFalse(page.verified_empty)
         self.assertIs(page.has_next, False)
+
+
+class MetricInputTests(unittest.TestCase):
+    def test_date_defaults_and_bounds(self):
+        from bi_agent.metrics import QueryRequest, resolve_period
+
+        now = datetime(2026, 9, 8, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.assertEqual(resolve_period("最近7天", now=now),
+                         (date(2026, 9, 1), date(2026, 9, 8)))
+        with self.assertRaises(ValueError):
+            QueryRequest(start="2025-01-01", end="2026-09-08", shop_ids=["S1"],
+                         metrics=["paid_amount"])
+
+    def test_same_bounds_rejected(self):
+        from bi_agent.metrics import QueryRequest
+
+        with self.assertRaises(ValueError):
+            QueryRequest(start="2026-09-01", end="2026-09-01", shop_ids=["S1"],
+                         metrics=["paid_amount"])
+
+    def test_unknown_metric_rejected(self):
+        from bi_agent.metrics import QueryRequest
+
+        with self.assertRaises(ValueError):
+            QueryRequest(start="2026-09-01", end="2026-09-08", shop_ids=["S1"],
+                         metrics=["widget_refund_rate"])
+
+    def test_non_cny_rejected(self):
+        from bi_agent.metrics import QueryRequest
+
+        with self.assertRaises(ValueError):
+            QueryRequest(start="2026-09-01", end="2026-09-08", shop_ids=["S1"],
+                         metrics=["paid_amount"], currency="USD")
+
+    def test_product_group_rejects_non_product_metrics(self):
+        from bi_agent.metrics import QueryRequest
+
+        with self.assertRaises(ValueError):
+            QueryRequest(start="2026-09-01", end="2026-09-08", shop_ids=["S1"],
+                         metrics=["paid_amount"], group_by="product")
+        request = QueryRequest(start="2026-09-01", end="2026-09-08", shop_ids=["S1"],
+                               metrics=["quantity"], group_by="product")
+        self.assertEqual(request.group_by, "product")
+
+    def test_spoken_dates(self):
+        from bi_agent.metrics import resolve_period
+
+        now = datetime(2026, 9, 8, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.assertEqual(resolve_period("9月1日至7日支付金额", now=now),
+                         (date(2026, 9, 1), date(2026, 9, 8)))
+        self.assertEqual(resolve_period("2026-09-01的支付额", now=now),
+                         (date(2026, 9, 1), date(2026, 9, 2)))
+        self.assertEqual(resolve_period("那上个月呢", now=now),
+                         (date(2026, 8, 1), date(2026, 9, 1)))
+        self.assertEqual(resolve_period("今天的支付额", now=now),
+                         (date(2026, 9, 8), date(2026, 9, 9)))
+        self.assertIsNone(resolve_period("照上次那样", now=now))
 
 
 if __name__ == "__main__":

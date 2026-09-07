@@ -1,0 +1,624 @@
+"""查询模型、结果模型、覆盖校验、固定SQL及指标口径。
+
+没有自由SQL：指标、维度和比较映射到服务端固定模板；
+权限店铺来自部署配置；SQL超时与行数受限。
+"""
+
+from __future__ import annotations
+
+import time
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+from typing import Literal
+
+import psycopg
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from zoneinfo import ZoneInfo
+
+BEIJING = ZoneInfo("Asia/Shanghai")
+MAX_SPAN_DAYS = 366
+MAX_ROWS = 500
+PRODUCT_METRICS = {"quantity", "product_paid_amount"}
+PERIOD_METRICS = {
+    "paid_amount", "paid_orders", "erp_documents", "aov",
+    "refund_amount", "cash_difference", "cohort_refund_rate",
+}
+
+Metric = Literal["paid_amount", "paid_orders", "erp_documents", "aov",
+                 "refund_amount", "cash_difference", "cohort_refund_rate",
+                 "quantity", "product_paid_amount"]
+
+METRIC_DEFINITIONS: dict[str, str] = {
+    "paid_amount": "已验证商业订单支付金额之和（人民币，按支付时间归属，[start,end)）",
+    "paid_orders": "已验证商业订单数（一行对应一次支付事实）",
+    "erp_documents": "ERP单据数（拆合单粒度，仅作对账参考，不作客单价分母）",
+    "aov": "客单价=支付金额/商业订单数（总口径，不平均每日客单价）",
+    "refund_amount": "平台退款成功发生额（按平台完成时间归属；系统实退口径未发布）",
+    "cash_difference": "期间收支差额=支付金额-期间退款发生额（不是净利润，也不是同批净收入）",
+    "cohort_refund_rate": "同批退款率=[start,end)支付商业单在明确截止时刻前的累计退款/同批支付额",
+    "quantity": "有效销售父行商品数量（赠品数量单独区分，不混入销量）",
+    "product_paid_amount": "已核验行级分摊的商品支付金额",
+}
+
+ENTITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "paid_amount": ("orders",),
+    "paid_orders": ("orders",),
+    "erp_documents": ("orders",),
+    "aov": ("orders",),
+    "quantity": ("orders",),
+    "product_paid_amount": ("orders",),
+    "refund_amount": ("orders", "aftersales_occurrence"),
+    "cash_difference": ("orders", "aftersales_occurrence"),
+    "cohort_refund_rate": ("orders", "aftersales_cohort"),
+}
+
+# 同一覆盖来源名：同步状态按数据来源记录
+_ENTITY_SOURCES = {
+    "orders": "erp.trade.list.query",
+    "aftersales_occurrence": "erp.aftersale.list.query",
+    "aftersales_cohort": "erp.aftersale.list.query",
+}
+
+
+class QueryRequest(BaseModel):
+    """唯一查询入口；keyword-only服务端参数不在此模型内。"""
+
+    model_config = ConfigDict(extra="forbid")
+    start: date
+    end: date                  # 排他，不使用用户口语的包含结束日
+    shop_ids: list[str] = Field(min_length=1)
+    metrics: list[Metric] = Field(min_length=1)
+    group_by: Literal["total", "day", "shop", "product"] = "total"
+    compare: Literal["none", "previous_period"] = "none"
+    top_n: int = Field(default=10, ge=1, le=500)
+    currency: Literal["CNY"] = "CNY"
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "QueryRequest":
+        if self.end <= self.start:
+            raise ValueError("end必须晚于start（排他区间）")
+        if (self.end - self.start).days > MAX_SPAN_DAYS:
+            raise ValueError(f"日期跨度最多{MAX_SPAN_DAYS}天")
+        if self.group_by == "product":
+            bad = sorted({m for m in self.metrics if m not in PRODUCT_METRICS})
+            if bad:
+                raise ValueError(f"商品分组只支持 {PRODUCT_METRICS}，不支持 {bad}")
+        else:
+            bad = sorted({m for m in self.metrics if m in PRODUCT_METRICS})
+            if bad:
+                raise ValueError(f"商品指标只能用product分组，不支持 {bad}")
+        if "cohort_refund_rate" in self.metrics and self.group_by not in ("total", "shop"):
+            raise ValueError("同批退款率只支持total/shop分组")
+        return self
+
+
+class Coverage(BaseModel):
+    status: Literal["complete", "partial", "missing"]
+    start: date | None
+    end: date | None
+    gaps: list[str] = Field(default_factory=list)
+
+
+class ToolResult(BaseModel):
+    status: Literal["ok", "missing_data", "invalid_parameters", "forbidden",
+                    "unavailable"]
+    data: list[dict[str, str | int | None]] = Field(default_factory=list)
+    metric_definition: dict[str, str] = Field(default_factory=dict)
+    filters: dict[str, object] = Field(default_factory=dict)
+    data_as_of: datetime | None = None
+    coverage: Coverage
+    limitations: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 日期词解析：只处理有限常见词及明确日期，不能理解时返回None
+# ---------------------------------------------------------------------------
+
+
+def resolve_period(text: str, *, now: datetime) -> tuple[date, date] | None:
+    """返回 [start, end) 的排他日期区间；无法理解返回None交给澄清。"""
+    import re
+
+    text = text.strip()
+    today = now.astimezone(BEIJING).date()
+
+    match = re.search(r"最近\s*(\d+)\s*天", text) or re.search(r"近\s*(\d+)\s*天", text)
+    if match:
+        days = int(match.group(1))
+        if 1 <= days <= MAX_SPAN_DAYS:
+            return today - timedelta(days=days), today
+        return None
+    if "今天" in text or "今日" in text:
+        return today, today + timedelta(days=1)
+    if "昨天" in text or "昨日" in text:
+        return today - timedelta(days=1), today
+    if re.search(r"上{1,2}个?月", text) or "上月" in text:
+        first = today.replace(day=1)
+        prev_first = (first - timedelta(days=1)).replace(day=1)
+        return prev_first, first
+    if "本月" in text or "这个月" in text:
+        first = today.replace(day=1)
+        nxt = (first + timedelta(days=32)).replace(day=1)
+        return first, nxt
+    if "上周" in text:
+        monday = today - timedelta(days=today.weekday())
+        return monday - timedelta(days=7), monday
+    if "本周" in text or "这周" in text:
+        monday = today - timedelta(days=today.weekday())
+        return monday, monday + timedelta(days=7)
+    range_match = re.search(
+        r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?至\s*(?:(\d{4})[-/年])?(\d{1,2})[-/月](\d{1,2})日?",
+        text)
+    if range_match:
+        y1, m1, d1, y2, m2, d2 = (int(g) if g else None for g in range_match.groups())
+        y2 = y2 or y1
+        try:
+            start = date(y1, m1, d1)
+            end = date(y2, m2, d2)
+        except (TypeError, ValueError):
+            return None
+        return start, end + timedelta(days=1)
+    single = re.search(r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?", text)
+    if single:
+        try:
+            day = date(int(single.group(1)), int(single.group(2)), int(single.group(3)))
+        except ValueError:
+            return None
+        return day, day + timedelta(days=1)
+    spoken = re.search(
+        r"(\d{1,2})月(\d{1,2})日至\s*(?:(\d{1,2})月)?(\d{1,2})日", text)
+    if spoken:
+        m1, d1, m2, d2 = (int(g) if g else None for g in spoken.groups())
+        try:
+            start = date(now.year, m1, d1)
+            end_day = d2 if m2 is None else d2
+            end = date(now.year, m2 or m1, end_day)
+        except (TypeError, ValueError):
+            return None
+        if end < start:
+            return None
+        return start, end + timedelta(days=1)
+    spoken_single = re.search(r"(\d{1,2})月(\d{1,2})日", text)
+    if spoken_single:
+        try:
+            day = date(now.year, int(spoken_single.group(1)), int(spoken_single.group(2)))
+        except ValueError:
+            return None
+        return day, day + timedelta(days=1)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 覆盖与质量
+# ---------------------------------------------------------------------------
+
+
+def _window_range(start: date, end: date) -> tuple[datetime, datetime]:
+    return (datetime(start.year, start.month, start.day, tzinfo=BEIJING),
+            datetime(end.year, end.month, end.day, tzinfo=BEIJING))
+
+
+def _coverage_for(conn, *, entity: str, shop_id: str,
+                  start_ts: datetime, end_ts: datetime) -> tuple[str, list[str], datetime | None]:
+    """返回 (状态, 缺口列表, data_as_of)。覆盖与请求范围用多区间运算。"""
+    row = conn.execute(
+        "SELECT covered, data_as_of FROM reporting.v_coverage "
+        "WHERE source=%s AND entity=%s AND shop_id=%s",
+        (_ENTITY_SOURCES[entity], entity, shop_id),
+    ).fetchone()
+    full = f"{start_ts.date()}~{end_ts.date()}"
+    if row is None:
+        return "missing", [full], None
+    covered, data_as_of = row
+    if not covered:
+        return "missing", [full], data_as_of
+    requested = conn.execute(
+        "SELECT tstzmultirange(tstzrange(%s, %s, '[)')) - %s",
+        (start_ts, end_ts, covered),
+    ).fetchone()[0]
+    gaps = [f"{rng.lower.date()}~{rng.upper.date()}"
+            for rng in requested if rng.lower is not None and rng.upper is not None]
+    if not gaps:
+        return "complete", [], data_as_of
+    overlaps = conn.execute(
+        "SELECT %s && tstzmultirange(tstzrange(%s, %s, '[)'))",
+        (covered, start_ts, end_ts),
+    ).fetchone()[0]
+    return ("partial" if overlaps else "missing"), gaps, data_as_of
+
+
+def _merge_coverage(statuses: list[tuple[str, list[str], datetime | None]],
+                    start: date, end: date) -> tuple[Coverage, datetime | None]:
+    """多实体覆盖合并：最弱状态胜出；data_as_of取共同截止。"""
+    gaps: list[str] = []
+    cutoffs = []
+    if any(status == "missing" for status, _, _ in statuses):
+        overall = "missing"
+    elif any(status == "partial" for status, _, _ in statuses):
+        overall = "partial"
+    else:
+        overall = "complete"
+    for _, gap_list, _ in statuses:
+        gaps.extend(gap_list)
+    for _, _, data_as_of in statuses:
+        if data_as_of is None:
+            return Coverage(status="partial", start=start, end=end, gaps=sorted(set(gaps))), None
+        cutoffs.append(data_as_of)
+    return (Coverage(status=overall, start=start, end=end, gaps=sorted(set(gaps))),
+            min(cutoffs))
+
+
+# ---------------------------------------------------------------------------
+# 固定SQL
+# ---------------------------------------------------------------------------
+
+_DAILY_SQL = """
+SELECT shop_id, day, paid_amount, paid_orders, erp_documents, refund_amount, cash_difference
+FROM reporting.v_shop_daily
+WHERE shop_id = ANY(%s) AND day >= %s AND day < %s
+ORDER BY day, shop_id
+LIMIT %s
+"""
+
+_PRODUCT_SQL = """
+SELECT shop_id, day, product_id, quantity, gift_quantity, product_paid_amount,
+       allocation_verified
+FROM reporting.v_product_daily
+WHERE shop_id = ANY(%s) AND day >= %s AND day < %s
+ORDER BY day, shop_id, product_id
+LIMIT %s
+"""
+
+_GROUP_COUNT_SQL = """
+SELECT count(*) FROM (
+    SELECT DISTINCT shop_id, day FROM reporting.v_shop_daily
+    WHERE shop_id = ANY(%s) AND day >= %s AND day < %s
+) t
+"""
+
+_COHORT_SQL = """
+WITH cohort AS (
+    SELECT shop_id, commercial_id, amount
+    FROM reporting.v_payments
+    WHERE shop_id = ANY(%s) AND paid_at >= %s AND paid_at < %s AND verified
+), refunds AS (
+    SELECT shop_id, commercial_id, sum(raw_platform_amount) AS refunded
+    FROM reporting.v_refunds
+    WHERE platform_success AND refund_canonical AND platform_completed_at < %s
+    GROUP BY shop_id, commercial_id
+)
+SELECT sum(c.amount) AS cohort_paid,
+       sum(coalesce(r.refunded, 0)) AS cohort_refunded
+FROM cohort c LEFT JOIN refunds r USING (shop_id, commercial_id)
+"""
+
+_UNMATCHED_SQL = """
+SELECT count(*) FROM reporting.v_refunds
+WHERE shop_id = ANY(%s) AND platform_success AND refund_canonical
+  AND platform_completed_at >= %s AND platform_completed_at < %s
+  AND (commercial_id IS NULL OR NOT matched)
+"""
+
+_SHOPS_SQL = """
+SELECT shop_id, enabled, currency FROM reporting.v_shops WHERE shop_id = ANY(%s)
+"""
+
+
+def _set_query_budget(conn, deadline: float) -> bool:
+    """每条SQL前重算deadline剩余值并收紧timeout，不给后续SQL重新授予预算。"""
+    remaining_ms = int((deadline - time.monotonic()) * 1000)
+    if remaining_ms <= 0:
+        return False
+    conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                 (f"{min(5000, remaining_ms)}ms",))
+    return True
+
+
+def _group_rows(values: dict[str, Decimal | int | None],
+                metrics: list[str]) -> dict[str, str | int | None]:
+    row: dict[str, str | int | None] = {}
+    for metric in metrics:
+        row[metric] = _render(values.get(metric))
+    return row
+
+
+def _render(value: Decimal | int | None) -> str | int | None:
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    return value
+
+
+def _compute_aov(values: dict[str, Decimal | int | None]) -> Decimal | None:
+    amount = values.get("paid_amount")
+    orders = values.get("paid_orders")
+    if not isinstance(amount, Decimal) or not isinstance(orders, int) or orders <= 0:
+        return None
+    return amount / orders
+
+
+def query_business(conn, request: QueryRequest, *, allowed_shop_ids: frozenset[str],
+                   now: datetime, deadline: float) -> ToolResult:
+    """确定性指标查询：覆盖门禁优先，拒绝部分汇总冒充总额。"""
+    if not set(request.shop_ids) <= allowed_shop_ids:
+        return ToolResult(
+            status="forbidden", coverage=Coverage(status="missing", start=None, end=None),
+            limitations=["店铺不在授权范围"], filters=_filters(request))
+    if not _set_query_budget(conn, deadline):
+        return ToolResult(
+            status="unavailable", coverage=Coverage(status="missing", start=None, end=None),
+            limitations=["本次查询时间预算已耗尽"], filters=_filters(request))
+    try:
+        if conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE:
+            tx = conn.transaction(psycopg.IsolationLevel.REPEATABLE_READ)
+        else:
+            # 已在外层事务（测试注入合成数据）：保存点即可，读一致怿由外层保证
+            tx = conn.transaction()
+        with tx:
+            conn.execute("SELECT set_config('transaction_read_only', 'on', true)")
+            return _query_in_transaction(conn, request, now=now, deadline=deadline)
+    except psycopg.errors.QueryCanceled:
+        return ToolResult(
+            status="unavailable", coverage=Coverage(status="missing", start=None, end=None),
+            limitations=["查询超时"], filters=_filters(request))
+
+
+def _filters(request: QueryRequest) -> dict[str, object]:
+    return {
+        "start": request.start.isoformat(),
+        "end": request.end.isoformat(),
+        "shop_ids": sorted(request.shop_ids),
+        "metrics": list(request.metrics),
+        "group_by": request.group_by,
+        "compare": request.compare,
+        "currency": request.currency,
+    }
+
+
+def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
+                          deadline: float) -> ToolResult:
+    start_ts, end_ts = _window_range(request.start, request.end)
+    filters = _filters(request)
+    limitations: list[str] = []
+
+    # 店铺能力检查
+    shops = {row[0]: (row[1], row[2]) for row in conn.execute(_SHOPS_SQL, (request.shop_ids,)).fetchall()}
+    unknown = [s for s in request.shop_ids if s not in shops]
+    if unknown:
+        return ToolResult(
+            status="missing_data", coverage=Coverage(status="missing", start=None, end=None),
+            filters=filters, limitations=["店铺尚未同步，无法查询"])
+    disabled = [s for s in request.shop_ids if not shops[s][0]]
+    if disabled:
+        limitations.append("部分店铺已停用，仅返回剩余范围")
+
+    # 覆盖门禁：当前期
+    statuses = []
+    for entity in sorted({e for m in request.metrics for e in ENTITY_REQUIREMENTS[m]}):
+        if not _set_query_budget(conn, deadline):
+            return ToolResult(status="unavailable",
+                              coverage=Coverage(status="missing", start=None, end=None),
+                              filters=filters, limitations=limitations + ["本次查询时间预算已耗尽"])
+        for shop_id in sorted(request.shop_ids):
+            statuses.append(_coverage_for(conn, entity=entity, shop_id=shop_id,
+                                          start_ts=start_ts, end_ts=end_ts))
+    coverage, data_as_of = _merge_coverage(statuses, request.start, request.end)
+    if coverage.status != "complete" or data_as_of is None:
+        limitations.append("覆盖未完成，拒绝部分汇总；缺口见coverage.gaps")
+        if data_as_of is None:
+            limitations.append("数据截止未知（回填未完成）")
+        return ToolResult(status="missing_data", coverage=coverage,
+                          metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
+                          filters=filters, data_as_of=data_as_of, limitations=limitations)
+
+    # 未匹配成功退款影响退款归属
+    refund_metrics = {"refund_amount", "cash_difference", "cohort_refund_rate"}
+    if set(request.metrics) & refund_metrics:
+        unmatched = conn.execute(
+            _UNMATCHED_SQL, (request.shop_ids, start_ts, end_ts)).fetchone()[0]
+        if unmatched:
+            limitations.append(f"存在{unmatched}条未匹配的平台成功退款，退款归属未确认")
+            return ToolResult(status="missing_data", coverage=coverage,
+                              metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
+                              filters=filters, data_as_of=data_as_of, limitations=limitations)
+
+    # 行数预检
+    if request.group_by == "day":
+        groups = conn.execute(_GROUP_COUNT_SQL,
+                              (request.shop_ids, request.start, request.end)).fetchone()[0]
+        if groups > MAX_ROWS:
+            return ToolResult(
+                status="invalid_parameters", coverage=coverage,
+                metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
+                filters=filters, data_as_of=data_as_of,
+                limitations=[f"结果超过{MAX_ROWS}组，请缩小日期范围或店铺范围"])
+
+    compare = request.compare == "previous_period"
+    prev_start = prev_end = None
+    if compare:
+        span = request.end - request.start
+        prev_start = request.start - span
+        prev_end = request.start
+        prev_ts = _window_range(prev_start, prev_end)
+        prev_statuses = []
+        for entity in sorted({e for m in request.metrics for e in ENTITY_REQUIREMENTS[m]}):
+            for shop_id in sorted(request.shop_ids):
+                prev_statuses.append(_coverage_for(conn, entity=entity, shop_id=shop_id,
+                                                   start_ts=prev_ts[0], end_ts=prev_ts[1]))
+        prev_coverage, _ = _merge_coverage(prev_statuses, prev_start, prev_end)
+        if prev_coverage.status != "complete":
+            compare = False
+            limitations.append("上期覆盖不足，无法比较，仅返回绝对值")
+
+    if not _set_query_budget(conn, deadline):
+        return ToolResult(status="unavailable", coverage=coverage,
+                          metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
+                          filters=filters, data_as_of=data_as_of,
+                          limitations=limitations + ["本次查询时间预算已耗尽"])
+
+    if request.group_by in ("total", "shop", "day"):
+        rows = _period_rows(conn, request, start_ts=start_ts, end_ts=end_ts,
+                            deadline=deadline, data_as_of=data_as_of,
+                            limitations=limitations)
+    else:
+        rows = _product_rows(conn, request, start_ts=start_ts, end_ts=end_ts, deadline=deadline)
+
+    if compare:
+        if request.group_by in ("total", "shop"):
+            prev_request = request.model_copy(update={
+                "start": prev_start, "end": prev_end, "compare": "none"})
+            prev_rows = _period_rows(conn, prev_request, start_ts=prev_ts[0],
+                                     end_ts=prev_ts[1], deadline=deadline,
+                                     data_as_of=data_as_of, limitations=[])
+            _attach_compare(rows, prev_rows, request)
+        else:
+            limitations.append("比较仅支持total/shop分组")
+
+    return ToolResult(
+        status="ok", data=rows,
+        metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
+        filters=filters, data_as_of=data_as_of, coverage=coverage,
+        limitations=limitations)
+
+
+def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: datetime,
+                 deadline: float, data_as_of: datetime,
+                 limitations: list[str]) -> list[dict[str, str | int | None]]:
+    """total/shop/day三种分组的指标行；退款率单独查询。"""
+    if not _set_query_budget(conn, deadline):
+        return []
+    raw = conn.execute(_DAILY_SQL, (request.shop_ids, start_ts.date(), end_ts.date(),
+                                    MAX_ROWS)).fetchall()
+    need_cohort = "cohort_refund_rate" in request.metrics
+    cohort_rate = None
+    if need_cohort:
+        if not _set_query_budget(conn, deadline):
+            return []
+        cohort_paid, cohort_refunded = conn.execute(
+            _COHORT_SQL, (request.shop_ids, start_ts, end_ts, data_as_of)).fetchone()
+        if cohort_paid is not None and cohort_paid > 0:
+            cohort_rate = (cohort_refunded or Decimal(0)) / cohort_paid
+        else:
+            cohort_rate = None
+            limitations.append("同批支付额为0或无支付，同批退款率不可计算")
+
+    metrics = list(request.metrics)
+    if request.group_by == "total":
+        totals: dict[str, Decimal | int | None] = {
+            "paid_amount": Decimal(0), "paid_orders": 0, "erp_documents": 0,
+            "refund_amount": Decimal(0), "cash_difference": Decimal(0)}
+        for row in raw:
+            totals["paid_amount"] += row[2]
+            totals["paid_orders"] += row[3]
+            totals["erp_documents"] += row[4]
+            totals["refund_amount"] += row[5]
+            totals["cash_difference"] += row[6]
+        totals["aov"] = _compute_aov(totals)
+        if need_cohort:
+            totals["cohort_refund_rate"] = cohort_rate
+        return [_group_rows(totals, metrics)]
+    if request.group_by == "shop":
+        by_shop: dict[str, dict[str, Decimal | int | None]] = {}
+        for row in raw:
+            entry = by_shop.setdefault(row[0], {
+                "paid_amount": Decimal(0), "paid_orders": 0, "erp_documents": 0,
+                "refund_amount": Decimal(0), "cash_difference": Decimal(0)})
+            entry["paid_amount"] += row[2]
+            entry["paid_orders"] += row[3]
+            entry["erp_documents"] += row[4]
+            entry["refund_amount"] += row[5]
+            entry["cash_difference"] += row[6]
+        for entry in by_shop.values():
+            entry["aov"] = _compute_aov(entry)
+            if need_cohort:
+                entry["cohort_refund_rate"] = cohort_rate
+        return [{"shop_id": shop_id, **_group_rows(entry, metrics)}
+                for shop_id, entry in sorted(by_shop.items())]
+    # day：先完成覆盖检查，再对覆盖内的缺交易日补真实0
+    by_day: dict[tuple[str, date], dict[str, Decimal | int | None]] = {}
+    for row in raw:
+        by_day[(row[0], row[1])] = {
+            "paid_amount": row[2], "paid_orders": row[3], "erp_documents": row[4],
+            "refund_amount": row[5], "cash_difference": row[6]}
+    rows: list[dict[str, str | int | None]] = []
+    for shop_id in sorted(request.shop_ids):
+        day = request.start
+        while day < request.end:
+            entry = by_day.get((shop_id, day), {
+                "paid_amount": Decimal(0), "paid_orders": 0, "erp_documents": 0,
+                "refund_amount": Decimal(0), "cash_difference": Decimal(0)})
+            if need_cohort:
+                entry["cohort_refund_rate"] = None  # 同批比率不逐日发布
+            rows.append({"shop_id": shop_id, "day": day.isoformat(),
+                         **_group_rows(entry, metrics)})
+            day += timedelta(days=1)
+    return rows
+
+
+def _product_rows(conn, request: QueryRequest, *, start_ts: datetime,
+                  end_ts: datetime, deadline: float) -> list[dict[str, str | int | None]]:
+    if not _set_query_budget(conn, deadline):
+        return []
+    raw = conn.execute(_PRODUCT_SQL, (request.shop_ids, start_ts.date(), end_ts.date(),
+                                      MAX_ROWS)).fetchall()
+    rank_metric = ("product_paid_amount" if "product_paid_amount" in request.metrics
+                   else "quantity")
+    by_product: dict[tuple[str, str], dict[str, Decimal | int | bool | None]] = {}
+    for row in raw:
+        entry = by_product.setdefault((row[0], row[2]), {
+            "quantity": Decimal(0), "gift_quantity": Decimal(0),
+            "product_paid_amount": Decimal(0), "allocation_verified": True})
+        entry["quantity"] += row[3]
+        entry["gift_quantity"] += row[4]
+        entry["product_paid_amount"] += row[5]
+        entry["allocation_verified"] = bool(entry["allocation_verified"] and row[6])
+    ranked = sorted(by_product.items(),
+                    key=lambda item: (item[1][rank_metric] or 0, item[0]),
+                    reverse=True)
+    rows: list[dict[str, str | int | None]] = []
+    for (shop_id, product_id), entry in ranked[:request.top_n]:
+        rows.append({
+            "shop_id": shop_id, "product_id": product_id,
+            "quantity": _render(entry["quantity"]),
+            "gift_quantity": _render(entry["gift_quantity"]),
+            "product_paid_amount": _render(entry["product_paid_amount"]),
+            "allocation_verified": int(entry["allocation_verified"]),
+        })
+    if len(ranked) > request.top_n:
+        rows.append({"notice": f"仅返回Top {request.top_n}，共{len(ranked)}个商品"})
+    return rows
+
+
+def _attach_compare(rows: list[dict[str, str | int | None]],
+                    prev_rows: list[dict[str, str | int | None]],
+                    request: QueryRequest) -> None:
+    prev_by_key: dict[str | None, dict[str, str | int | None]] = {}
+    for row in prev_rows:
+        prev_by_key[row.get("shop_id")] = row
+    for row in rows:
+        prev = prev_by_key.get(row.get("shop_id"))
+        for metric in request.metrics:
+            current = _to_decimal(row.get(metric))
+            previous = _to_decimal(prev.get(metric)) if prev else None
+            row[f"{metric}_previous"] = _render(previous)
+            if current is None or previous is None:
+                row[f"{metric}_change"] = None
+                row[f"{metric}_change_ratio"] = None
+                continue
+            row[f"{metric}_change"] = _render(current - previous)
+            if previous == 0:
+                row[f"{metric}_change_ratio"] = None
+            else:
+                row[f"{metric}_change_ratio"] = _render((current - previous) / previous)
+
+
+def _to_decimal(value: object) -> Decimal | None:
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, str):
+        try:
+            return Decimal(value)
+        except ArithmeticError:
+            return None
+    if isinstance(value, int):
+        return Decimal(value)
+    return None
