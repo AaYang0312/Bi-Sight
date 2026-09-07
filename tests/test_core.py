@@ -6,6 +6,7 @@ import json
 import logging
 import unittest
 from datetime import date, datetime
+from decimal import Decimal
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
@@ -482,6 +483,131 @@ class ModelTests(unittest.TestCase):
         for provider in ("qwen", "deepseek"):
             model = create_model(_model_settings(provider))
             self.assertIsInstance(model, CompatibleChatModel)
+
+
+class PromotionTests(unittest.TestCase):
+    NOW = datetime(2026, 9, 8, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    def test_cap_is_exact_and_missing_actual_is_not_zero(self):
+        from bi_agent.metrics import ToolResult
+        from bi_agent.promotion import PromotionRequest, evaluate_promotion
+
+        request = PromotionRequest(mode="sales_cap", start="2026-10-01", end="2026-11-01",
+                                   sales_estimate="100000", target_ratio="0.12")
+        result = evaluate_promotion(request, confirmed_inputs={
+            "sales_estimate": Decimal("100000"), "target_ratio": Decimal("0.12")},
+            now=self.NOW)
+        self.assertEqual(Decimal(result.data[0]["spend_cap"]), Decimal("12000"))
+        actual = PromotionRequest(mode="actual_budget", start="2026-09-01", end="2026-10-01")
+        outcome = evaluate_promotion(actual, confirmed_inputs={}, now=self.NOW)
+        self.assertEqual(outcome.status, "missing_data")
+
+    def test_budget_scenario_overrun(self):
+        from bi_agent.promotion import PromotionRequest, evaluate_promotion
+
+        request = PromotionRequest(mode="budget_scenario", start="2026-09-01",
+                                   end="2026-09-08", budget="100", assumed_spend="120",
+                                   spent_through="2026-09-06")
+        result = evaluate_promotion(request, confirmed_inputs={
+            "budget": Decimal("100"), "assumed_spend": Decimal("120")}, now=self.NOW)
+        row = result.data[0]
+        self.assertEqual(Decimal(row["remaining_budget"]), Decimal("0"))
+        self.assertEqual(Decimal(row["overrun"]), Decimal("20"))
+        self.assertEqual(row["remaining_days"], 2)
+        self.assertEqual(Decimal(row["daily_allowance"]), Decimal("0"))
+        self.assertEqual(row["basis"], "用户输入假设")
+
+    def test_zero_budget(self):
+        from bi_agent.promotion import PromotionRequest, evaluate_promotion
+
+        request = PromotionRequest(mode="budget_scenario", start="2026-09-01",
+                                   end="2026-09-08", budget="0", assumed_spend="0",
+                                   spent_through="2026-09-06")
+        result = evaluate_promotion(request, confirmed_inputs={
+            "budget": Decimal("0"), "assumed_spend": Decimal("0")}, now=self.NOW)
+        row = result.data[0]
+        self.assertEqual(Decimal(row["remaining_budget"]), Decimal("0"))
+        self.assertEqual(Decimal(row["daily_allowance"]), Decimal("0"))
+
+    def test_period_ended_no_division_by_zero(self):
+        from bi_agent.promotion import PromotionRequest, evaluate_promotion
+
+        request = PromotionRequest(mode="budget_scenario", start="2026-09-01",
+                                   end="2026-09-08", budget="100", assumed_spend="60",
+                                   spent_through="2026-09-08")
+        result = evaluate_promotion(request, confirmed_inputs={
+            "budget": Decimal("100"), "assumed_spend": Decimal("60")}, now=self.NOW)
+        row = result.data[0]
+        self.assertIsNone(row["daily_allowance"])
+        self.assertTrue(any("周期已结束" in item for item in result.limitations))
+
+    def test_ratio_over_100_percent_rejected(self):
+        from bi_agent.promotion import PromotionRequest
+
+        with self.assertRaises(ValueError):
+            PromotionRequest(mode="sales_cap", start="2026-10-01", end="2026-11-01",
+                             sales_estimate="100000", target_ratio="1.2")
+
+    def test_negative_and_nan_rejected(self):
+        from bi_agent.promotion import PromotionRequest
+
+        for kwargs in ({"sales_estimate": "-1", "target_ratio": "0.1"},
+                       {"sales_estimate": "NaN", "target_ratio": "0.1"},
+                       {"sales_estimate": "Infinity", "target_ratio": "0.1"}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    PromotionRequest(mode="sales_cap", start="2026-10-01",
+                                     end="2026-11-01", **kwargs)
+
+    def test_currency_restricted(self):
+        from bi_agent.promotion import PromotionRequest
+
+        with self.assertRaises(ValueError):
+            PromotionRequest(mode="sales_cap", start="2026-10-01", end="2026-11-01",
+                             sales_estimate="100000", target_ratio="0.1", currency="USD")
+
+    def test_unconfirmed_amounts_rejected(self):
+        from bi_agent.promotion import PromotionRequest, evaluate_promotion
+
+        request = PromotionRequest(mode="sales_cap", start="2026-10-01", end="2026-11-01",
+                                   sales_estimate="100000", target_ratio="0.12")
+        result = evaluate_promotion(request, confirmed_inputs={}, now=self.NOW)
+        self.assertEqual(result.status, "invalid_parameters")
+
+    def test_mismatched_confirmed_inputs_rejected(self):
+        from bi_agent.promotion import PromotionRequest, evaluate_promotion
+
+        request = PromotionRequest(mode="budget_scenario", start="2026-09-01",
+                                   end="2026-09-08", budget="100", assumed_spend="120",
+                                   spent_through="2026-09-06")
+        result = evaluate_promotion(request, confirmed_inputs={
+            "budget": Decimal("999"), "assumed_spend": Decimal("120")}, now=self.NOW)
+        self.assertEqual(result.status, "invalid_parameters")
+        self.assertTrue(any("不一致" in item for item in result.limitations))
+
+    def test_extra_mode_fields_rejected(self):
+        from bi_agent.promotion import PromotionRequest
+
+        with self.assertRaises(ValueError):
+            PromotionRequest(mode="sales_cap", start="2026-10-01", end="2026-11-01",
+                             sales_estimate="100000", target_ratio="0.1",
+                             budget="500")
+
+    def test_contribution_cap_missing_data(self):
+        from bi_agent.promotion import PromotionRequest, evaluate_promotion
+
+        request = PromotionRequest(mode="contribution_cap", start="2026-09-01",
+                                   end="2026-10-01")
+        result = evaluate_promotion(request, confirmed_inputs={}, now=self.NOW)
+        self.assertEqual(result.status, "missing_data")
+        self.assertTrue(any("推广实耗" in item for item in result.limitations))
+
+    def test_span_limit(self):
+        from bi_agent.promotion import PromotionRequest
+
+        with self.assertRaises(ValueError):
+            PromotionRequest(mode="sales_cap", start="2025-01-01", end="2026-09-08",
+                             sales_estimate="1", target_ratio="0.1")
 
 
 if __name__ == "__main__":
