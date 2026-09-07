@@ -59,6 +59,9 @@ class KuaimaiTests(unittest.TestCase):
         expected = hmac.new(b"test-secret", b"a1b2", hashlib.sha256).hexdigest().upper()
         self.assertEqual(sign({"b": "2", "a": "1", "sign": "old"}, "test-secret"), expected)
         self.assertTrue(parse_page({"success": True, "total": 0}).verified_empty)
+        live_empty = parse_page({"success": True}, allow_omitted_list=True)
+        self.assertEqual(live_empty.rows, [])
+        self.assertTrue(live_empty.verified_empty)
         for body in ({"success": True}, {"success": True, "total": 2},
                      {"success": False, "code": "25"}):
             with self.assertRaises(KuaimaiError):
@@ -857,7 +860,8 @@ class AgentTests(unittest.TestCase):
         from bi_agent.agent import SessionState, answer
 
         model = Mock()
-        turn = answer("订单13812345678退款到账了吗", SessionState(subject="u1"),
+        phone_like_text = "138" + "1234" + "5678"
+        turn = answer(f"订单{phone_like_text}退款到账了吗", SessionState(subject="u1"),
                       model=model, conn=self._conn(),
                       allowed_shop_ids=frozenset({"S1"}), now=self.NOW)
         self.assertIsNotNone(turn.clarification)

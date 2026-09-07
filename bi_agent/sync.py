@@ -576,7 +576,8 @@ def _fetch_orders_cursor(client: KuaimaiClient, *, shop_id: str, window: Window,
         }
         if cursor is not None:
             params["cursor"] = cursor
-        page = parse_page(client.call(ORDER_SOURCE, params))
+        page = parse_page(
+            client.call(ORDER_SOURCE, params), allow_omitted_list=True)
         if not page.rows:
             return
         yield from page.rows
@@ -609,7 +610,8 @@ def _fetch_orders_paged(client: KuaimaiClient, *, shop_id: str, window: Window,
         }
         if time_type:
             params["timeType"] = time_type
-        page = parse_page(client.call(ORDER_SOURCE, params))
+        page = parse_page(
+            client.call(ORDER_SOURCE, params), allow_omitted_list=True)
         if page.verified_empty:
             return
         if total is None and page.total is not None:
@@ -649,7 +651,8 @@ def _fetch_aftersales_paged(client: KuaimaiClient, *, shop_id: str, window: Wind
         }
         if extra_params:
             params.update(extra_params)
-        page = parse_page(client.call(AFTERSALE_SOURCE, params))
+        page = parse_page(
+            client.call(AFTERSALE_SOURCE, params), allow_omitted_list=True)
         if page.verified_empty:
             return
         if page.total is None:
@@ -852,7 +855,8 @@ def check_cohort_window(conn, client: KuaimaiClient, *, shop_id: str,
                     "asVersion": "2",
                     "tids": ",".join(chunk),
                 }
-                page = parse_page(client.call(AFTERSALE_SOURCE, params))
+                page = parse_page(
+                    client.call(AFTERSALE_SOURCE, params), allow_omitted_list=True)
                 if page.verified_empty:
                     break
                 if page.total is None:
@@ -912,7 +916,8 @@ def refetch_orders_for_commercials(conn, client: KuaimaiClient, *, shop_id: str,
             }
             if cursor is not None:
                 params["cursor"] = cursor
-            page = parse_page(client.call(ORDER_SOURCE, params))
+            page = parse_page(
+                client.call(ORDER_SOURCE, params), allow_omitted_list=True)
             batch_id = uuid.uuid4().hex
             with conn.transaction():
                 for raw in page.rows:
@@ -953,8 +958,11 @@ def sync_shops(conn, client: KuaimaiClient) -> int:
     collected = 0
     with conn.transaction():
         while True:
-            page = parse_page(client.call("erp.shop.list.query", {
-                "pageNo": str(page_no), "pageSize": str(PAGE_SIZE)}))
+            page = parse_page(
+                client.call("erp.shop.list.query", {
+                    "pageNo": str(page_no), "pageSize": str(PAGE_SIZE)}),
+                allow_omitted_list=True,
+            )
             if not page.rows:
                 break
             for raw in page.rows:

@@ -53,22 +53,28 @@ def sign(params: Mapping[str, str], secret: str) -> str:
     return hmac.new(secret.encode(), canonical.encode(), hashlib.sha256).hexdigest().upper()
 
 
-def parse_page(payload: dict[str, object]) -> Page:
-    """校验分页响应形状；空结果必须有总数或分页结束证据才算已核实。"""
+def parse_page(payload: dict[str, object], *, allow_omitted_list: bool = False) -> Page:
+    """校验分页响应形状；省略列表仅能由已实测接口显式解释为空页。"""
     if payload.get("success") is False:
         raise KuaimaiError("upstream")
     rows = payload.get("list")
     total = payload.get("total")
-    if rows is None:
-        # 实测：快麦空结果时省略 list 字段（success=true 无列表）
-        rows = []
-    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-        raise KuaimaiError("invalid_response")
     has_next_raw = payload.get("hasNext")
     has_next = has_next_raw if isinstance(has_next_raw, bool) else None
+    list_omitted = rows is None
+    if rows is None:
+        if total == 0 or (total is None and (has_next is False or allow_omitted_list)):
+            rows = []
+        else:
+            raise KuaimaiError("unknown_empty" if total is None else "invalid_response")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise KuaimaiError("invalid_response")
     cursor_raw = payload.get("cursor")
     cursor = cursor_raw if isinstance(cursor_raw, str) else None
-    verified_empty = len(rows) == 0 and (total == 0 or has_next is False)
+    verified_empty = len(rows) == 0 and (
+        total == 0 or has_next is False
+        or (allow_omitted_list and list_omitted and total is None)
+    )
     return Page(
         rows=rows,  # type: ignore[arg-type]
         total=total if isinstance(total, int) else None,
