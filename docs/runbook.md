@@ -66,7 +66,9 @@ development 只允许绑定本机回环地址（`st.get_option('server.address')
 | qwen | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 | deepseek | `https://api.deepseek.com/v1` |
 
-执行部署时需按上述地址所属地域核对账号可用性，再记录实际选择。真实联调命令与验收状态见 `docs/demo.md`。
+执行部署时需按上述地址所属地域核对账号可用性，再记录实际选择。地域变化只改部署地址（`LLM_BASE_URL`），不替换密钥。
+
+联调门槛：离线 mock 回合通过（31项核心检查）只证明协议适配正确，不证明模型理解准确率；真实工具回合见「验收」章节（`--provider-smoke`），必须经过「模型提出工具调用→回传同ID结果→模型回答」。错误不自动重试、不切 provider；单请求总时限 30 秒预算由调用方传入。
 
 ## 故障与恢复
 

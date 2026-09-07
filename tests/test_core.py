@@ -290,5 +290,199 @@ class PresentationTests(unittest.TestCase):
         self.assertEqual(_exclusive_end(date(2026, 9, 7)), date(2026, 9, 8))
 
 
+def _model_settings(provider: str):
+    from bi_agent.config import load_model_settings
+
+    key = f"{provider.upper()}_API_KEY"
+    return load_model_settings({
+        "LLM_PROVIDER": provider, "LLM_MODEL": "demo-model",
+        key: f"fake-{provider}-key",
+    })
+
+
+class ModelTests(unittest.TestCase):
+    PROVIDER_RESPONSE = {
+        "choices": [{"message": {
+            "role": "assistant", "content": None,
+            "reasoning_content": "synthetic-private-context",
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                "name": "query_business", "arguments": '{"start":"2026-09-01"}'}}]
+        }}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+
+    def _model(self, provider: str, handler):
+        from bi_agent.llm import CompatibleChatModel
+
+        return CompatibleChatModel(_model_settings(provider),
+                                   transport=httpx.MockTransport(handler))
+
+    def test_provider_round_trip_for_both(self):
+        from bi_agent.llm import Message
+
+        def provider_response(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=self.PROVIDER_RESPONSE)
+
+        for provider in ("qwen", "deepseek"):
+            with self.subTest(provider=provider):
+                model = self._model(provider, provider_response)
+                reply = model.complete([Message(role="user", content="查看经营")],
+                                       [], timeout_s=2)
+                self.assertEqual(reply.tool_calls[0].id, "call_1")
+                self.assertEqual(reply.tool_calls[0].arguments, {"start": "2026-09-01"})
+                self.assertNotIn("synthetic-private-context", repr(reply.as_message()))
+                self.assertNotIn("synthetic-private-context", repr(reply))
+
+    def test_second_request_preserves_reasoning_and_tool_id(self):
+        from bi_agent.llm import Message, ModelReply, ToolCall
+
+        requests: list[dict] = []
+
+        def provider_response(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            requests.append(body)
+            if len(requests) == 1:
+                return httpx.Response(200, json=self.PROVIDER_RESPONSE)
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant",
+                                          "content": "已查询"}}],
+            })
+
+        model = self._model("deepseek", provider_response)
+        first = model.complete([Message(role="user", content="查看经营")],
+                               [], timeout_s=2)
+        tool_result = Message(role="tool", tool_call_id="call_1", content="{}")
+        second = model.complete(
+            [Message(role="user", content="查看经营"), first.as_message(), tool_result],
+            [], timeout_s=2)
+        self.assertEqual(second.tool_calls, [])
+        assistant_encoded = requests[1]["messages"][1]
+        self.assertEqual(assistant_encoded["reasoning_content"],
+                         "synthetic-private-context")
+        self.assertEqual(assistant_encoded["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(assistant_encoded["tool_calls"][0]["function"]["arguments"],
+                         '{"start":"2026-09-01"}')
+        tool_encoded = requests[1]["messages"][2]
+        self.assertEqual(tool_encoded["tool_call_id"], "call_1")
+
+    def test_invalid_json_arguments_preserve_id(self):
+        from bi_agent.llm import Message
+
+        def provider_response(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant", "content": None,
+                                          "tool_calls": [{"id": "call_9",
+                                                           "type": "function",
+                                                           "function": {
+                                                               "name": "query_business",
+                                                               "arguments": '{bad json'}}]}}],
+            })
+
+        model = self._model("qwen", provider_response)
+        reply = model.complete([Message(role="user", content="q")], [], timeout_s=2)
+        self.assertIsNone(reply.tool_calls[0].arguments)
+        self.assertEqual(reply.tool_calls[0].arguments_error, "invalid_json")
+        self.assertEqual(reply.tool_calls[0].id, "call_9")
+
+    def test_usage_missing_and_partial(self):
+        from bi_agent.llm import Message
+
+        def missing_usage(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        model = self._model("qwen", missing_usage)
+        reply = model.complete([Message(role="user", content="q")], [], timeout_s=2)
+        self.assertIsNone(reply.usage)
+
+        def partial_usage(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 7}})
+
+        model = self._model("qwen", partial_usage)
+        reply = model.complete([Message(role="user", content="q")], [], timeout_s=2)
+        self.assertEqual(reply.usage, {"prompt_tokens": 7, "completion_tokens": None,
+                                       "total_tokens": None})
+
+    def test_error_mapping(self):
+        from bi_agent.llm import Message, ModelError
+
+        for status, code in ((401, "authentication"), (403, "authentication"),
+                             (429, "rate_limit"), (500, "unavailable"), (503, "unavailable")):
+            with self.subTest(status=status):
+                model = self._model("deepseek",
+                                    lambda request, s=status: httpx.Response(s))
+                with self.assertRaises(ModelError) as ctx:
+                    model.complete([Message(role="user", content="q")], [], timeout_s=2)
+                self.assertEqual(ctx.exception.code, code)
+
+    def test_timeout_budget_exhausted(self):
+        import asyncio as asyncio_module
+
+        from bi_agent.llm import Message, ModelError
+
+        async def slow(request: httpx.Request) -> httpx.Response:
+            await asyncio_module.sleep(1)
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        model = self._model("qwen", slow)
+        with self.assertRaises(ModelError) as ctx:
+            model.complete([Message(role="user", content="q")], [], timeout_s=0.05)
+        self.assertEqual(ctx.exception.code, "timeout")
+
+    def test_duplicate_and_missing_tool_ids_rejected(self):
+        from bi_agent.llm import Message, ModelError
+
+        duplicate = {
+            "choices": [{"message": {"role": "assistant", "content": None,
+                                      "tool_calls": [
+                                          {"id": "c1", "type": "function",
+                                           "function": {"name": "a", "arguments": "{}"}},
+                                          {"id": "c1", "type": "function",
+                                           "function": {"name": "b", "arguments": "{}"}}]}}]}
+        missing = {
+            "choices": [{"message": {"role": "assistant", "content": None,
+                                      "tool_calls": [
+                                          {"type": "function",
+                                           "function": {"name": "a", "arguments": "{}"}}]}}]}
+        for payload in (duplicate, missing):
+            with self.subTest():
+                model = self._model("qwen",
+                                    lambda request, p=payload: httpx.Response(200, json=p))
+                with self.assertRaises(ModelError) as ctx:
+                    model.complete([Message(role="user", content="q")], [], timeout_s=2)
+                self.assertEqual(ctx.exception.code, "invalid_response")
+
+    def test_tools_and_endpoint_passthrough(self):
+        from bi_agent.llm import DEFAULT_BASE_URLS, Message
+
+        bodies: list[dict] = []
+
+        def provider_response(request: httpx.Request) -> httpx.Response:
+            bodies.append({"url": str(request.url),
+                           "body": json.loads(request.content)})
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+        tools = [{"type": "function", "function": {"name": "query_business",
+                                                    "parameters": {"type": "object"}}}]
+        model = self._model("qwen", provider_response)
+        model.complete([Message(role="user", content="q")], tools, timeout_s=2)
+        self.assertEqual(bodies[0]["url"],
+                         DEFAULT_BASE_URLS["qwen"] + "/chat/completions")
+        self.assertEqual(bodies[0]["body"]["tools"], tools)
+        self.assertEqual(bodies[0]["body"]["model"], "demo-model")
+        self.assertNotIn("response_format", bodies[0]["body"])
+
+    def test_create_model_mapping(self):
+        from bi_agent.llm import CompatibleChatModel, create_model
+
+        for provider in ("qwen", "deepseek"):
+            model = create_model(_model_settings(provider))
+            self.assertIsInstance(model, CompatibleChatModel)
+
+
 if __name__ == "__main__":
     unittest.main()
