@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+.pi/
+.tmp/
+private/
+backups/
+exports/
+可参考/
+*.dump
