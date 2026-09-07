@@ -1,0 +1,469 @@
+"""单Agent对话：两个工具、有限回合、会话筛选与匿名映射。
+
+模型只看到匿名店铺编号与聚合结果；权限验证在映射前后都执行；
+金额一律来自确定性工具结果，模型不重算。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time as time_module
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from .llm import ChatModel, Message, ModelError, ModelReply, ToolCall
+from .metrics import QueryRequest, ToolResult, resolve_period
+from .promotion import PromotionRequest, evaluate_promotion
+
+BEIJING = ZoneInfo("Asia/Shanghai")
+TOTAL_BUDGET_SECONDS = 30
+MAX_TOOL_CALLS = 4
+MAX_MODEL_TURNS = 5
+MAX_KEPT_TURNS = 6
+
+_SYSTEM_PROMPT = """你是内部电商经营助手。当前北京时间：{now:%Y-%m-%d %H:%M}（Asia/Shanghai）。
+只能使用两个工具：
+- query_business：按已确认口径查询经营指标，日期end排他，店铺使用匿名编号{alias_doc}。
+- evaluate_promotion：仅按当前用户明确假设测算预算；当前未取得真实推广消耗。
+支持指标：支付金额、支付订单数、客单价、ERP单据数、退款发生额、期间收支差额、同批退款率、商品销量、商品支付金额。
+支持维度：合计、按日、按店铺、按商品。
+数据共同截止与覆盖限制会在工具结果中给出；未覆盖的历史不能编造数字。
+「销售额」在未确认支付/出库口径前不能直接当支付金额；店铺同名时必须先澄清。
+已知能力之外（广告实耗、全平台汇总、净利润）明确说不可用。
+不要重算金额，不要把相关性写成因果；数字以工具结果为准。"""
+
+_METRIC_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("同批退款率", "cohort_refund_rate"),
+    ("商品支付金额", "product_paid_amount"),
+    ("支付金额", "paid_amount"),
+    ("支付额", "paid_amount"),
+    ("支付订单数", "paid_orders"),
+    ("客单价", "aov"),
+    ("退款发生", "refund_amount"),
+    ("实际退款", "refund_amount"),
+    ("退款", "refund_amount"),
+    ("收支差", "cash_difference"),
+    ("ERP单", "erp_documents"),
+    ("销量", "quantity"),
+)
+
+_PII_PATTERNS = (
+    re.compile(r"1[3-9]\d{9}"),                      # 手机号
+    re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"),          # 邮箱
+    re.compile(r"\d{10,}"),                          # 订单号类长数字
+)
+
+
+class SessionState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    subject: str
+    shop_aliases: dict[str, str] = Field(default_factory=dict)  # shop_id -> 匿名编号
+    filters: dict[str, object] = Field(default_factory=dict)
+    turns: list[Message] = Field(default_factory=list)
+
+
+class TurnResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str
+    results: list[ToolResult] = Field(default_factory=list)
+    clarification: str | None = None
+    state: SessionState
+
+
+def explicit_assumptions(question: str) -> dict[str, object]:
+    """只识别明确表达的金额/比率/日期；不确定表达交给澄清。"""
+    values: dict[str, object] = {}
+    match = re.search(r"(?:假设|预计).*?销售额\s*(\d+(?:\.\d+)?)\s*(万)?元", question)
+    if match:
+        values["sales_estimate"] = Decimal(match.group(1)) * (10000 if match.group(2) else 1)
+    ratio = re.search(r"(?:推广费|费用率).*?(\d+(?:\.\d+)?)\s*%", question)
+    if ratio:
+        values["target_ratio"] = Decimal(ratio.group(1)) / 100
+    budget = re.search(r"预算\s*(\d+(?:\.\d+)?)\s*元", question)
+    if budget:
+        values["budget"] = Decimal(budget.group(1))
+    spend = re.search(r"已花\s*(\d+(?:\.\d+)?)\s*元", question)
+    if spend:
+        values["assumed_spend"] = Decimal(spend.group(1))
+    through = re.search(r"(?:实耗统计到|实耗到|已花到)\s*(\d{1,2})月(\d{1,2})日", question)
+    if through:
+        values["_spent_through_md"] = (int(through.group(1)), int(through.group(2)))
+    return values
+
+
+# ---------------------------------------------------------------------------
+# 会话辅助
+# ---------------------------------------------------------------------------
+
+
+def _fetch_shops(conn, allowed_shop_ids: frozenset[str]) -> list[tuple[str, str]]:
+    rows = conn.execute(
+        "SELECT shop_id, display_name FROM reporting.v_shops WHERE shop_id = ANY(%s)",
+        (sorted(allowed_shop_ids),),
+    ).fetchall()
+    return [(str(row[0]), str(row[1] or "")) for row in rows]
+
+
+def _ensure_aliases(state: SessionState, allowed_shop_ids: frozenset[str],
+                    shops: list[tuple[str, str]]) -> SessionState:
+    aliases = dict(state.shop_aliases)
+    changed = False
+    for index, shop_id in enumerate(sorted(allowed_shop_ids), start=1):
+        alias = f"shop_{index}"
+        existing = aliases.get(shop_id)
+        if existing != alias:
+            aliases[shop_id] = alias
+            changed = True
+    for shop_id in list(aliases):
+        if shop_id not in allowed_shop_ids:
+            aliases.pop(shop_id)
+            changed = True
+    if changed:
+        state = state.model_copy(update={"shop_aliases": aliases})
+    return state
+
+
+def _detect_metrics(question: str) -> list[str]:
+    found: list[str] = []
+    for keyword, metric in _METRIC_KEYWORDS:
+        if keyword in question and metric not in found:
+            found.append(metric)
+    return found
+
+
+def _detect_shop_ids(question: str, shops: list[tuple[str, str]],
+                     aliases: dict[str, str]) -> tuple[list[str], list[str]]:
+    """返回 (匹配的shop_ids, 同名店铺歧义名单)。"""
+    matched: list[str] = []
+    ambiguous: list[str] = []
+    alias_reverse = {alias: shop_id for shop_id, alias in aliases.items()}
+    for alias, shop_id in alias_reverse.items():
+        if re.search(rf"{alias}\b", question):
+            matched.append(shop_id)
+    for shop_id, display_name in shops:
+        if display_name and display_name in question:
+            if display_name not in matched and shop_id not in matched:
+                matched.append(shop_id)
+    # 同名检查：问题提到的名字对应多家店铺
+    names = [name for _, name in shops if name and name in question]
+    for name in set(names):
+        owners = [shop_id for shop_id, display in shops if display == name]
+        if len(owners) > 1:
+            ambiguous.append(name)
+    return matched, sorted(set(ambiguous))
+
+
+def _contains_pii(question: str) -> bool:
+    return any(pattern.search(question) for pattern in _PII_PATTERNS)
+
+
+def _anonymize_question(question: str, shops: list[tuple[str, str]]) -> str:
+    for shop_id, display_name in shops:
+        if display_name:
+            question = question.replace(display_name, shop_id)
+    return question
+
+
+def _trim_turns(turns: list[Message]) -> list[Message]:
+    """整体删除一个回合裁剪；不留孤立tool结果，不丢当前回合provider元数据。"""
+    turn_starts = [index for index, msg in enumerate(turns) if msg.role == "user"]
+    while len(turn_starts) > MAX_KEPT_TURNS:
+        cut = turn_starts[1]  # 下一回合起点即第一回合整体边界
+        turns = turns[cut:]
+        turn_starts = [index - cut for index in turn_starts if index - cut >= 0]
+    return turns
+
+
+def to_model_result(result: ToolResult, state: SessionState) -> dict[str, object]:
+    """聚合列白名单+匿名映射；原ToolResult留给本地UI，不能直接发给provider。"""
+    payload = result.model_dump(mode="json")
+    aliases = state.shop_aliases
+    alias_reverse = {alias: shop_id for shop_id, alias in aliases.items()}
+    product_alias: dict[str, str] = {}
+
+    def map_product(value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        if value not in product_alias:
+            product_alias[value] = f"商品{chr(ord('A') + len(product_alias) % 26)}"
+        return product_alias[value]
+
+    rows = payload.get("data") or []
+    for row in rows:
+        if isinstance(row, dict):
+            if "shop_id" in row and row["shop_id"] in alias_reverse:
+                row["shop_id"] = alias_reverse[row["shop_id"]]
+            if "product_id" in row:
+                row["product_id"] = map_product(row["product_id"])
+    filters = dict(payload.get("filters") or {})
+    if isinstance(filters.get("shop_ids"), list):
+        filters["shop_ids"] = [
+            alias_reverse.get(shop_id, shop_id) if isinstance(shop_id, str) else shop_id
+            for shop_id in filters["shop_ids"]
+        ]
+    return {
+        "status": payload.get("status"),
+        "metric_definition": payload.get("metric_definition"),
+        "coverage": payload.get("coverage"),
+        "limitations": payload.get("limitations"),
+        "data_as_of": payload.get("data_as_of"),
+        "filters": filters,
+        "data": rows,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 工具执行
+# ---------------------------------------------------------------------------
+
+
+def _correction_message(call_id: str, problems: list[str]) -> Message:
+    return Message(role="tool", tool_call_id=call_id,
+                   content=json.dumps({"error": "invalid_parameters",
+                                       "problems": problems}, ensure_ascii=False))
+
+
+def _handle_query_business(call: ToolCall, *, state: SessionState, conn,
+                           allowed_shop_ids: frozenset[str], now: datetime,
+                           deadline: float, question: str,
+                           previous_filters: dict[str, object]) -> ToolResult | list[str]:
+    """映射并校验后执行查询；返回ToolResult或需纠正的问题列表。"""
+    args = dict(call.arguments or {})
+    aliases = state.shop_aliases
+    alias_reverse = {alias: shop_id for shop_id, alias in aliases.items()}
+    raw_shops = args.get("shop_ids")
+    if isinstance(raw_shops, list) and raw_shops:
+        mapped: list[str] = []
+        for value in raw_shops:
+            shop_id = alias_reverse.get(str(value), str(value))
+            if shop_id not in allowed_shop_ids:
+                return [f"店铺 {value} 不在授权范围"]
+            mapped.append(shop_id)
+        args["shop_ids"] = mapped
+    elif not raw_shops:
+        previous = previous_filters.get("shop_ids")
+        if previous:
+            args["shop_ids"] = list(previous)  # type: ignore[assignment]
+    if "start" not in args or "end" not in args:
+        period = resolve_period(question, now=now)
+        previous_start = previous_filters.get("start")
+        previous_end = previous_filters.get("end")
+        if period:
+            args.setdefault("start", period[0].isoformat())
+            args.setdefault("end", period[1].isoformat())
+        elif previous_start and previous_end:
+            args.setdefault("start", previous_start)
+            args.setdefault("end", previous_end)
+    if "metrics" not in args or not args.get("metrics"):
+        previous_metrics = previous_filters.get("metrics")
+        args["metrics"] = list(previous_metrics) if previous_metrics else ["paid_amount"]
+    if "shop_ids" not in args or not args.get("shop_ids"):
+        return ["缺少店铺范围，请使用匿名店铺编号"]
+    try:
+        request = QueryRequest.model_validate(args)
+    except Exception as exc:  # noqa: BLE001 - pydantic校验错误转结构化纠正
+        return [str(exc).split("\n")[0]]
+    return _run_query_business(conn, request, allowed_shop_ids=allowed_shop_ids,
+                               now=now, deadline=deadline)
+
+
+def _run_query_business(conn, request: QueryRequest, *, allowed_shop_ids: frozenset[str],
+                        now: datetime, deadline: float) -> ToolResult:
+    from .metrics import query_business
+
+    return query_business(conn, request, allowed_shop_ids=allowed_shop_ids,
+                          now=now, deadline=deadline)
+
+
+def _handle_evaluate_promotion(call: ToolCall, *, question: str, now: datetime) -> (
+        ToolResult) | list[str]:
+    args = dict(call.arguments or {})
+    values = explicit_assumptions(question)
+    if "start" not in args or "end" not in args:
+        period = resolve_period(question, now=now)
+        if period:
+            args.setdefault("start", period[0].isoformat())
+            args.setdefault("end", period[1].isoformat())
+    if "spent_through" not in args:
+        md = values.get("_spent_through_md")
+        if isinstance(md, tuple):
+            through = date(now.year, md[0], md[1]) + timedelta(days=1)
+            args.setdefault("spent_through", through.isoformat())
+    try:
+        request = PromotionRequest.model_validate(args)
+    except Exception as exc:  # noqa: BLE001
+        return [str(exc).split("\n")[0]]
+    return evaluate_promotion(request, confirmed_inputs={
+        key: value for key, value in values.items() if not key.startswith("_")
+    }, now=now)
+
+
+# ---------------------------------------------------------------------------
+# 主回合
+# ---------------------------------------------------------------------------
+
+
+def _tool_schemas() -> list[dict[str, object]]:
+    return [
+        {"type": "function", "function": {
+            "name": "query_business",
+            "description": "按已确认口径查询经营指标，日期end排他，店铺使用匿名编号",
+            "parameters": QueryRequest.model_json_schema()}},
+        {"type": "function", "function": {
+            "name": "evaluate_promotion",
+            "description": "仅按当前用户明确假设测算预算；当前未取得真实推广消耗",
+            "parameters": PromotionRequest.model_json_schema()}},
+    ]
+
+
+def answer(question: str, state: SessionState, *, model: ChatModel, conn,
+           allowed_shop_ids: frozenset[str], now: datetime) -> TurnResult:
+    deadline = time_module.monotonic() + TOTAL_BUDGET_SECONDS
+    filters = dict(state.filters)
+    if _contains_pii(question):
+        return TurnResult(
+            text="请删除个人信息（手机号、邮箱、订单号）后重新提问；本工具只输出聚合结果。",
+            clarification="请删除个人信息后重新提问", state=state)
+    shops = _fetch_shops(conn, allowed_shop_ids)
+    state = _ensure_aliases(state, allowed_shop_ids, shops)
+    alias_doc = "，".join(
+        f"{shop_id}用{state.shop_aliases[shop_id]}表示"
+        for shop_id in sorted(state.shop_aliases))
+
+    # 澄清：销售额口径
+    if "销售额" in question and "支付" not in question and "出库" not in question \
+            and "假设" not in question and "预计" not in question:
+        return TurnResult(
+            text="", clarification="“销售额”需要确认口径：指买家已支付金额还是出库金额？"
+                                   "请确认后我再查询。",
+            state=state)
+
+    values = explicit_assumptions(question)
+    period = resolve_period(question, now=now)
+    detected_metrics = _detect_metrics(question)
+    matched_shops, ambiguous_names = _detect_shop_ids(question, shops, state.shop_aliases)
+    if ambiguous_names:
+        names = "、".join(ambiguous_names)
+        return TurnResult(
+            text="", clarification=f"存在多个同名店铺（{names}），请指明要查询的店铺编号。",
+            state=state)
+
+    tools = _tool_schemas()
+    system = Message(role="system",
+                     content=_SYSTEM_PROMPT.format(now=now.astimezone(BEIJING),
+                                                   alias_doc=alias_doc or "（无店铺）"))
+    messages = [system] + list(state.turns)
+    messages.append(Message(role="user",
+                            content=_anonymize_question(question, shops)))
+    results: list[ToolResult] = []
+    calls_used = 0
+    correction_used = False
+    text_answer: str | None = None
+    last_error: str | None = None
+    pending_call_ids: list[str] = []
+
+    for _ in range(MAX_MODEL_TURNS):
+        remaining = deadline - time_module.monotonic()
+        if remaining <= 0:
+            last_error = "本次30秒预算已耗尽，已保留已取得的确定性结果"
+            break
+        try:
+            reply: ModelReply = model.complete(messages, tools, timeout_s=remaining)
+        except ModelError as exc:
+            last_error = f"模型调用失败（{exc.code}）；固定查询入口仍可用"
+            break
+        messages.append(reply.as_message())
+        if not reply.tool_calls:
+            text_answer = reply.text or "（模型未返回内容）"
+            break
+        stop_after_batch = False
+        for call in reply.tool_calls:
+            if calls_used >= MAX_TOOL_CALLS:
+                messages.append(Message(role="tool", tool_call_id=call.id,
+                                        content=json.dumps(
+                                            {"error": "budget_exhausted",
+                                             "detail": "本次对话工具调用已达上限"},
+                                            ensure_ascii=False)))
+                stop_after_batch = True
+                continue
+            if call.arguments_error is not None or call.arguments is None:
+                if correction_used:
+                    last_error = "参数两次非法，已停止本次回答"
+                    stop_after_batch = True
+                    break
+                correction_used = True
+                messages.append(_correction_message(
+                    call.id, [call.arguments_error or "arguments不是对象"]))
+                continue
+            if call.name == "query_business":
+                outcome: ToolResult | list[str] = _handle_query_business(
+                    call, state=state, conn=conn, allowed_shop_ids=allowed_shop_ids,
+                    now=now, deadline=deadline, question=question,
+                    previous_filters=filters)
+            elif call.name == "evaluate_promotion":
+                outcome = _handle_evaluate_promotion(call, question=question, now=now)
+            else:
+                messages.append(Message(role="tool", tool_call_id=call.id,
+                                        content=json.dumps(
+                                            {"error": "unknown_tool",
+                                             "detail": "只允许query_business/evaluate_promotion"},
+                                            ensure_ascii=False)))
+                continue
+            if isinstance(outcome, list):
+                if correction_used:
+                    last_error = "参数两次非法，已停止本次回答"
+                    stop_after_batch = True
+                    break
+                correction_used = True
+                messages.append(_correction_message(call.id, outcome))
+                continue
+            calls_used += 1
+            results.append(outcome)
+            # 查询成功才更新会话筛选，失败不污染已确认state
+            if call.name == "query_business":
+                try:
+                    applied_args = dict(call.arguments or {})
+                    applied_args["shop_ids"] = _resolved_shops(
+                        call, state, filters, allowed_shop_ids)
+                    applied = QueryRequest.model_validate(applied_args)
+                    filters.update({
+                        "start": applied.start.isoformat(),
+                        "end": applied.end.isoformat(),
+                        "shop_ids": applied.shop_ids,
+                        "metrics": list(applied.metrics),
+                    })
+                except Exception:  # noqa: BLE001 - 参数合并失败不影响结果返回
+                    pass
+            messages.append(Message(
+                role="tool", tool_call_id=call.id,
+                content=json.dumps(to_model_result(outcome, state), ensure_ascii=False)))
+        if stop_after_batch:
+            break
+    if text_answer is None and last_error is None:
+        last_error = "未取得模型回答；已保留确定性结果"
+
+    new_state = state.model_copy(update={
+        "filters": filters,
+        "turns": _trim_turns(messages[1:]),
+    })
+    return TurnResult(text=text_answer or last_error or "", results=results,
+                      clarification=None, state=new_state)
+
+
+def _resolved_shops(call: ToolCall, state: SessionState,
+                    filters: dict[str, object],
+                    allowed_shop_ids: frozenset[str]) -> list[str]:
+    args = call.arguments or {}
+    raw = args.get("shop_ids")
+    alias_reverse = {alias: shop_id for shop_id, alias in state.shop_aliases.items()}
+    if isinstance(raw, list) and raw:
+        return [alias_reverse.get(str(value), str(value)) for value in raw]
+    previous = filters.get("shop_ids")
+    if isinstance(previous, list) and previous:
+        return [str(value) for value in previous]
+    return sorted(allowed_shop_ids)

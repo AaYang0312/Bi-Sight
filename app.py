@@ -242,15 +242,41 @@ def main() -> None:
 
 
 def _chat_section(settings: AppSettings) -> None:
-    """对话入口在任务9接入；模型未配置时固定查询照常工作。"""
+    """对话查询：单Agent、两工具、30秒预算；模型不可用时固定查询照常工作。"""
     st.subheader("对话查询")
     try:
         from bi_agent.config import load_model_settings
 
-        load_model_settings(os.environ)
-        st.caption("对话功能在任务9接入")
+        model_settings = load_model_settings(os.environ)
     except ValueError as exc:
         st.caption(f"对话功能未启用（{exc}）；固定查询不受影响")
+        return
+    from bi_agent.agent import SessionState, TurnResult, answer
+    from bi_agent.llm import ModelError, create_model
+
+    model = create_model(model_settings)
+    if "agent_state" not in st.session_state:
+        st.session_state["agent_state"] = SessionState(
+            subject=str(st.session_state.get("subject", "local-development")))
+    question = st.chat_input("例如：最近7天支付金额如何？")
+    if not question:
+        return
+    try:
+        with psycopg.connect(settings.reader_dsn.get_secret_value()) as conn:
+            turn: TurnResult = answer(
+                question, st.session_state["agent_state"], model=model, conn=conn,
+                allowed_shop_ids=settings.shop_ids,
+                now=datetime.now(BEIJING))
+    except psycopg.OperationalError:
+        st.error("数据库连接失败，请检查只读配置")
+        return
+    except ModelError as exc:
+        st.error(f"模型调用失败（{exc.code}）；固定查询入口仍可用")
+        return
+    st.session_state["agent_state"] = turn.state
+    for result in turn.results:
+        render_result(result)
+    st.write(turn.clarification or turn.text)
 
 
 if __name__ == "__main__":
