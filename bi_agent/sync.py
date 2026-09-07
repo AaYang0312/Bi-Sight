@@ -5,15 +5,40 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import argparse
+import json
+import logging
+import os
+import sys
+import uuid
+from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import httpx
+
+from .config import load_sync_settings
+from .kuaimai import KuaimaiClient, KuaimaiError, parse_page
+
+logger = logging.getLogger(__name__)
 
 BEIJING = ZoneInfo("Asia/Shanghai")
 
 ORDER_SOURCE = "erp.trade.list.query"
 AFTERSALE_SOURCE = "erp.aftersale.list.query"
+
+# 单实例同步锁；锁放在整个CLI运行入口，sync_window内部仅负责单窗口事务
+LOCK_ID = 7319041
+# 增量重叠；回填开始前记录T0，完成后补拉[T0,固定T1)
+SYNC_OVERLAP = timedelta(minutes=10)
+PAGE_SIZE = 200
+# 同批退款tids补查单次ID数量；执行4.7时按官方文档或小样本确认后固定
+COHORT_TIDS_BATCH = 50
+MAX_QUERY_DAYS = 366
+
 
 # ---------------------------------------------------------------------------
 # 基础解析：金额与时间
@@ -494,3 +519,743 @@ def mark_refund_canonical(conn, shop_id: str, platform_refund_ids: set[str]) -> 
                 "WHERE shop_id=%s AND platform_refund_id=%s",
                 (shop_id, refund_id),
             )
+
+
+# ---------------------------------------------------------------------------
+# 窗口与分页拉取
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Window:
+    """业务或修改时间窗口，内部归属一律 [start, end)。"""
+
+    start: datetime
+    end: datetime
+
+
+def day_windows(start: datetime, end: datetime) -> Iterator[Window]:
+    """把范围切成每窗口不超过一天的小窗口。"""
+    cursor = start
+    while cursor < end:
+        chunk_end = min(cursor + timedelta(days=1), end)
+        yield Window(cursor, chunk_end)
+        cursor = chunk_end
+
+
+def _fmt(moment: datetime) -> str:
+    return moment.astimezone(BEIJING).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _fetch_orders_cursor(client: KuaimaiClient, *, shop_id: str, window: Window,
+                         time_type: str, query_type: str) -> Iterator[dict[str, Any]]:
+    """非归档订单：官方cursor+hasNext分页；不能用'本页少于200'作为唯一结束条件。"""
+    cursor: str | None = None
+    while True:
+        params: dict[str, str] = {
+            "userIds": shop_id,
+            "timeType": time_type,
+            "startTime": _fmt(window.start),
+            "endTime": _fmt(window.end),
+            "pageSize": str(PAGE_SIZE),
+            "queryType": query_type,
+            "useHasNext": "true",
+            "useCursor": "true",
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+        page = parse_page(client.call(ORDER_SOURCE, params))
+        yield from page.rows
+        if page.verified_empty:
+            return
+        if page.has_next is False:
+            return
+        if page.cursor is None:
+            # hasNext=true却无数据/游标：无结束证据
+            raise KuaimaiError("invalid_response")
+        if cursor is not None and page.cursor == cursor:
+            raise KuaimaiError("invalid_response")
+        cursor = page.cursor
+
+
+def _fetch_orders_paged(client: KuaimaiClient, *, shop_id: str, window: Window,
+                        time_type: str | None, query_type: str) -> Iterator[dict[str, Any]]:
+    """归档通道：页码分页；按total判断末页并检查计数一致性。"""
+    page_no = 1
+    collected = 0
+    total: int | None = None
+    while True:
+        params: dict[str, str] = {
+            "userIds": shop_id,
+            "pageNo": str(page_no),
+            "pageSize": str(PAGE_SIZE),
+            "queryType": query_type,
+            "startTime": _fmt(window.start),
+            "endTime": _fmt(window.end),
+        }
+        if time_type:
+            params["timeType"] = time_type
+        page = parse_page(client.call(ORDER_SOURCE, params))
+        if page.verified_empty:
+            return
+        if page.total is None:
+            raise KuaimaiError("invalid_response")
+        if total is not None and page.total != total:
+            # 数据漂移：重跑由上层决定，不确认覆盖
+            raise KuaimaiError("upstream")
+        total = page.total
+        yield from page.rows
+        collected += len(page.rows)
+        if collected >= total:
+            return
+        if len(page.rows) < PAGE_SIZE:
+            raise KuaimaiError("invalid_response")
+        page_no += 1
+
+
+def _fetch_aftersales_paged(client: KuaimaiClient, *, shop_id: str, window: Window,
+                            start_param: str, end_param: str,
+                            extra_params: dict[str, str] | None = None) -> Iterator[dict[str, Any]]:
+    """售后：userIds/pageNo/pageSize=200/asVersion=2；按total判断末页。"""
+    page_no = 1
+    collected = 0
+    total: int | None = None
+    while True:
+        params: dict[str, str] = {
+            "userIds": shop_id,
+            "pageNo": str(page_no),
+            "pageSize": str(PAGE_SIZE),
+            "asVersion": "2",
+            start_param: _fmt(window.start),
+            end_param: _fmt(window.end),
+        }
+        if extra_params:
+            params.update(extra_params)
+        page = parse_page(client.call(AFTERSALE_SOURCE, params))
+        if page.verified_empty:
+            return
+        if page.total is None:
+            raise KuaimaiError("invalid_response")
+        if total is not None and page.total != total:
+            raise KuaimaiError("upstream")
+        total = page.total
+        yield from page.rows
+        collected += len(page.rows)
+        if collected >= total:
+            return
+        if len(page.rows) < PAGE_SIZE:
+            raise KuaimaiError("invalid_response")
+        page_no += 1
+
+
+def fetch_window(client: KuaimaiClient, *, entity: str, shop_id: str,
+                 window: Window, mode: str) -> Iterator[dict[str, Any]]:
+    """拉取一个窗口；结束前必须证明分页完整，否则抛KuaimaiError。
+
+    初始订单回填按pay_time建立支付业务覆盖；归档边界附近分别核对
+    queryType=0/1，使用两通道覆盖且依主键幂等去重。
+    """
+    if entity == "orders":
+        if mode in ("incremental", "scan"):
+            yield from _fetch_orders_cursor(client, shop_id=shop_id, window=window,
+                                            time_type="upd_time", query_type="0")
+        elif mode in ("backfill", "replay", "reconcile", "probe"):
+            yield from _fetch_orders_cursor(client, shop_id=shop_id, window=window,
+                                            time_type="pay_time", query_type="0")
+            yield from _fetch_orders_paged(client, shop_id=shop_id, window=window,
+                                           time_type="pay_time", query_type="1")
+        else:
+            raise ValueError(f"未知模式 {mode}")
+    elif entity == "aftersales_occurrence":
+        if mode in ("incremental", "scan"):
+            yield from _fetch_aftersales_paged(client, shop_id=shop_id, window=window,
+                                               start_param="startModified",
+                                               end_param="endModified")
+        elif mode in ("backfill", "replay", "reconcile", "probe"):
+            # 售后发生额用startPlatformCompleteTime/endPlatformCompleteTime建立覆盖
+            yield from _fetch_aftersales_paged(client, shop_id=shop_id, window=window,
+                                               start_param="startPlatformCompleteTime",
+                                               end_param="endPlatformCompleteTime")
+        else:
+            raise ValueError(f"未知模式 {mode}")
+    elif entity == "aftersales_cohort":
+        raise ValueError("aftersales_cohort由check_cohort_window按已回填商业单补查")
+    else:
+        raise ValueError(f"未知实体 {entity}")
+
+
+# ---------------------------------------------------------------------------
+# 窗口事务与覆盖/水位维护
+# ---------------------------------------------------------------------------
+
+
+def _ensure_state(conn, source: str, entity: str, shop_id: str) -> None:
+    conn.execute(
+        "INSERT INTO bi.sync_state(source, entity, shop_id) VALUES (%s, %s, %s) "
+        "ON CONFLICT (source, entity, shop_id) DO NOTHING",
+        (source, entity, shop_id),
+    )
+
+
+def _extend_incremental_coverage(conn, *, source: str, entity: str, shop_id: str,
+                                 batch_id: str, window: Window) -> None:
+    """确认期间新增支付/退款的收录后才扩展已建立的业务覆盖终点。"""
+    if entity == "orders":
+        business_end = conn.execute(
+            "SELECT max(paid_at) FROM bi.orders WHERE shop_id=%s AND batch_id=%s",
+            (shop_id, batch_id),
+        ).fetchone()[0]
+    else:
+        business_end = conn.execute(
+            "SELECT max(platform_completed_at) FROM bi.aftersales "
+            "WHERE shop_id=%s AND batch_id=%s AND platform_success",
+            (shop_id, batch_id),
+        ).fetchone()[0]
+    if business_end is None:
+        return
+    state = conn.execute(
+        "SELECT covered FROM bi.sync_state WHERE source=%s AND entity=%s AND shop_id=%s FOR UPDATE",
+        (source, entity, shop_id),
+    ).fetchone()
+    if state is None:
+        return
+    uppers = [rng.upper for rng in state[0]
+              if rng.upper is not None and rng.upper != datetime.max.replace(tzinfo=BEIJING)]
+    if not uppers:
+        return  # 未建立业务覆盖，不靠增量直接填平历史缺口
+    prev_end = max(uppers)
+    if business_end <= prev_end:
+        return
+    if window.start - prev_end > SYNC_OVERLAP:
+        return  # 覆盖不连续
+    # 终点含边界时刻的已收录支付（[start,end)归属，多加1秒覆盖边界）
+    conn.execute(
+        "UPDATE bi.sync_state SET covered = covered + tstzmultirange(tstzrange(%s, %s, '[)')) "
+        "WHERE source=%s AND entity=%s AND shop_id=%s",
+        (prev_end, business_end + timedelta(seconds=1), source, entity, shop_id),
+    )
+
+
+
+
+def _record_window_success(conn, *, source: str, entity: str, shop_id: str,
+                           window: Window, mode: str, batch_id: str) -> None:
+    _ensure_state(conn, source, entity, shop_id)
+    if mode in ("incremental", "scan"):
+        conn.execute(
+            "UPDATE bi.sync_state SET watermark=%s, last_success_at=now(), last_error_code=NULL "
+            "WHERE source=%s AND entity=%s AND shop_id=%s",
+            (window.end, source, entity, shop_id),
+        )
+        _extend_incremental_coverage(conn, source=source, entity=entity, shop_id=shop_id,
+                                     batch_id=batch_id, window=window)
+    else:
+        # 仅完成对应业务时间回填/replay的窗口可加入覆盖；
+        # upd_time成功本身不能证明该修改窗口就是支付覆盖
+        conn.execute(
+            "UPDATE bi.sync_state SET "
+            "covered = covered + tstzmultirange(tstzrange(%s, %s, '[)')), "
+            "last_success_at = now(), last_error_code = NULL "
+            "WHERE source=%s AND entity=%s AND shop_id=%s",
+            (window.start, window.end, source, entity, shop_id),
+        )
+
+
+def record_failure(conn, *, source: str, entity: str, shop_id: str, code: str) -> None:
+    """异常回滚后另开短事务记录；保留旧成功水位和已完成窗口。"""
+    _ensure_state(conn, source, entity, shop_id)
+    conn.execute(
+        "UPDATE bi.sync_state SET last_attempt_at=now(), last_error_code=%s "
+        "WHERE source=%s AND entity=%s AND shop_id=%s",
+        (code, source, entity, shop_id),
+    )
+
+
+def sync_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
+                window: Window, mode: str) -> int:
+    """单个窗口事务：拉取、规范化、入库、去重；成功后推进状态。成功返回写入记录数。"""
+    batch_id = uuid.uuid4().hex
+    source = ORDER_SOURCE if entity == "orders" else AFTERSALE_SOURCE
+    accepted = 0
+    refund_ids: set[str] = set()
+    touched_commercials: set[str] = set()
+    with conn.transaction():
+        for raw in fetch_window(client, entity=entity, shop_id=shop_id, window=window, mode=mode):
+            if entity == "orders":
+                trade = normalise_trade(raw)
+                if trade["normalization_status"] == "invalid":
+                    continue
+                apply_trade(conn, trade, batch_id=batch_id)
+                accepted += 1
+                touched_commercials.update(trade["commercial_ids"])
+            else:
+                aftersale = normalise_aftersale(raw)
+                if apply_aftersale(conn, aftersale, batch_id=batch_id):
+                    accepted += 1
+                if aftersale["platform_refund_id"]:
+                    refund_ids.add(aftersale["platform_refund_id"])
+                if aftersale["commercial_id"]:
+                    touched_commercials.add(aftersale["commercial_id"])
+        if entity != "orders":
+            refresh_aftersale_matched(conn, shop_id, touched_commercials)
+        mark_refund_canonical(conn, shop_id, refund_ids)
+        _record_window_success(conn, source=source, entity=entity, shop_id=shop_id,
+                               window=window, mode=mode, batch_id=batch_id)
+    return accepted
+
+
+def check_cohort_window(conn, client: KuaimaiClient, *, shop_id: str,
+                        window: Window) -> int:
+    """同批退款：用已回填商业单的tids分批补查，并建立cohort覆盖。
+
+    另取status=2,12未结工单属于增量/reconcile的modified扫描，不在此处。
+    """
+    batch_id = uuid.uuid4().hex
+    refund_ids: set[str] = set()
+    touched: set[str] = set()
+    with conn.transaction():
+        commercials = [
+            row[0] for row in conn.execute(
+                "SELECT commercial_id FROM bi.order_payments "
+                "WHERE shop_id=%s AND paid_at >= %s AND paid_at < %s AND verified",
+                (shop_id, window.start, window.end),
+            ).fetchall()
+        ]
+        for offset in range(0, len(commercials), COHORT_TIDS_BATCH):
+            chunk = commercials[offset:offset + COHORT_TIDS_BATCH]
+            page_no = 1
+            collected = 0
+            total: int | None = None
+            while True:
+                params = {
+                    "userIds": shop_id,
+                    "pageNo": str(page_no),
+                    "pageSize": str(PAGE_SIZE),
+                    "asVersion": "2",
+                    "tids": ",".join(chunk),
+                }
+                page = parse_page(client.call(AFTERSALE_SOURCE, params))
+                if page.verified_empty:
+                    break
+                if page.total is None:
+                    raise KuaimaiError("invalid_response")
+                if total is not None and page.total != total:
+                    raise KuaimaiError("upstream")
+                total = page.total
+                for raw in page.rows:
+                    aftersale = normalise_aftersale(raw)
+                    apply_aftersale(conn, aftersale, batch_id=batch_id)
+                    if aftersale["platform_refund_id"]:
+                        refund_ids.add(aftersale["platform_refund_id"])
+                    if aftersale["commercial_id"]:
+                        touched.add(aftersale["commercial_id"])
+                collected += len(page.rows)
+                if collected >= total:
+                    break
+                if len(page.rows) < PAGE_SIZE:
+                    raise KuaimaiError("invalid_response")
+                page_no += 1
+        refresh_aftersale_matched(conn, shop_id, touched)
+        mark_refund_canonical(conn, shop_id, refund_ids)
+        _ensure_state(conn, AFTERSALE_SOURCE, "aftersales_cohort", shop_id)
+        conn.execute(
+            "UPDATE bi.sync_state SET "
+            "covered = covered + tstzmultirange(tstzrange(%s, %s, '[)')), "
+            "last_success_at = now(), last_error_code = NULL, "
+            "data_as_of = greatest(coalesce(data_as_of, '1970-01-01 00:00+00'), now()) "
+            "WHERE source=%s AND entity='aftersales_cohort' AND shop_id=%s",
+            (window.start, window.end, AFTERSALE_SOURCE, shop_id),
+        )
+    return len(commercials)
+
+
+def refetch_orders_for_commercials(conn, client: KuaimaiClient, *, shop_id: str,
+                                   commercial_ids: set[str]) -> int:
+    """增量收到更早商业单退款时按已发布的tid条件补拉原单。
+
+    单次tid查询参数及数量上限需在4.7真实核验后固定；当前按单tid逐个补拉。
+    """
+    accepted = 0
+    for commercial_id in sorted(commercial_ids):
+        if not commercial_id:
+            continue
+        cursor: str | None = None
+        while True:
+            params: dict[str, str] = {
+                "userIds": shop_id,
+                "timeType": "upd_time",
+                "startTime": _fmt(datetime.now(BEIJING) - timedelta(days=MAX_QUERY_DAYS)),
+                "endTime": _fmt(datetime.now(BEIJING)),
+                "pageSize": str(PAGE_SIZE),
+                "queryType": "0",
+                "useHasNext": "true",
+                "useCursor": "true",
+                "tid": commercial_id,
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            page = parse_page(client.call(ORDER_SOURCE, params))
+            batch_id = uuid.uuid4().hex
+            with conn.transaction():
+                for raw in page.rows:
+                    trade = normalise_trade(raw)
+                    if trade["normalization_status"] == "invalid":
+                        continue
+                    if apply_trade(conn, trade, batch_id=batch_id):
+                        accepted += 1
+            refresh_aftersale_matched(conn, shop_id, {commercial_id})
+            if page.verified_empty or page.has_next is False:
+                break
+            if page.cursor is None or (cursor is not None and page.cursor == cursor):
+                raise KuaimaiError("invalid_response")
+            cursor = page.cursor
+    return accepted
+
+
+def unmatched_commercials(conn, shop_id: str) -> set[str]:
+    """售后已到、原单未到的商业订单号，等待按tid补拉。"""
+    rows = conn.execute(
+        "SELECT DISTINCT a.commercial_id FROM bi.aftersales a "
+        "WHERE a.shop_id=%s AND a.commercial_id IS NOT NULL "
+        "AND NOT EXISTS (SELECT 1 FROM bi.orders o WHERE o.shop_id=a.shop_id "
+        "                AND o.active AND o.commercial_ids @> ARRAY[a.commercial_id])",
+        (shop_id,),
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+# ---------------------------------------------------------------------------
+# 店铺同步
+# ---------------------------------------------------------------------------
+
+
+def sync_shops(conn, client: KuaimaiClient) -> int:
+    """拉取店铺档案并更新bi.shops；不输出店铺名称到控制台。"""
+    page_no = 1
+    collected = 0
+    total: int | None = None
+    with conn.transaction():
+        while True:
+            page = parse_page(client.call("erp.shop.list.query", {
+                "pageNo": str(page_no), "pageSize": str(PAGE_SIZE)}))
+            if page.verified_empty:
+                break
+            if page.total is None:
+                raise KuaimaiError("invalid_response")
+            if total is not None and page.total != total:
+                raise KuaimaiError("upstream")
+            total = page.total
+            for raw in page.rows:
+                shop_id = str(raw.get("userId") or "").strip()
+                if not shop_id:
+                    continue
+                state = str(raw.get("state") or "").strip().lower()
+                enabled = state not in {"disable", "disabled", "deleted", "0"}
+                conn.execute(
+                    "INSERT INTO bi.shops(shop_id, platform, display_name, enabled) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "ON CONFLICT (shop_id) DO UPDATE SET platform=EXCLUDED.platform, "
+                    "display_name=EXCLUDED.display_name, enabled=EXCLUDED.enabled",
+                    (shop_id, str(raw.get("source") or "unknown"),
+                     str(raw.get("shopName") or raw.get("name") or ""), enabled),
+                )
+                collected += 1
+            if collected >= total:
+                break
+            if len(page.rows) < PAGE_SIZE:
+                raise KuaimaiError("invalid_response")
+            page_no += 1
+    return collected
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _connect(dsn: str):
+    # 每个conn.transaction()都是独立提交，不能让默认外层事务拖到CLI结束才提交
+    return __import__("psycopg").connect(dsn, autocommit=True)
+
+
+def _require_single_shop(settings) -> str:
+    if len(settings.shop_ids) != 1:
+        raise SystemExit("probe要求仅配置一个店铺（BI_SHOP_IDS）")
+    return next(iter(settings.shop_ids))
+
+
+def _run_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
+                window: Window, mode: str) -> int:
+    try:
+        return sync_window(conn, client, entity=entity, shop_id=shop_id,
+                           window=window, mode=mode)
+    except KuaimaiError as exc:
+        record_failure(conn, source=ORDER_SOURCE if entity == "orders" else AFTERSALE_SOURCE,
+                       entity=entity, shop_id=shop_id, code=exc.code)
+        logger.warning("sync window failed entity=%s shop=%s code=%s", entity, shop_id, exc.code)
+        raise
+
+
+def _backfill_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
+                   t0: datetime, t1: datetime) -> dict[str, int]:
+    """回填最近N天并补拉[T0,T1)；补齐成功后才发布data_as_of。"""
+    if days > MAX_QUERY_DAYS:
+        raise SystemExit(f"回填跨度最多{MAX_QUERY_DAYS}天")
+    start = t0 - timedelta(days=days)
+    stats = {"orders": 0, "aftersales_occurrence": 0, "cohort_windows": 0}
+    for window in day_windows(start, t0):
+        stats["orders"] += _run_window(conn, client, entity="orders", shop_id=shop_id,
+                                       window=window, mode="backfill")
+    for window in day_windows(start, t0):
+        stats["aftersales_occurrence"] += _run_window(
+            conn, client, entity="aftersales_occurrence", shop_id=shop_id,
+            window=window, mode="backfill")
+        check_cohort_window(conn, client, shop_id=shop_id, window=window)
+        stats["cohort_windows"] += 1
+    # 补拉回填期间的变化：修改时间扫描推进水位
+    for window in day_windows(t0, t1):
+        _run_window(conn, client, entity="orders", shop_id=shop_id,
+                    window=window, mode="scan")
+        _run_window(conn, client, entity="aftersales_occurrence", shop_id=shop_id,
+                    window=window, mode="scan")
+    with conn.transaction():
+        for entity in ("orders", "aftersales_occurrence", "aftersales_cohort"):
+            _ensure_state(conn, ORDER_SOURCE if entity == "orders" else AFTERSALE_SOURCE,
+                          entity, shop_id)
+            conn.execute(
+                "UPDATE bi.sync_state SET data_as_of=%s "
+                "WHERE source IN (%s, %s) AND entity=%s AND shop_id=%s",
+                (t1, ORDER_SOURCE, AFTERSALE_SOURCE, entity, shop_id),
+            )
+    return stats
+
+
+def _incremental_shop(conn, client: KuaimaiClient, *, shop_id: str,
+                      run_end: datetime) -> dict[str, int]:
+    """增量：从watermark-10分钟到本次固定run_end，逐日窗口推进。"""
+    stats = {"orders": 0, "aftersales_occurrence": 0}
+    for entity, source in (("orders", ORDER_SOURCE),
+                           ("aftersales_occurrence", AFTERSALE_SOURCE)):
+        state = conn.execute(
+            "SELECT watermark FROM bi.sync_state WHERE source=%s AND entity=%s AND shop_id=%s",
+            (source, entity, shop_id),
+        ).fetchone()
+        if state is None or state[0] <= datetime(1970, 1, 2, tzinfo=BEIJING):
+            raise SystemExit(f"{entity} 增量前必须先完成backfill建立水位")
+        start = state[0] - SYNC_OVERLAP
+        for window in day_windows(start, run_end):
+            stats[entity] += _run_window(conn, client, entity=entity, shop_id=shop_id,
+                                         window=window, mode="incremental")
+    # 增量收到更早商业单退款时，按已发布的tid条件补拉原单
+    missing = unmatched_commercials(conn, shop_id)
+    if missing:
+        refetch_orders_for_commercials(conn, client, shop_id=shop_id, commercial_ids=missing)
+    return stats
+
+
+def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
+                    run_end: datetime) -> dict[str, int]:
+    """按支付日/退款完成日重核最近N天，并刷新cohort覆盖与data_as_of。"""
+    if days > MAX_QUERY_DAYS:
+        raise SystemExit(f"重核跨度最多{MAX_QUERY_DAYS}天")
+    start = run_end - timedelta(days=days)
+    stats = {"orders": 0, "aftersales_occurrence": 0, "cohort_windows": 0}
+    for window in day_windows(start, run_end):
+        stats["orders"] += _run_window(conn, client, entity="orders", shop_id=shop_id,
+                                       window=window, mode="reconcile")
+        stats["aftersales_occurrence"] += _run_window(
+            conn, client, entity="aftersales_occurrence", shop_id=shop_id,
+            window=window, mode="reconcile")
+        check_cohort_window(conn, client, shop_id=shop_id, window=window)
+        stats["cohort_windows"] += 1
+    missing = unmatched_commercials(conn, shop_id)
+    if missing:
+        refetch_orders_for_commercials(conn, client, shop_id=shop_id, commercial_ids=missing)
+    return stats
+
+
+def _replay_entity(conn, client: KuaimaiClient, *, shop_id: str, entity: str,
+                   start: datetime, end: datetime) -> int:
+    """历史范围replay：业务时间窗口重跑并加入覆盖。"""
+    count = 0
+    if entity == "orders":
+        for window in day_windows(start, end):
+            count += _run_window(conn, client, entity="orders", shop_id=shop_id,
+                                 window=window, mode="replay")
+    elif entity == "aftersales_occurrence":
+        for window in day_windows(start, end):
+            count += _run_window(conn, client, entity="aftersales_occurrence",
+                                 shop_id=shop_id, window=window, mode="replay")
+    elif entity == "aftersales_cohort":
+        for window in day_windows(start, end):
+            check_cohort_window(conn, client, shop_id=shop_id, window=window)
+    else:
+        raise SystemExit(f"未知实体 {entity}")
+    return count
+
+
+def _probe(client: KuaimaiClient, *, shop_id: str, start: datetime,
+           end: datetime) -> dict[str, object]:
+    """拉全页但只输出数量、金额字段覆盖和质量统计，不输出客户/订单号。"""
+    window = Window(start, end)
+    pay_total = Decimal(0)
+    pay_present = 0
+    pay_negative = 0
+    order_count = 0
+    commercial_ids: set[str] = set()
+    tid_counts: dict[str, int] = {}
+    for raw in fetch_window(client, entity="orders", shop_id=shop_id,
+                            window=window, mode="probe"):
+        order_count += 1
+        amount = to_decimal(raw.get("payAmount"))
+        if amount is not None:
+            pay_present += 1
+            if amount < 0:
+                pay_negative += 1
+            else:
+                pay_total += amount
+        tid = str(raw.get("tid") or "").strip()
+        if tid:
+            tid_counts[tid] = tid_counts.get(tid, 0) + 1
+    commercial_ids = set(tid_counts)
+    refund_count = 0
+    refund_success = 0
+    refund_amount = Decimal(0)
+    for raw in fetch_window(client, entity="aftersales_occurrence", shop_id=shop_id,
+                            window=window, mode="probe"):
+        aftersale = normalise_aftersale(raw)
+        refund_count += 1
+        if aftersale["platform_success"]:
+            refund_success += 1
+            if aftersale["raw_platform_amount"] is not None:
+                refund_amount += aftersale["raw_platform_amount"]
+    split_or_merge = sum(1 for c in commercial_ids if tid_counts[c] > 1)
+    return {
+        "window": {"start": _fmt(start), "end": _fmt(end)},
+        "orders": order_count,
+        "pay_amount_present": pay_present,
+        "pay_amount_negative": pay_negative,
+        "pay_amount_sum": str(pay_total),
+        "commercials": len(commercial_ids),
+        "split_or_merge_commercials": split_or_merge,
+        "aftersales": refund_count,
+        "platform_success": refund_success,
+        "platform_success_amount": str(refund_amount),
+    }
+
+
+def _refresh_session(conn, client: KuaimaiClient, *, shop_id: str = "__company__") -> None:
+    """同一锁内检查到期窗口、距上次调用至少一小时；只记录期限和成功时刻。"""
+    source = "open.token.refresh"
+    _ensure_state(conn, source, "session", shop_id)
+    state = conn.execute(
+        "SELECT token_expires_at, last_refresh_at FROM bi.sync_state "
+        "WHERE source=%s AND entity='session' AND shop_id=%s",
+        (source, shop_id),
+    ).fetchone()
+    now = datetime.now(BEIJING)
+    expires_at, last_refresh = state
+    if expires_at is not None and expires_at - now > timedelta(days=7):
+        print(json.dumps({"action": "refresh-session", "skipped": "not_in_window"}))
+        return
+    if last_refresh is not None and now - last_refresh < timedelta(hours=1):
+        print(json.dumps({"action": "refresh-session", "skipped": "rate_limited"}))
+        return
+    expires = client.refresh_session(now=now)
+    conn.execute(
+        "UPDATE bi.sync_state SET token_expires_at=%s, last_refresh_at=%s, "
+        "last_success_at=%s, last_error_code=NULL "
+        "WHERE source=%s AND entity='session' AND shop_id=%s",
+        (expires, now, now, source, shop_id),
+    )
+    print(json.dumps({"action": "refresh-session", "expires_at": expires.isoformat()}))
+
+
+def _parse_date(text: str) -> datetime:
+    parsed = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=BEIJING)
+    return parsed
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    parser = argparse.ArgumentParser(prog="bi_agent.sync")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("shops")
+    probe = sub.add_parser("probe")
+    probe.add_argument("--start", required=True, help="含，YYYY-MM-DD（北京时间）")
+    probe.add_argument("--end", required=True, help="排他，YYYY-MM-DD（北京时间）")
+    backfill = sub.add_parser("backfill")
+    backfill.add_argument("--days", type=int, default=90)
+    sub.add_parser("incremental")
+    reconcile = sub.add_parser("reconcile")
+    reconcile.add_argument("--days", type=int, default=7)
+    replay = sub.add_parser("replay")
+    replay.add_argument("--entity", required=True,
+                        choices=["orders", "aftersales_occurrence", "aftersales_cohort"])
+    replay.add_argument("--start", required=True)
+    replay.add_argument("--end", required=True)
+    sub.add_parser("refresh-session")
+    args = parser.parse_args(argv)
+
+    settings = load_sync_settings(os.environ)
+    conn = _connect(settings.writer_dsn.get_secret_value())
+    locked = False
+    try:
+        locked = conn.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_ID,)).fetchone()[0]
+        if not locked:
+            raise RuntimeError("已有同步任务运行")
+        http = httpx.Client(timeout=30.0)
+        client = KuaimaiClient(settings, http)
+        try:
+            if args.command == "shops":
+                count = sync_shops(conn, client)
+                print(json.dumps({"action": "shops", "updated": count}))
+            elif args.command == "probe":
+                shop_id = _require_single_shop(settings)
+                summary = _probe(client, shop_id=shop_id,
+                                 start=_parse_date(args.start), end=_parse_date(args.end))
+                print(json.dumps(summary, ensure_ascii=False))
+            elif args.command == "backfill":
+                t0 = datetime.now(BEIJING)
+                t1 = t0
+                for shop_id in sorted(settings.shop_ids):
+                    stats = _backfill_shop(conn, client, shop_id=shop_id,
+                                           days=args.days, t0=t0, t1=t1)
+                    print(json.dumps({"action": "backfill", "shop_id": shop_id,
+                                      "stats": stats}))
+            elif args.command == "incremental":
+                run_end = datetime.now(BEIJING)
+                for shop_id in sorted(settings.shop_ids):
+                    stats = _incremental_shop(conn, client, shop_id=shop_id, run_end=run_end)
+                    print(json.dumps({"action": "incremental", "shop_id": shop_id,
+                                      "stats": stats}))
+            elif args.command == "reconcile":
+                run_end = datetime.now(BEIJING)
+                for shop_id in sorted(settings.shop_ids):
+                    stats = _reconcile_shop(conn, client, shop_id=shop_id,
+                                            days=args.days, run_end=run_end)
+                    print(json.dumps({"action": "reconcile", "shop_id": shop_id,
+                                      "stats": stats}))
+            elif args.command == "replay":
+                start = _parse_date(args.start)
+                end = _parse_date(args.end)
+                if (end - start).days > MAX_QUERY_DAYS:
+                    raise SystemExit(f"replay跨度最多{MAX_QUERY_DAYS}天")
+                for shop_id in sorted(settings.shop_ids):
+                    count = _replay_entity(conn, client, shop_id=shop_id,
+                                           entity=args.entity, start=start, end=end)
+                    print(json.dumps({"action": "replay", "shop_id": shop_id,
+                                      "entity": args.entity, "accepted": count}))
+            elif args.command == "refresh-session":
+                _refresh_session(conn, client)
+        finally:
+            http.close()
+    finally:
+        if locked:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (LOCK_ID,))
+        conn.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

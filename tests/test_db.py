@@ -6,10 +6,12 @@
 
 import os
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import httpx
 import psycopg
 
 BEIJING = ZoneInfo("Asia/Shanghai")
@@ -373,6 +375,176 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(trade["normalization_status"], "invalid")
         with self.conn.transaction():
             self.assertFalse(apply_trade(self.conn, trade, batch_id="b"))
+
+
+    # -- 窗口事务与水位（任务4） ----------------------------------------------
+
+    def _client(self):
+        from bi_agent.config import SyncSettings
+        from bi_agent.kuaimai import KuaimaiClient
+        from pydantic import SecretStr
+
+        settings = SyncSettings(
+            writer_dsn=SecretStr("postgresql://localhost/bi_agent_test"),
+            shop_ids=frozenset({"S1"}),
+            app_key=SecretStr("k"), app_secret=SecretStr("s"),
+            access_token=SecretStr("t"), refresh_token=SecretStr("r"),
+        )
+        return KuaimaiClient(settings, httpx.Client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"success": True, "total": 0}))))
+
+    def _state_row(self, entity: str, shop_id: str = "S1"):
+        source = "erp.trade.list.query" if entity == "orders" else "erp.aftersale.list.query"
+        return self.conn.execute(
+            "SELECT watermark, covered, data_as_of, last_error_code FROM bi.sync_state "
+            "WHERE source=%s AND entity=%s AND shop_id=%s",
+            (source, entity, shop_id),
+        ).fetchone()
+
+    def test_interrupted_window_does_not_advance_watermark(self):
+        """4.1：分页中断后水位不动、零业务；不能把失败变成零数据。"""
+        from bi_agent.kuaimai import KuaimaiError
+        from bi_agent.sync import Window, sync_window
+
+        self._seed_shop()
+        old_watermark = datetime(2026, 9, 5, 0, 0, tzinfo=BEIJING)
+        self.conn.execute(
+            "INSERT INTO bi.sync_state(source, entity, shop_id, watermark) "
+            "VALUES ('erp.trade.list.query', 'orders', 'S1', %s)",
+            (old_watermark,),
+        )
+
+        def interrupted_fetch(*args, **kwargs):
+            yield {"sid": "E1", "userId": "S1", "updTime": 1788537600000,
+                   "tid": "C1", "payAmount": "100.00", "orders": []}
+            raise KuaimaiError("timeout")
+
+        window = Window(datetime(2026, 9, 5, 0, 0, tzinfo=BEIJING),
+                        datetime(2026, 9, 6, 0, 0, tzinfo=BEIJING))
+        client = self._client()
+        with patch("bi_agent.sync.fetch_window", side_effect=interrupted_fetch):
+            with self.assertRaises(KuaimaiError):
+                sync_window(self.conn, client, entity="orders", shop_id="S1",
+                            window=window, mode="incremental")
+        self.assertEqual(self._state_row("orders")[0], old_watermark)
+        count = self.conn.execute(
+            "SELECT count(*) FROM bi.orders WHERE shop_id='S1'").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_successful_incremental_advances_watermark_and_covers(self):
+        """4.6：补跑→覆盖缺口闭合；连续增量扩展业务覆盖终点。"""
+        from bi_agent.sync import Window, sync_window
+
+        self._seed_shop()
+        base = datetime(2026, 9, 5, 0, 0, tzinfo=BEIJING)
+        prior_end = base  # 已有覆盖终点与水位一致：连续增量
+        self.conn.execute(
+            "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered) "
+            "VALUES ('erp.trade.list.query', 'orders', 'S1', %s, "
+            "tstzmultirange(tstzrange(%s, %s, '[)')))",
+            (base, base - timedelta(days=5), prior_end))
+
+        records = [
+            {"sid": "E1", "userId": "S1", "updTime": _ms(base + timedelta(hours=2)),
+             "tid": "C1", "payAmount": "100.00",
+             "payTime": _ms(base + timedelta(hours=1)),
+             "orders": [{"oid": "E1-1", "tid": "C1", "itemSysId": "P_A",
+                          "num": "1", "payAmount": "100.00"}]},
+        ]
+        window = Window(base, base + timedelta(days=1))
+
+        def full_fetch(*args, **kwargs):
+            yield from records
+
+        client = self._client()
+        with patch("bi_agent.sync.fetch_window", side_effect=full_fetch):
+            accepted = sync_window(self.conn, client, entity="orders", shop_id="S1",
+                                   window=window, mode="incremental")
+        self.assertEqual(accepted, 1)
+        watermark, covered, _, _ = self._state_row("orders")
+        self.assertEqual(watermark, window.end)
+        contains = self.conn.execute(
+            "SELECT covered @> tstzmultirange(tstzrange(%s, %s, '[)')) "
+            "FROM bi.sync_state WHERE source='erp.trade.list.query' "
+            "AND entity='orders' AND shop_id='S1'",
+            (base, base + timedelta(hours=1, seconds=1)),
+        ).fetchone()[0]
+        self.assertTrue(contains)
+        # 覆盖不能越过已观察到的业务时间盲目延伸整天
+        beyond = self.conn.execute(
+            "SELECT covered @> tstzmultirange(tstzrange(%s, %s, '[)')) "
+            "FROM bi.sync_state WHERE source='erp.trade.list.query' "
+            "AND entity='orders' AND shop_id='S1'",
+            (base + timedelta(hours=2), window.end),
+        ).fetchone()[0]
+        self.assertFalse(beyond)
+
+    def test_fetch_window_cursor_pagination_contract(self):
+        """4.2：首请求不传cursor；后续传上一页cursor；hasNext=true无游标报错。"""
+        from bi_agent.kuaimai import KuaimaiError
+        from bi_agent.sync import Window, fetch_window
+
+        requests: list[dict] = []
+        pages = [
+            {"success": True, "total": 2, "hasNext": True, "cursor": "c1",
+             "list": [{"sid": "E1", "userId": "S1", "updTime": 1, "payAmount": "1"}]},
+            {"success": True, "total": 2, "hasNext": False,
+             "list": [{"sid": "E2", "userId": "S1", "updTime": 2, "payAmount": "2"}]},
+        ]
+
+        class FakeClient:
+            def call(self, method, params):
+                requests.append(dict(params))
+                return pages[len(requests) - 1]
+
+        window = Window(datetime(2026, 9, 5, 0, 0, tzinfo=BEIJING),
+                        datetime(2026, 9, 6, 0, 0, tzinfo=BEIJING))
+        rows = list(fetch_window(FakeClient(), entity="orders", shop_id="S1",
+                                 window=window, mode="incremental"))
+        self.assertEqual(len(rows), 2)
+        self.assertNotIn("cursor", requests[0])
+        self.assertEqual(requests[1]["cursor"], "c1")
+        self.assertEqual(requests[0]["timeType"], "upd_time")
+        self.assertEqual(requests[0]["queryType"], "0")
+
+        pages_stuck = [pages[0], pages[0]]
+
+        class StuckClient:
+            def __init__(self):
+                self.n = 0
+
+            def call(self, method, params):
+                self.n += 1
+                return pages_stuck[min(self.n - 1, 1)]
+
+        with self.assertRaises(KuaimaiError):
+            list(fetch_window(StuckClient(), entity="orders", shop_id="S1",
+                              window=window, mode="incremental"))
+
+    def test_fetch_window_aftersales_contract(self):
+        """4.2：售后分页不附订单参数，按total判断末页。"""
+        from bi_agent.sync import Window, fetch_window
+
+        requests: list[dict] = []
+        pages = [
+            {"success": True, "total": 1,
+             "list": [{"aftersaleId": "A1", "userId": "S1", "rawRefundMoney": "30"}]},
+        ]
+
+        class FakeClient:
+            def call(self, method, params):
+                requests.append(dict(params))
+                return pages[0]
+
+        window = Window(datetime(2026, 9, 5, 0, 0, tzinfo=BEIJING),
+                        datetime(2026, 9, 6, 0, 0, tzinfo=BEIJING))
+        rows = list(fetch_window(FakeClient(), entity="aftersales_occurrence",
+                                 shop_id="S1", window=window, mode="backfill"))
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("timeType", requests[0])
+        self.assertNotIn("useHasNext", requests[0])
+        self.assertIn("startPlatformCompleteTime", requests[0])
+        self.assertEqual(requests[0]["asVersion"], "2")
 
 
 if __name__ == "__main__":
