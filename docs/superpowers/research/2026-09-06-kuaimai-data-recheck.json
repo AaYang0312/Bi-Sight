@@ -1,0 +1,1115 @@
+{
+  "checked_at": "2026-09-06T14:35:07+08:00",
+  "requests": [
+    {
+      "method": "erp.shop.list.query",
+      "scope": "shop_first_page",
+      "status": "success",
+      "records": 42,
+      "has_next": null,
+      "nonempty": {},
+      "numeric": {},
+      "ad_named_fields": [],
+      "platform_counts": {
+        "tb": 10,
+        "tm": 2,
+        "fxg": 4,
+        "pdd": 16,
+        "jd": 1,
+        "kuaishou": 2,
+        "wxsph": 3,
+        "1688": 1,
+        "alibabac2m": 2,
+        "wsxc": 1
+      },
+      "enabled_platform_counts": {
+        "tb": 9,
+        "tm": 2,
+        "fxg": 4,
+        "pdd": 13,
+        "jd": 1,
+        "kuaishou": 1,
+        "alibabac2m": 1,
+        "wxsph": 1,
+        "wsxc": 1
+      }
+    },
+    {
+      "method": "erp.trade.outstock.simple.query",
+      "scope": "fxg_updated_yesterday",
+      "status": "success",
+      "records": 20,
+      "has_next": true,
+      "nonempty": {
+        "sid": 20,
+        "tid": 20,
+        "payTime": 20,
+        "modified": 20,
+        "orders": 20
+      },
+      "numeric": {
+        "payAmount": {
+          "present": 20,
+          "missing": 0,
+          "positive": 20,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "payment": {
+          "present": 20,
+          "missing": 0,
+          "positive": 20,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "platformPaymentAmount": {
+          "present": 0,
+          "missing": 20,
+          "positive": 0,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "cost": {
+          "present": 20,
+          "missing": 0,
+          "positive": 20,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "grossProfit": {
+          "present": 20,
+          "missing": 0,
+          "positive": 18,
+          "zero": 0,
+          "negative": 2,
+          "nonnumeric": 0
+        },
+        "actualPostFee": {
+          "present": 0,
+          "missing": 20,
+          "positive": 0,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "theoryPostFee": {
+          "present": 20,
+          "missing": 0,
+          "positive": 6,
+          "zero": 14,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "packmaCost": {
+          "present": 20,
+          "missing": 0,
+          "positive": 0,
+          "zero": 20,
+          "negative": 0,
+          "nonnumeric": 0
+        }
+      },
+      "children": {
+        "key": "orders",
+        "records": 20,
+        "numeric": {
+          "payment": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "payAmount": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "cost": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "num": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          }
+        }
+      },
+      "ad_named_fields": []
+    },
+    {
+      "method": "erp.trade.list.query",
+      "scope": "fxg_updated_yesterday",
+      "status": "success",
+      "records": 20,
+      "has_next": true,
+      "nonempty": {
+        "sid": 20,
+        "tid": 20,
+        "payTime": 20,
+        "modified": 20,
+        "orders": 20
+      },
+      "numeric": {
+        "payAmount": {
+          "present": 20,
+          "missing": 0,
+          "positive": 20,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "payment": {
+          "present": 20,
+          "missing": 0,
+          "positive": 20,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "platformPaymentAmount": {
+          "present": 0,
+          "missing": 20,
+          "positive": 0,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "cost": {
+          "present": 20,
+          "missing": 0,
+          "positive": 20,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "grossProfit": {
+          "present": 20,
+          "missing": 0,
+          "positive": 18,
+          "zero": 0,
+          "negative": 2,
+          "nonnumeric": 0
+        },
+        "actualPostFee": {
+          "present": 0,
+          "missing": 20,
+          "positive": 0,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "theoryPostFee": {
+          "present": 20,
+          "missing": 0,
+          "positive": 6,
+          "zero": 14,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "packmaCost": {
+          "present": 20,
+          "missing": 0,
+          "positive": 0,
+          "zero": 20,
+          "negative": 0,
+          "nonnumeric": 0
+        }
+      },
+      "children": {
+        "key": "orders",
+        "records": 20,
+        "numeric": {
+          "payment": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "payAmount": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "cost": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "num": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          }
+        }
+      },
+      "ad_named_fields": []
+    },
+    {
+      "method": "erp.aftersale.list.query",
+      "scope": "fxg_updated_yesterday",
+      "status": "success",
+      "records": 14,
+      "has_next": null,
+      "nonempty": {
+        "id": 14,
+        "sid": 14,
+        "tid": 14,
+        "onlineStatus": 14,
+        "platformCompleteTime": 9,
+        "items": 14
+      },
+      "numeric": {
+        "rawRefundMoney": {
+          "present": 14,
+          "missing": 0,
+          "positive": 14,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "refundMoney": {
+          "present": 14,
+          "missing": 0,
+          "positive": 14,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        }
+      },
+      "children": {
+        "key": "items",
+        "records": 16,
+        "numeric": {
+          "refundMoney": {
+            "present": 16,
+            "missing": 0,
+            "positive": 14,
+            "zero": 2,
+            "negative": 0,
+            "nonnumeric": 0
+          }
+        }
+      },
+      "ad_named_fields": []
+    },
+    {
+      "method": "erp.trade.outstock.simple.query",
+      "scope": "tb_updated_yesterday",
+      "status": "success",
+      "records": 20,
+      "has_next": true,
+      "nonempty": {
+        "sid": 20,
+        "tid": 20,
+        "payTime": 20,
+        "modified": 20,
+        "orders": 20
+      },
+      "numeric": {
+        "payAmount": {
+          "present": 20,
+          "missing": 0,
+          "positive": 20,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "payment": {
+          "present": 20,
+          "missing": 0,
+          "positive": 20,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "platformPaymentAmount": {
+          "present": 0,
+          "missing": 20,
+          "positive": 0,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "cost": {
+          "present": 20,
+          "missing": 0,
+          "positive": 20,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "grossProfit": {
+          "present": 20,
+          "missing": 0,
+          "positive": 17,
+          "zero": 0,
+          "negative": 3,
+          "nonnumeric": 0
+        },
+        "actualPostFee": {
+          "present": 0,
+          "missing": 20,
+          "positive": 0,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "theoryPostFee": {
+          "present": 20,
+          "missing": 0,
+          "positive": 13,
+          "zero": 7,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "packmaCost": {
+          "present": 20,
+          "missing": 0,
+          "positive": 0,
+          "zero": 20,
+          "negative": 0,
+          "nonnumeric": 0
+        }
+      },
+      "children": {
+        "key": "orders",
+        "records": 20,
+        "numeric": {
+          "payment": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "payAmount": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "cost": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "num": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          }
+        }
+      },
+      "ad_named_fields": []
+    },
+    {
+      "method": "erp.trade.outstock.simple.query",
+      "scope": "tm_updated_yesterday",
+      "status": "success",
+      "records": 20,
+      "has_next": true,
+      "nonempty": {
+        "sid": 20,
+        "tid": 20,
+        "payTime": 20,
+        "modified": 20,
+        "orders": 20
+      },
+      "numeric": {
+        "payAmount": {
+          "present": 20,
+          "missing": 0,
+          "positive": 20,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "payment": {
+          "present": 20,
+          "missing": 0,
+          "positive": 20,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "platformPaymentAmount": {
+          "present": 0,
+          "missing": 20,
+          "positive": 0,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "cost": {
+          "present": 20,
+          "missing": 0,
+          "positive": 20,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "grossProfit": {
+          "present": 20,
+          "missing": 0,
+          "positive": 19,
+          "zero": 0,
+          "negative": 1,
+          "nonnumeric": 0
+        },
+        "actualPostFee": {
+          "present": 0,
+          "missing": 20,
+          "positive": 0,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "theoryPostFee": {
+          "present": 20,
+          "missing": 0,
+          "positive": 15,
+          "zero": 5,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "packmaCost": {
+          "present": 20,
+          "missing": 0,
+          "positive": 0,
+          "zero": 20,
+          "negative": 0,
+          "nonnumeric": 0
+        }
+      },
+      "children": {
+        "key": "orders",
+        "records": 28,
+        "numeric": {
+          "payment": {
+            "present": 28,
+            "missing": 0,
+            "positive": 28,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "payAmount": {
+            "present": 28,
+            "missing": 0,
+            "positive": 28,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "cost": {
+            "present": 28,
+            "missing": 0,
+            "positive": 28,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "num": {
+            "present": 28,
+            "missing": 0,
+            "positive": 28,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          }
+        }
+      },
+      "ad_named_fields": []
+    },
+    {
+      "method": "erp.trade.outstock.simple.query",
+      "scope": "pdd_updated_yesterday",
+      "status": "success",
+      "records": 20,
+      "has_next": true,
+      "nonempty": {
+        "sid": 20,
+        "tid": 0,
+        "payTime": 20,
+        "modified": 0,
+        "orders": 20
+      },
+      "numeric": {
+        "payAmount": {
+          "present": 0,
+          "missing": 20,
+          "positive": 0,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "payment": {
+          "present": 0,
+          "missing": 20,
+          "positive": 0,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "platformPaymentAmount": {
+          "present": 0,
+          "missing": 20,
+          "positive": 0,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "cost": {
+          "present": 20,
+          "missing": 0,
+          "positive": 19,
+          "zero": 1,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "grossProfit": {
+          "present": 20,
+          "missing": 0,
+          "positive": 19,
+          "zero": 0,
+          "negative": 1,
+          "nonnumeric": 0
+        },
+        "actualPostFee": {
+          "present": 0,
+          "missing": 20,
+          "positive": 0,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "theoryPostFee": {
+          "present": 20,
+          "missing": 0,
+          "positive": 13,
+          "zero": 7,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "packmaCost": {
+          "present": 20,
+          "missing": 0,
+          "positive": 0,
+          "zero": 20,
+          "negative": 0,
+          "nonnumeric": 0
+        }
+      },
+      "children": {
+        "key": "orders",
+        "records": 20,
+        "numeric": {
+          "payment": {
+            "present": 0,
+            "missing": 20,
+            "positive": 0,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "payAmount": {
+            "present": 0,
+            "missing": 20,
+            "positive": 0,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "cost": {
+            "present": 20,
+            "missing": 0,
+            "positive": 19,
+            "zero": 1,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "num": {
+            "present": 20,
+            "missing": 0,
+            "positive": 20,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          }
+        }
+      },
+      "ad_named_fields": []
+    },
+    {
+      "method": "erp.aftersale.list.query",
+      "scope": "pdd_updated_yesterday",
+      "status": "success",
+      "records": 8,
+      "has_next": null,
+      "nonempty": {
+        "id": 8,
+        "sid": 8,
+        "tid": 8,
+        "onlineStatus": 8,
+        "platformCompleteTime": 7,
+        "items": 8
+      },
+      "numeric": {
+        "rawRefundMoney": {
+          "present": 8,
+          "missing": 0,
+          "positive": 8,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "refundMoney": {
+          "present": 8,
+          "missing": 0,
+          "positive": 8,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        }
+      },
+      "children": {
+        "key": "items",
+        "records": 9,
+        "numeric": {
+          "refundMoney": {
+            "present": 8,
+            "missing": 1,
+            "positive": 8,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          }
+        }
+      },
+      "ad_named_fields": []
+    },
+    {
+      "method": "erp.wave.logistics.order.query",
+      "scope": "fxg_shipped_yesterday",
+      "status": "unexpected_list_shape",
+      "expected_key": "list",
+      "actual_type": "NoneType",
+      "response_keys": [
+        "traceId",
+        "total",
+        "success"
+      ]
+    },
+    {
+      "method": "erp.aftersale.refund.warehouse.query",
+      "scope": "fxg_returns_updated_yesterday",
+      "status": "unexpected_list_shape",
+      "expected_key": "list",
+      "actual_type": "NoneType",
+      "response_keys": [
+        "traceId",
+        "total",
+        "success"
+      ]
+    },
+    {
+      "method": "item.list.query",
+      "scope": "three_enabled_products",
+      "status": "success",
+      "records": 3,
+      "has_next": null,
+      "nonempty": {
+        "sysItemId": 3,
+        "outerId": 3,
+        "skus": 0,
+        "modified": 3
+      },
+      "numeric": {
+        "purchasePrice": {
+          "present": 3,
+          "missing": 0,
+          "positive": 3,
+          "zero": 0,
+          "negative": 0,
+          "nonnumeric": 0
+        },
+        "priceOutput": {
+          "present": 3,
+          "missing": 0,
+          "positive": 2,
+          "zero": 1,
+          "negative": 0,
+          "nonnumeric": 0
+        }
+      },
+      "children": {
+        "key": "skus",
+        "records": 0,
+        "numeric": {
+          "purchasePrice": {
+            "present": 0,
+            "missing": 0,
+            "positive": 0,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "priceOutput": {
+            "present": 0,
+            "missing": 0,
+            "positive": 0,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          }
+        }
+      },
+      "ad_named_fields": []
+    },
+    {
+      "method": "erp.item.sku.list.get",
+      "scope": "one_product_skus",
+      "status": "unexpected_list_shape",
+      "expected_key": "itemSkus",
+      "actual_type": "NoneType",
+      "response_keys": [
+        "traceId",
+        "success"
+      ]
+    },
+    {
+      "method": "erp.item.history.cost.price.query",
+      "scope": "one_sku_history",
+      "status": "unexpected_list_shape",
+      "expected_key": "list",
+      "actual_type": "NoneType",
+      "response_keys": [
+        "traceId",
+        "success"
+      ]
+    },
+    {
+      "method": "stock.api.status.query",
+      "scope": "one_product_stock",
+      "status": "unexpected_list_shape",
+      "expected_key": "stockStatusVoList",
+      "actual_type": "NoneType",
+      "response_keys": [
+        "traceId",
+        "total",
+        "success"
+      ]
+    },
+    {
+      "method": "erp.item.warehouse.list.get",
+      "scope": "one_product_warehouse_stock",
+      "status": "unexpected_list_shape",
+      "expected_key": "skus",
+      "actual_type": "NoneType",
+      "response_keys": [
+        "traceId",
+        "success"
+      ]
+    },
+    {
+      "method": "purchase.order.query",
+      "scope": "purchase_updated_yesterday",
+      "status": "unexpected_list_shape",
+      "expected_key": "list",
+      "actual_type": "NoneType",
+      "response_keys": [
+        "traceId",
+        "total",
+        "success"
+      ]
+    }
+  ],
+  "sample_window_gmt8": {
+    "startTime": "2026-09-05 00:00:00",
+    "endTime": "2026-09-05 23:59:59"
+  },
+  "request_count": 16,
+  "followup": {
+    "checked_at": "2026-09-06T14:38:17+08:00",
+    "requests": [
+      {
+        "method": "erp.shop.list.query",
+        "scope": "followup_shop_first_page",
+        "api_success": true,
+        "reported_total": null,
+        "status": "success",
+        "records": 42,
+        "has_next": null,
+        "nonempty": {},
+        "numeric": {},
+        "ad_named_fields": [],
+        "platform_counts": {
+          "tb": 10,
+          "tm": 2,
+          "fxg": 4,
+          "pdd": 16,
+          "jd": 1,
+          "kuaishou": 2,
+          "wxsph": 3,
+          "1688": 1,
+          "alibabac2m": 2,
+          "wsxc": 1
+        },
+        "enabled_platform_counts": {
+          "tb": 9,
+          "tm": 2,
+          "fxg": 4,
+          "pdd": 13,
+          "jd": 1,
+          "kuaishou": 1,
+          "alibabac2m": 1,
+          "wxsph": 1,
+          "wsxc": 1
+        }
+      },
+      {
+        "method": "erp.trade.list.query",
+        "scope": "followup_fxg_orders",
+        "api_success": true,
+        "reported_total": 282,
+        "status": "success",
+        "records": 20,
+        "has_next": null,
+        "nonempty": {
+          "sid": 20,
+          "orders": 20
+        },
+        "numeric": {},
+        "ad_named_fields": []
+      },
+      {
+        "method": "erp.item.sku.list.get",
+        "scope": "sold_product_skus",
+        "api_success": true,
+        "reported_total": null,
+        "status": "success",
+        "records": 8,
+        "has_next": null,
+        "nonempty": {
+          "sysItemId": 8,
+          "sysSkuId": 8
+        },
+        "numeric": {
+          "purchasePrice": {
+            "present": 8,
+            "missing": 0,
+            "positive": 8,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "priceOutput": {
+            "present": 8,
+            "missing": 0,
+            "positive": 7,
+            "zero": 1,
+            "negative": 0,
+            "nonnumeric": 0
+          }
+        },
+        "ad_named_fields": []
+      },
+      {
+        "method": "erp.item.history.cost.price.query",
+        "scope": "sold_product_history",
+        "api_success": true,
+        "reported_total": null,
+        "status": "success_no_records",
+        "expected_key": "list",
+        "actual_type": "NoneType",
+        "response_keys": [
+          "traceId",
+          "success"
+        ]
+      },
+      {
+        "method": "stock.api.status.query",
+        "scope": "sold_product_stock",
+        "api_success": true,
+        "reported_total": 8,
+        "status": "success",
+        "records": 3,
+        "has_next": null,
+        "nonempty": {
+          "sysItemId": 3,
+          "sysSkuId": 3,
+          "stockStatus": 3,
+          "stockModifiedTime": 3
+        },
+        "numeric": {
+          "totalAvailableStock": {
+            "present": 3,
+            "missing": 0,
+            "positive": 2,
+            "zero": 1,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "totalLockStock": {
+            "present": 3,
+            "missing": 0,
+            "positive": 1,
+            "zero": 2,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "totalAvailableStockSum": {
+            "present": 3,
+            "missing": 0,
+            "positive": 2,
+            "zero": 1,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "sellableNum": {
+            "present": 3,
+            "missing": 0,
+            "positive": 2,
+            "zero": 1,
+            "negative": 0,
+            "nonnumeric": 0
+          },
+          "purchasePrice": {
+            "present": 3,
+            "missing": 0,
+            "positive": 3,
+            "zero": 0,
+            "negative": 0,
+            "nonnumeric": 0
+          }
+        },
+        "ad_named_fields": []
+      },
+      {
+        "method": "erp.item.warehouse.list.get",
+        "scope": "sold_product_warehouse_stock",
+        "api_success": true,
+        "reported_total": null,
+        "status": "success",
+        "records": 3,
+        "has_next": null,
+        "nonempty": {
+          "skuOuterId": 3,
+          "mainWareHousesStock": 3
+        },
+        "numeric": {},
+        "children": {
+          "key": "mainWareHousesStock",
+          "records": 3,
+          "numeric": {
+            "totalAvailableStock": {
+              "present": 3,
+              "missing": 0,
+              "positive": 2,
+              "zero": 1,
+              "negative": 0,
+              "nonnumeric": 0
+            },
+            "totalLockStock": {
+              "present": 3,
+              "missing": 0,
+              "positive": 1,
+              "zero": 2,
+              "negative": 0,
+              "nonnumeric": 0
+            },
+            "sellableNum": {
+              "present": 3,
+              "missing": 0,
+              "positive": 0,
+              "zero": 3,
+              "negative": 0,
+              "nonnumeric": 0
+            }
+          }
+        },
+        "ad_named_fields": []
+      },
+      {
+        "method": "erp.wave.logistics.order.query",
+        "scope": "known_order_warehouse_outstock",
+        "api_success": true,
+        "reported_total": 0,
+        "status": "success_no_records",
+        "expected_key": "list",
+        "actual_type": "NoneType",
+        "response_keys": [
+          "traceId",
+          "total",
+          "success"
+        ]
+      },
+      {
+        "method": "erp.aftersale.refund.warehouse.query",
+        "scope": "fxg_returns_last_seven_days",
+        "api_success": true,
+        "reported_total": 0,
+        "status": "success_no_records",
+        "expected_key": "list",
+        "actual_type": "NoneType",
+        "response_keys": [
+          "traceId",
+          "total",
+          "success"
+        ]
+      },
+      {
+        "method": "purchase.order.query",
+        "scope": "purchase_last_seven_days",
+        "api_success": true,
+        "reported_total": 0,
+        "status": "success_no_records",
+        "expected_key": "list",
+        "actual_type": "NoneType",
+        "response_keys": [
+          "traceId",
+          "total",
+          "success"
+        ]
+      }
+    ]
+  },
+  "total_request_count": 25
+}

@@ -1176,8 +1176,38 @@ def _parse_date(text: str) -> datetime:
     return parsed
 
 
+def _setup_logging(log_dir: str = "logs") -> None:
+    """一行JSON、字段白名单；文件轮转10MiB×5；不记录凭证/请求体/DSN。"""
+    import json as json_module
+    import logging.handlers
+    import os as os_module
+
+    class JsonFormatter(logging.Formatter):
+        _ALLOWED = ("request_id", "tool", "entity", "shop_id", "window",
+                    "rows", "duration_ms", "data_as_of", "error_code", "attempt")
+
+        def format(self, record: logging.LogRecord) -> str:
+            payload = {"ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+                       "level": record.levelname, "logger": record.name}
+            for key in self._ALLOWED:
+                if hasattr(record, key):
+                    payload[key] = getattr(record, key)
+            if record.exc_text:
+                payload["error_code"] = "exception"
+            return json_module.dumps(payload, ensure_ascii=False)
+
+    os_module.makedirs(log_dir, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        os_module.join(log_dir, "sync.log"), maxBytes=10 * 1024 * 1024,
+        backupCount=5, encoding="utf-8")
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.handlers[:] = [handler]
+    root.setLevel(logging.INFO)
+
+
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    _setup_logging()
     parser = argparse.ArgumentParser(prog="bi_agent.sync")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("shops")

@@ -86,6 +86,44 @@ development 只允许绑定本机回环地址（`st.get_option('server.address')
 - 同步失败时页面显示影响范围与最后成功时间，历史成功报表仍可查看。
 - 模拟上游超时验证：水位不动 → 页面提示失败 → 恢复后成功。
 
+## 定时任务（部署时注册，本计划不创建）
+
+```powershell
+$taskUv = (Get-Command uv).Source
+$syncAction = New-ScheduledTaskAction -Execute $taskUv -Argument 'run --locked --env-file .env.sync python -m bi_agent.sync incremental' -WorkingDirectory 'D:\Projects\bi-agent'
+$syncTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Hours 1)
+$syncSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName 'BI Agent Hourly Sync' -Action $syncAction -Trigger $syncTrigger -Settings $syncSettings
+```
+
+另建每日低峰 `reconcile --days 7` 动作；同用数据库锁，错过时下一次再跑。运行账户仅能读取同步凭证；运行参数不含密码；后台辅助进程使用隐藏窗口。
+
+## 脱敏日志
+
+同步 CLI 日志写入 `logs/sync.log`：一行JSON、字段白名单（request_id、工具名/实体、匿名店铺、日期范围、行数、耗时、data_as_of、错误类别），轮转 10MiB×5。禁止 `logger.exception` 无审查输出包含请求体/DSN的异常。页面显示同步失败影响范围与最后成功时间，历史成功报表仍可查看；用一次模拟上游超时确认水位不动、页面提示失败、随后恢复成功。
+
+## 备份与恢复（部署时执行）
+
+`bi_backup` / `bi_restore_check` 是本机 pg_service.conf 中的连接服务名；备份身份需有事实表读取权限，不能误用只看视图的应用账号。备份文件位于受限ACL及加密磁盘；每日备份、保留7天。
+
+```powershell
+New-Item -ItemType Directory -Path backups -Force
+# 备份前通过同一advisory锁暂停同步写入，记录行数/金额汇总/覆盖状态摘要
+pg_dump --dbname="service=bi_backup" --format=custom --file=backups/restore-check.dump
+# 恢复目标由管理员预建独立空库 bi_agent_restore，先确认服务确实指向此库，不覆盖业务库
+psql "service=bi_restore_check" -c "SELECT current_database();"
+pg_restore --dbname="service=bi_restore_check" --no-owner --no-privileges backups/restore-check.dump
+# 恢复后比较相同摘要，并验证关键报表可查询；记录一次真正恢复成功的日期与步骤（单有dump文件不算通过）
+```
+
+## 验收与试用
+
+验收命令与provider联调状态表见 `docs/demo.md`。试用规则：
+
+- 一店小范围试用一周：每日检查同步覆盖和失败、抽查一个经营问题、记录失败问法及口径分歧。
+- 对接口审批/字段限制形成明确问题单；不为“所有平台都有店铺记录”提前开放全平台汇总；页面始终标出试点范围。
+- 推广实耗接入前置条件（向快麦实施确认）：具体方法名/文档、当前账号授权、费用粒度、币种、修正规则、更新时间、归因窗口。拿到并对账后另建 `promotion_daily` 及真实费用规则；若快麦不提供，由经营者选择广告平台导出CSV或授权API。淘系/拼多多分别取得奇门/方舟的实际授权文档并对账后才能扩展支付能力。
+
 ## 安全红线
 
 - `.env*`、真实导出、备份、接口响应、业务截图不进 Git。

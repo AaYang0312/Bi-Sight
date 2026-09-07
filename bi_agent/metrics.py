@@ -185,6 +185,13 @@ def resolve_period(text: str, *, now: datetime) -> tuple[date, date] | None:
         except ValueError:
             return None
         return day, day + timedelta(days=1)
+    month_only = re.search(r"(\d{1,2})月", text)
+    if month_only:
+        try:
+            start = date(now.year, int(month_only.group(1)), 1)
+        except ValueError:
+            return None
+        return start, (start + timedelta(days=32)).replace(day=1)
     return None
 
 
@@ -349,13 +356,17 @@ def query_business(conn, request: QueryRequest, *, allowed_shop_ids: frozenset[s
             limitations=["本次查询时间预算已耗尽"], filters=_filters(request))
     try:
         if conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE:
-            tx = conn.transaction(psycopg.IsolationLevel.REPEATABLE_READ)
+            tx = conn.transaction()
+            with tx:
+                # 事务首条命令：可重复读，防止同步并发造成前后口径漂移
+                conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                conn.execute("SELECT set_config('transaction_read_only', 'on', true)")
+                return _query_in_transaction(conn, request, now=now, deadline=deadline)
         else:
             # 已在外层事务（测试注入合成数据）：保存点即可，读一致怿由外层保证
-            tx = conn.transaction()
-        with tx:
-            conn.execute("SELECT set_config('transaction_read_only', 'on', true)")
-            return _query_in_transaction(conn, request, now=now, deadline=deadline)
+            with conn.transaction():
+                conn.execute("SELECT set_config('transaction_read_only', 'on', true)")
+                return _query_in_transaction(conn, request, now=now, deadline=deadline)
     except psycopg.errors.QueryCanceled:
         return ToolResult(
             status="unavailable", coverage=Coverage(status="missing", start=None, end=None),

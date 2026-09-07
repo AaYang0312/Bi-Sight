@@ -620,7 +620,11 @@ def seed_business_case(conn) -> None:
     for raw in trades:
         trade = normalise_trade(raw)
         assert trade["normalization_status"] == "normal", raw
-        assert apply_trade(conn, trade, batch_id="seed")
+        if not apply_trade(conn, trade, batch_id="seed"):
+            # 同版本幂等重放：确认记录已存在
+            assert conn.execute(
+                "SELECT 1 FROM bi.orders WHERE shop_id=%s AND erp_id=%s",
+                (trade["shop_id"], trade["erp_id"])).fetchone()
 
     from bi_agent.sync import apply_aftersale, normalise_aftersale
 
@@ -636,7 +640,10 @@ def seed_business_case(conn) -> None:
         if complete is not None:
             raw["platformCompleteTime"] = _ms(complete)
         record = normalise_aftersale(raw)
-        assert apply_aftersale(conn, record, batch_id="seed")
+        if not apply_aftersale(conn, record, batch_id="seed"):
+            assert conn.execute(
+                "SELECT 1 FROM bi.aftersales WHERE shop_id='S1' AND aftersale_id=%s",
+                (record["aftersale_id"],)).fetchone()
 
     refund("R1", "C1", "PR1", "30.00", pay_time(2, 8), 7, 9, pay_time(2, 8))
     refund("R2", "C1", "PR2", "20.00", pay_time(4, 8), 7, 9, pay_time(4, 8))
