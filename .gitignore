@@ -12,3 +12,4 @@ backups/
 exports/
 可参考/
 *.dump
+logs/
