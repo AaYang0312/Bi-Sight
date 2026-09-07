@@ -1,0 +1,2 @@
+# Windows CMD reads this launcher as GBK; Git stores a reviewable UTF-8 blob.
+public_test.cmd text working-tree-encoding=GBK eol=crlf

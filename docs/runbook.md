@@ -57,6 +57,14 @@ development 只允许绑定本机回环地址（`st.get_option('server.address')
 
 会话隔离：服务端身份 subject 变化时清空会话；日期选择器的包含结束日自动转换为排他end；查询由按钮触发，不自动读库。CSV 下载只含当前授权聚合数据，对 `= + - @`、制表符开头的文本做公式注入转义，金额列按数值输出；比率缺失显示“不可计算”，缺数据不画 0 线。模型未配置或失败时固定查询照常工作。
 
+## 临时公网测试（仅本机）
+
+1. 复制 `public_test.local.cmd.example` 为 `public_test.local.cmd`，填写 SSH 别名、测试域名、Basic Auth 用户名及端口；本地文件已被 Git 忽略，禁止写入口令。
+2. 双击 `public_test.cmd` 开启入口；脚本检查本地页面、渲染 nginx 模板、清理残留转发、建立反向隧道并验证 HTTP 200。
+3. 测试后执行 `public_test.cmd close`；必须确认服务器 nginx 临时配置、远端监听端口及本地隧道进程均已清理。
+
+服务器证书与 htpasswd 由管理员预置，口令不写入脚本、配置模板或 Git。公网入口仅用于短时人工测试，不替代 OIDC 生产部署。
+
 ## 对话查询与Agent边界
 
 - 单Agent只调用两个工具：`query_business`、`evaluate_promotion`；没有自由SQL/Python/HTTP工具。
