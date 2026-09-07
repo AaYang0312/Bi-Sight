@@ -59,10 +59,9 @@ def parse_page(payload: dict[str, object]) -> Page:
         raise KuaimaiError("upstream")
     rows = payload.get("list")
     total = payload.get("total")
-    if rows is None and total == 0:
-        rows = []
     if rows is None:
-        raise KuaimaiError("unknown_empty" if total is None else "invalid_response")
+        # 实测：快麦空结果时省略 list 字段（success=true 无列表）
+        rows = []
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
         raise KuaimaiError("invalid_response")
     has_next_raw = payload.get("hasNext")

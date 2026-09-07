@@ -123,7 +123,8 @@ def _normalise_item(raw_item: dict[str, Any], erp_id: str, index: int,
         line_kind = str(raw_item.get("lineKind") or "sale")
     allocated = to_decimal(raw_item.get("payAmount"))
     return {
-        "line_id": str(raw_item.get("oid") or raw_item.get("id") or f"{erp_id}#{index}"),
+        "line_id": str(raw_item.get("id") or raw_item.get("oid")
+                       or f"{erp_id}#{index}"),
         "commercial_id": (str(raw_item.get("tid") or "").strip() or None),
         "platform_line_id": (str(raw_item.get("platformOid") or "").strip() or None),
         "product_id": (str(raw_item.get("itemSysId") or "").strip() or None),
@@ -338,9 +339,9 @@ def apply_trade(conn, trade: dict[str, Any], *, batch_id: str) -> bool:
             "SELECT source_updated_at FROM bi.orders WHERE shop_id=%s AND erp_id=%s",
             (trade["shop_id"], trade["erp_id"]),
         ).fetchone()
-        if existing is None or existing[0] > trade["source_updated_at"]:
+        if existing is None or existing[0] >= trade["source_updated_at"]:
             return False
-        # 同版本：内容不同属于冲突，进入定向完整补查，不猜哪个新
+        # 仅当数据库版本严格更旧才可能走到这里；同版本不视为冲突
         conn.execute(
             "UPDATE bi.orders SET normalization_status='version_conflict' "
             "WHERE shop_id=%s AND erp_id=%s",
@@ -403,7 +404,8 @@ def normalise_aftersale(raw: dict[str, Any], *,
     return {
         "shop_id": shop_id,
         "aftersale_id": aftersale_id,
-        "platform_refund_id": (str(raw.get("refundId") or raw.get("platformRefundId") or "").strip() or None),
+        "platform_refund_id": (str(raw.get("platformId") or raw.get("refundId")
+                                   or raw.get("platformRefundId") or "").strip() or None),
         "commercial_id": (str(raw.get("tid") or "").strip() or None),
         "erp_id": (str(raw.get("sid") or "").strip() or None),
         "raw_platform_amount": to_decimal(raw.get("rawRefundMoney")),
@@ -462,6 +464,16 @@ def apply_aftersale(conn, aftersale: dict[str, Any], *, batch_id: str) -> bool:
         ),
     ).fetchone()
     if updated is None:
+        # 版本护栏拦截：历史行仍补齐缺失的平台退款号，并维持canonical判定
+        if aftersale["platform_refund_id"]:
+            conn.execute(
+                "UPDATE bi.aftersales SET platform_refund_id=%s "
+                "WHERE shop_id=%s AND aftersale_id=%s AND platform_refund_id IS NULL",
+                (aftersale["platform_refund_id"], aftersale["shop_id"],
+                 aftersale["aftersale_id"]),
+            )
+            mark_refund_canonical(conn, aftersale["shop_id"],
+                                  {aftersale["platform_refund_id"]})
         return False
     if aftersale["platform_refund_id"]:
         mark_refund_canonical(conn, aftersale["shop_id"], {aftersale["platform_refund_id"]})
@@ -565,6 +577,8 @@ def _fetch_orders_cursor(client: KuaimaiClient, *, shop_id: str, window: Window,
         if cursor is not None:
             params["cursor"] = cursor
         page = parse_page(client.call(ORDER_SOURCE, params))
+        if not page.rows:
+            return
         yield from page.rows
         if page.verified_empty:
             return
@@ -598,18 +612,22 @@ def _fetch_orders_paged(client: KuaimaiClient, *, shop_id: str, window: Window,
         page = parse_page(client.call(ORDER_SOURCE, params))
         if page.verified_empty:
             return
-        if page.total is None:
-            raise KuaimaiError("invalid_response")
-        if total is not None and page.total != total:
+        if total is None and page.total is not None:
+            total = page.total
+        if page.total is not None and total is not None and page.total != total:
             # 数据漂移：重跑由上层决定，不确认覆盖
             raise KuaimaiError("upstream")
-        total = page.total
         yield from page.rows
         collected += len(page.rows)
-        if collected >= total:
-            return
-        if len(page.rows) < PAGE_SIZE:
-            raise KuaimaiError("invalid_response")
+        if total is not None:
+            if collected >= total:
+                return
+            if len(page.rows) < PAGE_SIZE:
+                raise KuaimaiError("invalid_response")
+        else:
+            # 归档通道不返回total：以不足一页作为末页证据
+            if len(page.rows) < PAGE_SIZE:
+                return
         page_no += 1
 
 
@@ -933,18 +951,12 @@ def sync_shops(conn, client: KuaimaiClient) -> int:
     """拉取店铺档案并更新bi.shops；不输出店铺名称到控制台。"""
     page_no = 1
     collected = 0
-    total: int | None = None
     with conn.transaction():
         while True:
             page = parse_page(client.call("erp.shop.list.query", {
                 "pageNo": str(page_no), "pageSize": str(PAGE_SIZE)}))
-            if page.verified_empty:
+            if not page.rows:
                 break
-            if page.total is None:
-                raise KuaimaiError("invalid_response")
-            if total is not None and page.total != total:
-                raise KuaimaiError("upstream")
-            total = page.total
             for raw in page.rows:
                 shop_id = str(raw.get("userId") or "").strip()
                 if not shop_id:
@@ -957,13 +969,12 @@ def sync_shops(conn, client: KuaimaiClient) -> int:
                     "ON CONFLICT (shop_id) DO UPDATE SET platform=EXCLUDED.platform, "
                     "display_name=EXCLUDED.display_name, enabled=EXCLUDED.enabled",
                     (shop_id, str(raw.get("source") or "unknown"),
-                     str(raw.get("shopName") or raw.get("name") or ""), enabled),
+                     str(raw.get("title") or raw.get("nick") or raw.get("shopName") or ""),
+                     enabled),
                 )
                 collected += 1
-            if collected >= total:
-                break
             if len(page.rows) < PAGE_SIZE:
-                raise KuaimaiError("invalid_response")
+                break
             page_no += 1
     return collected
 
@@ -1198,7 +1209,7 @@ def _setup_logging(log_dir: str = "logs") -> None:
 
     os_module.makedirs(log_dir, exist_ok=True)
     handler = logging.handlers.RotatingFileHandler(
-        os_module.join(log_dir, "sync.log"), maxBytes=10 * 1024 * 1024,
+        os_module.path.join(log_dir, "sync.log"), maxBytes=10 * 1024 * 1024,
         backupCount=5, encoding="utf-8")
     handler.setFormatter(JsonFormatter())
     root = logging.getLogger()
