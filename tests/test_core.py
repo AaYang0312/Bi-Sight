@@ -259,5 +259,36 @@ class MetricInputTests(unittest.TestCase):
         self.assertIsNone(resolve_period("照上次那样", now=now))
 
 
+class PresentationTests(unittest.TestCase):
+    def test_csv_escape_and_amounts(self):
+        from app import _csv_bytes
+
+        rows = [{"shop_id": "S1", "label": "=SUM(A1)", "cmd": "@cmd",
+                 "plus": "+1", "note": "-note", "tab": "\tvalue",
+                 "paid_amount": "1000.00", "negative_amount": "-50"}]
+        text = _csv_bytes(rows).decode("utf-8-sig")
+        self.assertIn("'=SUM(A1)", text)
+        self.assertIn("'@cmd", text)
+        self.assertIn("+1", text)  # 数值形式按数字输出，无注入风险
+        self.assertNotIn("'+1", text)
+        self.assertIn("'-note", text)
+        self.assertIn("'\tvalue", text)
+        self.assertIn("1000.00", text)
+        self.assertIn("-50", text)
+        self.assertNotIn("'-50", text)
+
+    def test_money_format_and_missing(self):
+        from app import _money
+
+        self.assertEqual(_money("166.6666"), "166.67")
+        self.assertEqual(_money(1000), "1000.00")
+        self.assertEqual(_money(None), "不可计算")
+
+    def test_exclusive_end_conversion(self):
+        from app import _exclusive_end
+
+        self.assertEqual(_exclusive_end(date(2026, 9, 7)), date(2026, 9, 8))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -53,7 +53,9 @@ uv run --env-file .env.sync python -m bi_agent.sync refresh-session
 uv run --env-file .env.app streamlit run app.py --server.address 127.0.0.1
 ```
 
-development 只允许绑定本机回环地址；生产使用 Streamlit 内置 OIDC（`.streamlit/secrets.toml`），`APP_ALLOWED_SUBJECTS` 是服务端名单。
+development 只允许绑定本机回环地址（`st.get_option('server.address')` 校验，否则拒绝渲染）；生产使用 Streamlit 内置 OIDC（`.streamlit/secrets.toml`），`APP_ALLOWED_SUBJECTS` 是服务端名单（`issuer|sub`，逗号分隔）。
+
+会话隔离：服务端身份 subject 变化时清空会话；日期选择器的包含结束日自动转换为排他end；查询由按钮触发，不自动读库。CSV 下载只含当前授权聚合数据，对 `= + - @`、制表符开头的文本做公式注入转义，金额列按数值输出；比率缺失显示“不可计算”，缺数据不画 0 线。模型未配置或失败时固定查询照常工作。
 
 ## 模型 provider
 
