@@ -328,6 +328,99 @@ class DatabaseTests(unittest.TestCase):
                 "SELECT count(*) FROM reporting.v_product_daily WHERE product_id='P_CLOSED'").fetchone()[0]
         self.assertEqual(count, 0)
 
+    def test_closed_paid_order_keeps_cash_payment_and_refund_match(self):
+        from bi_agent.sync import apply_aftersale, apply_trade, normalise_aftersale, normalise_trade
+
+        self._seed_shop()
+        paid_at = datetime(2026, 9, 2, 12, tzinfo=BEIJING)
+        closed = normalise_trade({
+            "sid": "E_CASH", "userId": "S1", "tid": "C_CASH",
+            "updTime": _ms(paid_at), "payTime": _ms(paid_at), "payAmount": "100",
+            "unifiedStatus": "CLOSED",
+            "orders": [{"oid": "L_CASH", "tid": "C_CASH", "itemSysId": "P_CASH",
+                        "type": 0, "num": "1", "payAmount": "100"}],
+        })
+        refund = normalise_aftersale({
+            "aftersaleId": "A_CASH", "userId": "S1", "tid": "C_CASH",
+            "onlineStatus": 7, "status": 9, "rawRefundMoney": "30",
+            "platformCompleteTime": _ms(paid_at), "modified": _ms(paid_at),
+        })
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(self.conn, closed, batch_id="cash"))
+            self.assertTrue(apply_aftersale(self.conn, refund, batch_id="cash"))
+            payment = self.conn.execute(
+                "SELECT amount, verified FROM bi.order_payments WHERE commercial_id='C_CASH'").fetchone()
+            matched = self.conn.execute(
+                "SELECT matched FROM bi.aftersales WHERE aftersale_id='A_CASH'").fetchone()[0]
+        self.assertEqual(payment, (Decimal("100"), True))
+        self.assertTrue(matched)
+
+    def test_closed_paid_split_orders_keep_one_verified_payment(self):
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self._seed_shop()
+        paid_at = datetime(2026, 9, 2, 12, tzinfo=BEIJING)
+
+        def closed_trade(erp_id: str, line_id: str, amount: str):
+            return normalise_trade({
+                "sid": erp_id, "userId": "S1", "tid": "C_CLOSED_SPLIT",
+                "updTime": _ms(paid_at), "payTime": _ms(paid_at), "payAmount": amount,
+                "unifiedStatus": "CLOSED",
+                "orders": [{"oid": line_id, "tid": "C_CLOSED_SPLIT", "itemSysId": "P_SPLIT",
+                            "type": 0, "num": "1", "payAmount": amount}],
+            })
+
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(self.conn, closed_trade("E_SPLIT_1", "L_SPLIT_1", "40"),
+                                        batch_id="closed-split"))
+            self.assertTrue(apply_trade(self.conn, closed_trade("E_SPLIT_2", "L_SPLIT_2", "60"),
+                                        batch_id="closed-split"))
+            payment = self.conn.execute(
+                "SELECT amount, verified, basis FROM bi.order_payments "
+                "WHERE commercial_id='C_CLOSED_SPLIT'").fetchone()
+        self.assertEqual(payment, (Decimal("100"), True, "items"))
+
+    def test_metric_semantics_migration_appends_line_kind_to_legacy_view(self):
+        from pathlib import Path
+
+        self.conn.execute("DROP VIEW reporting.v_product_daily")
+        self.conn.execute(
+            "CREATE OR REPLACE VIEW reporting.v_product_daily AS "
+            "SELECT shop_id, (paid_at AT TIME ZONE 'Asia/Shanghai')::date AS day, product_id, "
+            "sum(quantity) AS quantity, sum(gift_quantity) AS gift_quantity, "
+            "sum(allocated_paid_amount) AS product_paid_amount, bool_and(allocation_verified) "
+            "AS allocation_verified FROM bi.order_items "
+            "WHERE active AND line_kind = 'sale' AND product_id IS NOT NULL "
+            "AND allocated_paid_amount IS NOT NULL GROUP BY shop_id, day, product_id")
+        migration = Path(__file__).parents[1] / "sql" / "003_kuaimai_metric_semantics.sql"
+        self.conn.execute(migration.read_text(encoding="utf-8"))
+        columns = self.conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='reporting' AND table_name='v_product_daily' "
+            "ORDER BY ordinal_position").fetchall()
+        self.assertEqual([row[0] for row in columns], [
+            "shop_id", "day", "product_id", "quantity", "gift_quantity",
+            "product_paid_amount", "allocation_verified", "line_kind",
+        ])
+
+    def test_product_daily_keeps_suite_parent_with_kind_label(self):
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self._seed_shop()
+        paid_at = datetime(2026, 9, 2, 12, tzinfo=BEIJING)
+        suite = normalise_trade({
+            "sid": "E_SUITE", "userId": "S1", "tid": "C_SUITE",
+            "updTime": _ms(paid_at), "payTime": _ms(paid_at), "payAmount": "100",
+            "orders": [{"oid": "L_SUITE", "tid": "C_SUITE", "itemSysId": "P_SUITE",
+                        "type": 2, "num": "1", "payAmount": "100"}],
+        })
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(self.conn, suite, batch_id="suite"))
+            row = self.conn.execute(
+                "SELECT line_kind, quantity, product_paid_amount "
+                "FROM reporting.v_product_daily WHERE product_id='P_SUITE'").fetchone()
+        self.assertEqual(row, ("suite", Decimal("1"), Decimal("100")))
+
     def test_status_only_trade_update_deactivates_existing_product_rows(self):
         from bi_agent.sync import apply_trade, normalise_trade
 

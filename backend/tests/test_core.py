@@ -315,6 +315,33 @@ class SyncNormalisationTests(unittest.TestCase):
         self.assertTrue(conn.parameters[1][-1])
 
 
+class SyncSchemaTests(unittest.TestCase):
+    def test_sync_schema_rejects_missing_mapping_columns(self):
+        from bi_agent.kuaimai import KuaimaiError
+        from bi_agent.sync import assert_sync_schema
+
+        class Rows:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def fetchall(self):
+                return self.rows
+
+        class Connection:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def execute(self, sql, parameters):
+                return Rows(self.rows)
+
+        assert_sync_schema(Connection([
+            ("orders", "unified_status"), ("orders", "system_status"),
+            ("order_items", "source_type"),
+        ]))
+        with self.assertRaisesRegex(KuaimaiError, "schema_outdated"):
+            assert_sync_schema(Connection([("orders", "unified_status")]))
+
+
 class MetricInputTests(unittest.TestCase):
     def test_date_defaults_and_bounds(self):
         from bi_agent.metrics import QueryRequest, resolve_period

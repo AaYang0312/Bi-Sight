@@ -36,8 +36,8 @@ METRIC_DEFINITIONS: dict[str, str] = {
     "refund_amount": "平台退款成功发生额（按平台完成时间归属；系统实退口径未发布）",
     "cash_difference": "期间收支差额=支付金额-期间退款发生额（不是净利润，也不是同批净收入）",
     "cohort_refund_rate": "同批退款率=[start,end)支付商业单在明确截止时刻前的累计退款/同批支付额",
-    "quantity": "有效销售父行商品数量（赠品数量单独区分，不混入销量）",
-    "product_paid_amount": "已核验行级分摊的商品支付金额",
+    "quantity": "有效非赠品父项数量（含套件/组合/加工，按line_kind标注）",
+    "product_paid_amount": "已核验的非赠品父项行级分摊支付金额（按line_kind标注）",
 }
 
 ENTITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
@@ -269,7 +269,7 @@ LIMIT %s
 
 _PRODUCT_SQL = """
 SELECT shop_id, day, product_id, quantity, gift_quantity, product_paid_amount,
-       allocation_verified
+       allocation_verified, line_kind
 FROM reporting.v_product_daily
 WHERE shop_id = ANY(%s) AND day >= %s AND day < %s
 ORDER BY day, shop_id, product_id
@@ -582,9 +582,9 @@ def _product_rows(conn, request: QueryRequest, *, start_ts: datetime,
                                       MAX_ROWS)).fetchall()
     rank_metric = ("product_paid_amount" if "product_paid_amount" in request.metrics
                    else "quantity")
-    by_product: dict[tuple[str, str], dict[str, Decimal | int | bool | None]] = {}
+    by_product: dict[tuple[str, str, str], dict[str, Decimal | int | bool | None]] = {}
     for row in raw:
-        entry = by_product.setdefault((row[0], row[2]), {
+        entry = by_product.setdefault((row[0], row[2], row[7]), {
             "quantity": Decimal(0), "gift_quantity": Decimal(0),
             "product_paid_amount": Decimal(0), "allocation_verified": True})
         entry["quantity"] += row[3]
@@ -595,9 +595,9 @@ def _product_rows(conn, request: QueryRequest, *, start_ts: datetime,
                     key=lambda item: (item[1][rank_metric] or 0, item[0]),
                     reverse=True)
     rows: list[dict[str, str | int | None]] = []
-    for (shop_id, product_id), entry in ranked[:request.top_n]:
+    for (shop_id, product_id, line_kind), entry in ranked[:request.top_n]:
         rows.append({
-            "shop_id": shop_id, "product_id": product_id,
+            "shop_id": shop_id, "product_id": product_id, "line_kind": line_kind,
             "quantity": _render(entry["quantity"]),
             "gift_quantity": _render(entry["gift_quantity"]),
             "product_paid_amount": _render(entry["product_paid_amount"]),

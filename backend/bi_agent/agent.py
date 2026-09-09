@@ -190,7 +190,7 @@ def _trim_turns(turns: list[Message]) -> list[Message]:
 
 
 _PUBLIC_RESULT_COLUMNS = {
-    "day", "shop_id", "product_id", "currency", "basis",
+    "day", "shop_id", "product_id", "line_kind", "currency", "basis",
     "paid_amount", "paid_orders", "erp_documents", "aov", "refund_amount",
     "cash_difference", "cohort_refund_rate", "quantity", "product_paid_amount",
     "spend_cap", "budget", "actual_spend", "remaining_budget", "over_budget",

@@ -42,11 +42,12 @@ Vite 将 `/api` 代理到 `http://127.0.0.1:8001`。开发页必须通过 `http:
 
 `bi_sync` 写业务事实，`bi_reader` 只能读报表视图，`bi_app` 读取相同视图并读写 `bi.app_chats` 与 `bi.app_messages`。API 查询与消息写入都有五秒 SQL 超时；同一会话同时生成时返回 `409 chat_busy`。
 
-已有数据库升级快麦字段映射时，先由管理员执行前向迁移，再部署同步代码。迁移不会重写历史事实；为使修正后的状态、行号、行类型和完成时间生效，须对保留历史范围显式重放订单和售后，再刷新店铺档案。`replay` 仅会重规范化相同 `source_updated_at` 的版本，不会让较旧上游版本覆盖较新版本。
+已有数据库升级快麦字段映射与指标口径时，先由管理员执行前向迁移，再部署同步代码。迁移不会重写历史事实；为使修正后的状态、行号、行类型和完成时间生效，须对保留历史范围显式重放订单和售后，再刷新店铺档案。同步启动会检查 002 所需列；缺失时以 `schema_outdated` 拒绝写入。`replay` 仅会重规范化相同 `source_updated_at` 的版本，不会让较旧上游版本覆盖较新版本。
 
 ```powershell
 Set-Location backend
 psql -d bi_agent -f sql/002_kuaimai_mapping_repair.sql
+psql -d bi_agent -f sql/003_kuaimai_metric_semantics.sql
 uv run --env-file ../.env.sync python -m bi_agent.sync shops
 uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity orders --start <保留历史起日> --end <截止日的下一日>
 uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity aftersales_occurrence --start <保留历史起日> --end <截止日的下一日>

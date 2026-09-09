@@ -39,6 +39,11 @@ PAGE_SIZE = 200
 COHORT_TIDS_BATCH = 50
 MAX_QUERY_DAYS = 366
 
+_REQUIRED_SYNC_COLUMNS = {
+    "orders": frozenset({"unified_status", "system_status"}),
+    "order_items": frozenset({"source_type"}),
+}
+
 
 # ---------------------------------------------------------------------------
 # 基础解析：金额与时间
@@ -149,6 +154,23 @@ def _source_bool(value: Any) -> bool | None:
     return None
 
 
+def assert_sync_schema(conn) -> None:
+    """在任何同步写入前确认前向迁移已完成。"""
+    table_names = sorted(_REQUIRED_SYNC_COLUMNS)
+    column_names = sorted({column for columns in _REQUIRED_SYNC_COLUMNS.values()
+                           for column in columns})
+    rows = conn.execute(
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema='bi' AND table_name = ANY(%s) AND column_name = ANY(%s)",
+        (table_names, column_names),
+    ).fetchall()
+    present = {(str(table), str(column)) for table, column in rows}
+    required = {(table, column) for table, columns in _REQUIRED_SYNC_COLUMNS.items()
+                for column in columns}
+    if not required <= present:
+        raise KuaimaiError("schema_outdated")
+
+
 def _normalise_item(raw_item: dict[str, Any], erp_id: str, index: int,
                     fallback_paid_at: datetime | None) -> dict[str, Any]:
     quantity = to_decimal(raw_item.get("num")) or Decimal(0)
@@ -241,7 +263,8 @@ def normalise_trade(raw: dict[str, Any], *, source: str = ORDER_SOURCE) -> dict[
 def _load_orders(conn, shop_id: str, commercial_id: str) -> list[tuple]:
     return conn.execute(
         "SELECT erp_id, commercial_ids, paid_at, raw_pay_amount, source_updated_at "
-        "FROM bi.orders WHERE shop_id=%s AND commercial_ids @> %s AND active",
+        "FROM bi.orders WHERE shop_id=%s AND commercial_ids @> %s "
+        "AND (active OR (paid_at IS NOT NULL AND raw_pay_amount > 0))",
         (shop_id, [commercial_id]),
     ).fetchall()
 
@@ -264,7 +287,8 @@ def _determine_payment(conn, shop_id: str, commercial_id: str,
     # 所有引用涉及商业单的有效订单都要参与交叉核对
     all_orders = conn.execute(
         "SELECT erp_id, commercial_ids, paid_at, raw_pay_amount, source_updated_at "
-        "FROM bi.orders WHERE shop_id=%s AND commercial_ids && %s AND active",
+        "FROM bi.orders WHERE shop_id=%s AND commercial_ids && %s "
+        "AND (active OR (paid_at IS NOT NULL AND raw_pay_amount > 0))",
         (shop_id, involved),
     ).fetchall()
     source_updated_at = max(order[4] for order in all_orders) if all_orders else source_updated_at
@@ -277,8 +301,12 @@ def _determine_payment(conn, shop_id: str, commercial_id: str,
     item_rows: dict[str, list[tuple[Decimal, datetime | None]]] = {}
     for cid in involved:
         item_rows[cid] = conn.execute(
-            "SELECT allocated_paid_amount, paid_at FROM bi.order_items "
-            "WHERE shop_id=%s AND commercial_id=%s AND active AND allocated_paid_amount IS NOT NULL",
+            "SELECT i.allocated_paid_amount, i.paid_at FROM bi.order_items i "
+            "JOIN bi.orders o ON o.shop_id=i.shop_id AND o.erp_id=i.erp_id "
+            "WHERE i.shop_id=%s AND i.commercial_id=%s "
+            "AND (i.active OR (NOT o.active AND o.paid_at IS NOT NULL "
+            "                 AND o.raw_pay_amount > 0)) "
+            "AND i.allocated_paid_amount IS NOT NULL",
             (shop_id, cid),
         ).fetchall()
         if not item_rows[cid]:
@@ -553,7 +581,8 @@ def refresh_aftersale_matched(conn, shop_id: str, commercial_ids: set[str]) -> N
             """
             UPDATE bi.aftersales a SET matched = EXISTS (
                 SELECT 1 FROM bi.orders o
-                WHERE o.shop_id = a.shop_id AND o.active
+                WHERE o.shop_id = a.shop_id
+                  AND (o.active OR (o.paid_at IS NOT NULL AND o.raw_pay_amount > 0))
                   AND o.commercial_ids @> ARRAY[a.commercial_id])
             WHERE a.shop_id=%s AND a.commercial_id=%s
             """,
@@ -1005,7 +1034,8 @@ def unmatched_commercials(conn, shop_id: str) -> set[str]:
         "SELECT DISTINCT a.commercial_id FROM bi.aftersales a "
         "WHERE a.shop_id=%s AND a.commercial_id IS NOT NULL "
         "AND NOT EXISTS (SELECT 1 FROM bi.orders o WHERE o.shop_id=a.shop_id "
-        "                AND o.active AND o.commercial_ids @> ARRAY[a.commercial_id])",
+        "                AND (o.active OR (o.paid_at IS NOT NULL AND o.raw_pay_amount > 0)) "
+        "                AND o.commercial_ids @> ARRAY[a.commercial_id])",
         (shop_id,),
     ).fetchall()
     return {row[0] for row in rows}
@@ -1319,6 +1349,10 @@ def main(argv: list[str] | None = None) -> int:
         locked = conn.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_ID,)).fetchone()[0]
         if not locked:
             raise RuntimeError("已有同步任务运行")
+        try:
+            assert_sync_schema(conn)
+        except KuaimaiError as exc:
+            raise SystemExit(exc.code) from None
         http = httpx.Client(timeout=30.0)
         client = KuaimaiClient(settings, http)
         try:

@@ -21,9 +21,9 @@
 | 字段 | 规范化规则 |
 | --- | --- |
 | 订单 `payAmount/payment/platformPaymentAmount` | 分别为买家已付/应付/平台支付，均独立保留；不得互换 |
-| 订单 `unifiedStatus` / `sysStatus` | 两者原样保留；`unifiedStatus=CLOSED` 时订单无效，仅在它缺失时以 `sysStatus=CLOSED` 回退。平台 `status` 是平台码，不参与此判定 |
+| 订单 `unifiedStatus` / `sysStatus` | 两者原样保留；`unifiedStatus=CLOSED` 时订单不参与 ERP 有效单与商品父项统计，仅在它缺失时以 `sysStatus=CLOSED` 回退。平台 `status` 是平台码，不参与此判定；若已有有效支付时间和正支付额，支付事实仍保留，以便退款从已收款中抵扣 |
 | 订单 `splitType` / `splitSid` | 仅 `splitType=1` 时，将 `splitSid` 写入 `split_parent_id` |
-| 订单 `orders[].oid` / `orders[].type` / `orders[].giftNum` | `oid` 为平台行号；`type` 原样保留为 `source_type`；赠品判定以 `giftNum>0` 为准，套件/组合/加工行不进入销售父行商品排行 |
+| 订单 `orders[].oid` / `orders[].type` / `orders[].giftNum` | `oid` 为平台行号；`type` 原样保留为 `source_type`；赠品判定以 `giftNum>0` 为准。商品排行保留套件/组合/加工**父项**并输出 `line_kind`，不把它们表述为SKU子件排行 |
 | 订单 `updTime` / `modified` | 前者为ERP数据更新时间，后者为平台修改时间；对 `upd_time` 增量先核对二者含义和样本，不直接把后者当ERP版本 |
 | 订单 `cost` / `orders[].cost` / `orders[].suits[].cost` | 分别为总成本/普通行单位成本（需×num）/部分套件子结构总成本，分别标注；不统一乘数量 |
 | 售后 `rawRefundMoney` / `items[].rawRefundMoney` | 单头是元，商品明细是分；首版退款聚合仅使用单头，商品退款暂不开放 |
@@ -48,7 +48,7 @@
 | `refund_amount` | 平台退款成功（`platform_success` 且 `refund_canonical`）按完成时间归属的发生额 | aftersales_occurrence |
 | `cash_difference` | paid_amount − refund_amount；**期间收支差额，不是净利润** | 上两者 |
 | `cohort_refund_rate` | 同批：`[start,end)` 支付商业单在明确截止时刻前的累计退款 / 同批支付额 | aftersales_cohort + 原单匹配 |
-| `quantity` / `product_paid_amount` | 有效销售父行数量与已核验行级分摊金额 | order_items |
+| `quantity` / `product_paid_amount` | 有效非赠品父项数量与已核验行级分摊金额；结果以 `line_kind` 区分 sale/suite/combination/processing，套件不是子SKU排行 | order_items |
 | 推广费率/ROAS | **未启用**：无实耗来源；折扣/成本不得替代广告费 | 无 |
 
 ## 4. 已知功能门槛

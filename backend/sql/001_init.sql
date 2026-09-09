@@ -249,7 +249,7 @@ FULL JOIN documents d ON p.shop_id = d.shop_id AND p.day = d.day
 FULL JOIN refunds r ON coalesce(p.shop_id, d.shop_id) = r.shop_id
                    AND coalesce(p.day, d.day) = r.day;
 
--- 商品日聚合：仅有效销售父行及已核验的行金额；赠品数量区分展示
+-- 商品日聚合：有效父行按行性质分组；套件等为父项，不表示其SKU子件
 CREATE OR REPLACE VIEW reporting.v_product_daily AS
 SELECT shop_id,
        (paid_at AT TIME ZONE 'Asia/Shanghai')::date AS day,
@@ -257,11 +257,12 @@ SELECT shop_id,
        sum(quantity) AS quantity,
        sum(gift_quantity) AS gift_quantity,
        sum(allocated_paid_amount) AS product_paid_amount,
-       bool_and(allocation_verified) AS allocation_verified
+       bool_and(allocation_verified) AS allocation_verified,
+       line_kind
 FROM bi.order_items
-WHERE active AND line_kind = 'sale' AND product_id IS NOT NULL
+WHERE active AND line_kind <> 'gift' AND product_id IS NOT NULL
   AND allocated_paid_amount IS NOT NULL
-GROUP BY shop_id, day, product_id;
+GROUP BY shop_id, day, product_id, line_kind;
 
 -- ---------------------------------------------------------------------------
 -- 权限：bi_sync 事实表读写，bi_app 只读报表并维护聊天；不能建表/角色
