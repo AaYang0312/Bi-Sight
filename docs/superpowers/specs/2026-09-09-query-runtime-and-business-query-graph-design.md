@@ -1,7 +1,7 @@
 # 查询运行状态与确定性经营查询子图设计
 
 **日期：** 2026-09-09
-**状态：** 已完成对话设计确认，等待书面审阅
+**状态：** 已确认，可进入实施计划
 **范围：** 阶段 1「结构化运行状态」与阶段 2「现有固定查询的确定性子图」
 
 ## 1. 目标
@@ -31,7 +31,7 @@
 
 没有采用立即引入 LangGraph 的方案，因为当前查询路径节点少、转移固定，引入框架不会增加当前阶段的业务能力，反而会把依赖升级、检查点和序列化语义加入迁移范围。没有采用只定义内存状态的方案，因为无法满足错误、重试、查询结果与聊天消息分离以及可审计要求。
 
-数据库变更使用新的 `backend/sql/002_query_runtime.sql`。现有数据库映射修复由另一个 Agent 处理，本项目不修改 `sync.py`、既有业务表定义或 `metrics.py` 的查询语义。实施任务开始前必须检查工作区最新差异，避免覆盖并行工作。
+数据库变更使用新的 `backend/sql/003_query_runtime.sql`，顺接已经提交的 `002_kuaimai_mapping_repair.sql`。现有数据库映射修复由另一个 Agent 处理，本项目不修改 `sync.py`、既有业务表定义或 `metrics.py` 的查询语义。实施任务开始前必须检查工作区最新差异，避免覆盖并行工作。
 
 ## 4. 目标模块
 
@@ -123,6 +123,8 @@ def run_business_query(
 ) -> DomainResult:
     ...
 ```
+
+为兼容现有 `TurnResult.results: list[ToolResult]` 和真实店铺筛选状态，图内部可以使用不持久化的 `BusinessQueryExecution`，同时携带 `DomainResult`、原始 `ToolResult` 和 `session_filters`。公开领域入口仍只返回 `DomainResult`；兼容包装仅供当前主 Agent 迁移期间使用。
 
 `BusinessQueryInput` 包含模型工具调用 ID 与解析后的参数。`BusinessQueryContext` 仅在进程内使用，包含原始问题、会话筛选、匿名店铺映射、授权店铺 ID、业务时刻、绝对 deadline、`chat_id`、`user_message_id` 和本轮 `attempt_no`。
 
@@ -217,7 +219,8 @@ RECEIVED
   -> EXECUTE_FIXED_QUERY
   -> CLASSIFY_RESULT
   -> PERSIST_ARTIFACT
-  -> SUCCEEDED
+  -> FINALIZE
+  -> SUCCEEDED | MISSING_DATA | PARTIAL | FAILED
 ```
 
 终态包括：
@@ -236,8 +239,9 @@ FAILED
 2. `VALIDATE_PARAMETERS`：使用现有 `QueryRequest` 校验日期、指标、维度、比较和 Top-N。
 3. `AUTHORIZE_SCOPE`：确认全部店铺均在授权集合内；失败后禁止执行查询。
 4. `EXECUTE_FIXED_QUERY`：调用现有 `metrics.query_business()`，继续使用其权限二次校验、覆盖检查、绝对 deadline 和固定 SQL。
-5. `CLASSIFY_RESULT`：把 `ToolResult.status` 与覆盖状态映射成领域终态或 Artifact 路径。
-6. `PERSIST_ARTIFACT`：保存公共安全投影；成功后才能向模型返回成功结果。
+5. `CLASSIFY_RESULT`：把 `ToolResult.status` 与覆盖状态映射成待应用的领域终态。
+6. `PERSIST_ARTIFACT`：对所有形状合法的 `ToolResult` 保存公共安全投影，包括 `missing_data`、`partial` 和查询层失败结果；成功保存后才能返回该结果。
+7. `FINALIZE`：应用已分类的领域终态。Artifact 保存失败时覆盖原分类并进入 `FAILED`。
 
 状态机不允许自由选择下一节点。非法转移产生 `invalid_transition`，运行进入 `FAILED`。
 
@@ -294,7 +298,7 @@ run_chat_turn
 
 - 所有 Pydantic 边界契约拒绝额外字段。
 - `ErrorEnvelope`、运行状态和事件 payload 拒绝数据库原文、真实 ERP ID 和模型隐藏推理。
-- `002_query_runtime.sql` 可重复执行。
+- `003_query_runtime.sql` 可重复执行。
 - 一次迁移的运行更新和事件插入原子提交。
 - revision 与事件顺序一致，过期 revision 更新失败。
 - 删除聊天时运行、事件和 Artifact 级联删除。
