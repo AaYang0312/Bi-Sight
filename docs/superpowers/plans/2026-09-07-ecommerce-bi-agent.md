@@ -2,17 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 交付一个可对话查询抖音试点店铺经营情况、按明确假设测算推广预算的内部工具，结果可对账，模型 provider 可选择。
+**Goal:** 交付一个React聊天前端与FastAPI后端分离的内部Agent，可对话查询抖音试点店铺经营情况、按明确假设测算推广预算，结果可对账，模型provider可选择。
 
-**Architecture:** Python 单体，快麦同步命令将必要字段写入 PostgreSQL，受控 SQL 和 Decimal 计算指标，Streamlit 展示确定性结果。单 Agent 只调用 `query_business`、`evaluate_promotion`；模型差异收敛在 `llm.py`，不参与金额计算。
+**Architecture:** 一个仓库包含独立的React/Vite前端和FastAPI后端；生产由同源反向代理提供静态前端及 `/api`，浏览器只使用聊天会话JSON接口和SSE。快麦同步、受控SQL、Decimal指标和单Agent留在后端；`query_business`、`evaluate_promotion`只供Agent内部调用，模型差异收敛在 `llm.py`。
 
-**Tech Stack:** Python 3.11、uv、PostgreSQL 17、psycopg 3、Pydantic 2、httpx、Streamlit 原生组件及认证、Windows所需tzdata、标准库 unittest。
+**Tech Stack:** Python 3.11、uv、FastAPI、Uvicorn、PostgreSQL 17、psycopg 3、Pydantic 2、httpx、Node.js 22 LTS、npm、React 19、TypeScript、Vite、普通CSS、Windows所需tzdata、标准库unittest、Vitest。
 
 **Spec:** [2026-09-06-ecommerce-bi-agent-design.md](../specs/2026-09-06-ecommerce-bi-agent-design.md)。数据依据为 [快麦复核报告](../research/2026-09-06-kuaimai-data-verification.md) 和 [脱敏实测统计](../research/2026-09-06-kuaimai-data-recheck.json)。执行者先读设计及这两份证据；本文件安排实施，不代表代码或线上能力已经完成。
 
 ## Global Constraints
 
-- 工作目录 `D:\Projects\bi-agent`；命令示例使用 PowerShell。当前根目录尚无应用代码、根 Git 仓库、uv 或 PostgreSQL 命令环境；准备这些环境属于实施工作。
+- 工作目录 `D:\Projects\bi-agent`；命令示例使用 PowerShell。当前根Git仓库已有Streamlit原型，`bi_agent/`、`tests/`、`sql/`及锁文件均在根目录；本计划迁移并复用这些代码，不按空仓库重建。
 - 一家公司、一个已验证有数据的 `fxg` 抖音店铺先闭环；不得把样本可读取写成全量已对账。真实店铺 ID 只放本地配置。
 - 业务时区 `Asia/Shanghai`；内部范围 `[start, end)`；“最近7天”默认最近7个完整自然日；“今天”标记未完成。
 - SQL `statement_timeout=5s`，最多500行；日期跨度最多366天，必须在相关来源的已确认覆盖内。
@@ -22,9 +22,10 @@
 - 金额采用 `NUMERIC` / `Decimal`，人民币先验收；字段单位按完整路径转换。缺失、零、负值、非法值分开处理。
 - 平台实退与系统实退分开；退款发生额、同批订单退款率、期间收支差额分开；ERP 毛利不称净利润。
 - 订单、商品、退款先分别聚合再连接；保留拆合单关联；不能用当前商品成本回填历史成本。
-- 首版仅两个工具、参数化 SQL、普通 Python 函数。没有自由 SQL/Python/HTTP 工具，没有 ORM、FastAPI、LangGraph、向量库、Redis 或队列。
+- 首版仅两个内部工具、参数化 SQL、普通 Python 函数。没有自由 SQL/Python/HTTP 工具，没有 ORM、LangGraph、向量库、Redis 或队列。
 - `LLM_PROVIDER=qwen|deepseek`，显式配置 `LLM_MODEL`，只使用所选 provider 的密钥；启动时选择，无自动切换和动态路由。
-- 页面只有数据库分析身份；同步使用写入身份。应用认证和会话隔离必须在试用前完成。
+- 浏览器不连接数据库，不接触ERP/模型密钥，也没有手动指标查询API；FastAPI应用身份仅可读报表视图并读写自己的会话表，同步身份写经营事实。
+- API只包含会话CRUD、消息SSE和无敏感细节的健康检查。生产前端与API同源，不开放宽泛CORS；FastAPI只监听回环地址并信任反向代理覆盖写入的OIDC `sub`。
 - `.env`、真实导出、备份、接口响应、业务截图不进 Git。模型只接收必要聚合结果、匿名标签和口径说明；日志不记录凭证、签名串、完整请求响应或客户信息。
 - 真实推广实耗、成本贡献计算、淘系/拼多多完整支付指标均有数据门槛；未满足时明确不可用，不用0或推测值补齐。
 - 本次只编写计划。执行时按任务顺序完成、验证再提交；如采用子代理方式，另按用户选择及对应技能执行。
@@ -33,38 +34,43 @@
 
 ## 交付边界与顺序
 
-主线为 `1 配置 → 2 快麦客户端 → 3 事实表 → 4 同步 → 5 指标 → 6 固定页面 → 7 provider → 8 费用规则 → 9 对话 → 10 试用验收`。这些模块属于一个应用，共用数据和业务契约，因此保留一份计划；不拆成独立服务。
+主线为 `1 前后端环境 → 2 快麦客户端 → 3 事实与会话表 → 4 同步 → 5 指标 → 6 FastAPI会话边界 → 7 provider → 8 费用规则 → 9 Agent与SSE → 10 React聊天界面 → 11 试用验收`。前后端可独立修改，后端API、Agent和同步仍共享同一业务内核，因此保留一份端到端计划，不拆微服务。
 
 | 检查点 | 可以交付的能力 | 进入下一阶段的条件 |
 | --- | --- | --- |
 | A：任务1—4 | 一店数据接入、覆盖记录、故障恢复 | 一天数据完整拉取；拆合单、退款和金额字段完成对账，不能只看第一页 |
-| B：任务5—6 | 不依赖模型的概览、趋势、排行、明确降级 | 合成金钱检查通过；真实一天报表差额已解释；未确认指标禁用 |
-| C：任务7—9 | provider 可配置、连续追问、预算情景测算 | 模拟工具回合通过；至少部署所用 provider 完成真实工具回合 |
-| D：任务10 | 有认证、定时同步、备份恢复的内部试用 | 20题验收、一周试用记录；双 provider 实测状态分别报告 |
+| B：任务5—6 | 确定性指标与有身份边界的会话API | 合成金钱检查通过；真实一天报表差额已解释；跨身份会话请求返回404 |
+| C：任务7—9 | provider可配置、连续追问、预算情景、SSE消息接口 | 模拟工具回合与SSE事件顺序通过；至少部署所用provider完成真实工具回合 |
+| D：任务10—11 | DeepSeek风格聊天界面和可运行的内部试用 | 前端无手动查询入口；20题验收、一周试用记录；provider实测状态分别报告 |
 
 暂不开发：广告数据导入表/上传器/广告平台连接器、历史库存、采购和仓储业务、完整利润、自动改投放预算。快麦公开文档未证实推广实耗；付费报表文档及授权落实后，再单独安排费用实绩接入。CSV也是取得真实来源并选定后才做。
 
 ## 文件职责与公共契约
 
-下列是执行时实际创建的文件，不在计划阶段生成空架子。路径均相对项目根目录。
+下列是拆分完成后的文件。已有后端文件用 `git mv` 迁入 `backend/`，新文件才创建；路径均相对项目根目录。
 
 | 文件 | 唯一主要职责 |
 | --- | --- |
-| `pyproject.toml`、`uv.lock`、`.python-version` | Python版本与锁定依赖 |
+| `backend/pyproject.toml`、`backend/uv.lock`、`backend/.python-version` | 后端Python版本与锁定依赖 |
 | `.gitignore`、`.env.example` | 防止敏感文件入库；配置名称和非敏感默认值 |
-| `bi_agent/__init__.py` | 包标识，不承载逻辑 |
-| `bi_agent/config.py` | 分别加载应用、同步、模型配置；凭证验证 |
-| `bi_agent/kuaimai.py` | 官方参数、签名、HTTP、分页响应和会话续期 |
-| `bi_agent/sync.py` | 字段规范化、窗口分页、事务、水位、补查、同步CLI |
-| `sql/001_init.sql` | 事实表、约束、视图、最小数据库权限 |
-| `bi_agent/metrics.py` | 查询模型、结果模型、覆盖校验、固定SQL及指标口径 |
-| `bi_agent/promotion.py` | 显式假设计算，实绩和成本能力门槛 |
-| `bi_agent/llm.py` | provider选择、统一消息、工具回合、超时及错误转换 |
-| `bi_agent/agent.py` | 有限工具循环、会话筛选、匿名映射、模型上下文 |
-| `app.py` | 认证、固定筛选、聊天、确定性结果、下载 |
-| `tests/__init__.py`、`tests/test_core.py` | 金额、接口边界、provider和对话的集中离线检查 |
-| `tests/test_db.py` | 独立测试数据库内的事务、权限和聚合检查 |
-| `tests/questions.jsonl`、`tests/acceptance.py` | 20题人工答案；离线/显式联网验收入口 |
+| `backend/bi_agent/__init__.py` | 包标识，不承载逻辑 |
+| `backend/bi_agent/config.py` | 分别加载API、同步、模型配置；凭证验证 |
+| `backend/bi_agent/kuaimai.py` | 官方参数、签名、HTTP、分页响应和会话续期 |
+| `backend/bi_agent/sync.py` | 字段规范化、窗口分页、事务、水位、补查、同步CLI |
+| `backend/sql/001_init.sql` | 事实表、会话表、约束、视图、最小数据库权限 |
+| `backend/bi_agent/metrics.py` | 查询模型、结果模型、覆盖校验、固定SQL及指标口径 |
+| `backend/bi_agent/promotion.py` | 显式假设计算，实绩和成本能力门槛 |
+| `backend/bi_agent/llm.py` | provider选择、统一消息、工具回合、超时及错误转换 |
+| `backend/bi_agent/agent.py` | 有限工具循环、会话筛选、匿名映射、模型上下文 |
+| `backend/bi_agent/chats.py` | 会话/消息CRUD、归属校验和最近上下文读取 |
+| `backend/bi_agent/api.py` | FastAPI路由、可信身份、Origin检查和SSE事件 |
+| `backend/tests/test_core.py` | 金额、接口边界、provider和对话的集中离线检查 |
+| `backend/tests/test_db.py` | 独立测试数据库内的事务、权限和聚合检查 |
+| `backend/tests/test_api.py` | 会话归属、写请求保护和SSE契约检查 |
+| `backend/tests/questions.jsonl`、`backend/tests/acceptance.py` | 20题人工答案；离线/显式联网验收入口 |
+| `frontend/src/api.ts`、`frontend/src/types.ts` | JSON调用、SSE分片解析和与后端一致的手写类型 |
+| `frontend/src/App.tsx`、`frontend/src/components/*`、`frontend/src/styles.css` | 会话工作台、消息、输入框、附件及响应式视觉 |
+| `frontend/src/api.test.ts` | SSE解析的一个关键回归检查 |
 | `docs/metrics.md` | 来源、单位、聚合规则、功能门槛及真实对账结果摘要 |
 | `docs/runbook.md` | 配置、启动、同步、故障、认证、备份恢复 |
 | `docs/demo.md` | 合成数据演示步骤、模块说明、已完成能力证据 |
@@ -73,10 +79,10 @@
 
 ### 类型约定
 
-类型集中在消费它的模块，不新增通用 `types.py`。所有Pydantic边界模型设置 `extra="forbid"`；JSON金额输出为十进制字符串。
+后端类型集中在消费它的模块，不新增通用 `types.py`。前端只在 `src/types.ts`集中HTTP/SSE数据形状；首版手工保持这一小份契约，不引入OpenAPI代码生成。所有Pydantic边界模型设置 `extra="forbid"`；JSON金额输出为十进制字符串。
 
 ```python
-# bi_agent/metrics.py：下游共同使用
+# backend/bi_agent/metrics.py：下游共同使用
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
@@ -120,28 +126,29 @@ class ToolResult(BaseModel):
 
 `deadline` 始终是 `time.monotonic()` 的绝对截止值；`now` 是带时区的业务时刻。权限店铺来自部署配置；模型工具里的匿名店铺编号先由 `agent.py` 映射，SQL只接收映射并鉴权后的ERP ID。第一版所有已授权内部用户访问同一个试点范围，聊天状态按身份隔离。
 
-## Task 1：可复现环境和分离配置
+## Task 1：可复现的前后端环境和分离配置
 
-**Files:** Create `pyproject.toml`、`uv.lock`、`.python-version`、`.gitignore`、`.env.example`、`bi_agent/__init__.py`、`bi_agent/config.py`、`tests/__init__.py`、`tests/test_core.py`、`docs/runbook.md`。
+**Files:** Move `pyproject.toml`、`uv.lock`、`.python-version`、`bi_agent/`、`tests/`、`sql/` into `backend/`；Create `frontend/package.json`、`frontend/package-lock.json`、`frontend/tsconfig*.json`、`frontend/vite.config.ts`、`frontend/index.html`、`frontend/src/main.tsx`；Modify `.gitignore`、`.env.example`、`README.md`、`docs/runbook.md`；Delete `app.py`、`public_test.cmd`、`public_test.local.cmd.example`、`deploy/nginx_bi_test.conf.template`。这些删除项只服务旧Streamlit页面，新的同源部署在任务11写明。
 
 **Interfaces:**
 - Produces `load_app_settings(env: Mapping[str, str]) -> AppSettings`、`load_sync_settings(env: Mapping[str, str]) -> SyncSettings`、`load_model_settings(env: Mapping[str, str]) -> ModelSettings`。
-- `AppSettings`：`reader_dsn: SecretStr`、`shop_ids: frozenset[str]`、`environment: Literal["development","production"]`、`allowed_subjects: frozenset[str]`。
+- `AppSettings`：`app_dsn: SecretStr`、`shop_ids: frozenset[str]`、`environment: Literal["development","production"]`、`allowed_subjects: frozenset[str]`、`public_origin: str`、`auth_subject_header: str`。production必须是HTTPS origin且subject header非空。
 - `SyncSettings`：`writer_dsn: SecretStr`、`shop_ids: frozenset[str]`、`app_key/app_secret/access_token/refresh_token: SecretStr`。
-- `ModelSettings`：`provider: Literal["qwen","deepseek"]`、`model: str`、`api_key: SecretStr`、`base_url: str | None`。未配置模型不妨碍固定页面；主动启用模型时配置错误必须显示。
+- `ModelSettings`：`provider: Literal["qwen","deepseek"]`、`model: str`、`api_key: SecretStr`、`base_url: str | None`。聊天后端启动时校验所选provider配置；健康检查不得返回这些值。
 
-- [ ] **1.1 准备Python 3.11、uv及PostgreSQL 17工具，记录版本。** 执行 `uv --version`、`psql --version`；缺失时使用官方安装方式。现有公司数据库若可直接复用，先记录其兼容性决定，不开发双数据库适配。新环境按PostgreSQL 17实施。
+- [ ] **1.1 记录当前基线和工具版本。** 执行 `python --version`、`uv --version`、`node --version`、`npm --version`、`psql --version`；Node至少22.12。先在根目录运行现有离线测试并记录结果，再移动文件；现有公司数据库若可直接复用，记录兼容性决定，不开发双数据库适配。
 
-- [ ] **1.2 写忽略规则，再初始化根Git仓库。** 保留现有 `.env` 原样，不读取或复制凭证到文档。
+- [ ] **1.2 更新已有忽略规则。** 保留现有 `.env` 原样，不读取或复制凭证到文档；补上前后端构建目录，不覆盖已有规则。
 
 ```gitignore
-.venv/
+backend/.venv/
 __pycache__/
 *.py[cod]
+frontend/node_modules/
+frontend/dist/
 .env
 .env.*
 !.env.example
-.streamlit/secrets.toml
 .pi/
 .tmp/
 private/
@@ -151,21 +158,38 @@ exports/
 *.dump
 ```
 
-执行 `git init`；随后提交只使用本任务列出的文件，禁止 `git add .`。参考仓库不纳入根仓库。若执行时根Git已存在则沿用，不重复初始化。
+仓库已经初始化，不执行 `git init`。提交只使用本任务列出的文件，禁止 `git add .`；参考仓库和现有运行日志不纳入提交。
 
-- [ ] **1.3 创建包及依赖清单并锁定。** 包中先不放业务代码。
+- [ ] **1.3 用Git移动现有后端并加入FastAPI依赖。** 以下命令从项目根目录执行；后续后端命令默认先 `Set-Location backend`。移动前确保工作区没有与这些路径冲突的未提交改动。
 
 ```powershell
-uv init --bare --python 3.11
-uv python pin 3.11
-uv add "psycopg[binary]>=3.2,<4" "pydantic>=2,<3" "httpx>=0.27,<1" "streamlit[auth]>=1.42,<2" "tzdata>=2024.1"
+New-Item -ItemType Directory -Path backend -Force
+git mv pyproject.toml uv.lock .python-version bi_agent tests sql backend/
+Set-Location backend
+uv add "fastapi>=0.116,<1" "uvicorn>=0.35,<1" "psycopg[binary]>=3.2,<4" "pydantic>=2,<3" "httpx>=0.27,<1" "tzdata>=2024.1"
+uv remove streamlit
 uv lock
 uv sync --locked
+Set-Location ..
 ```
 
-不加pytest、OpenAI SDK或dotenv：分别使用unittest、httpx兼容接口及uv的 `--env-file`。Windows通常没有系统IANA时区库，tzdata确保 `ZoneInfo('Asia/Shanghai')`可用。最终具体小版本由 `uv.lock` 固定。
+删除旧Streamlit入口和仅供它使用的公网测试脚本，不保留两套UI或兼容壳。不加pytest、OpenAI SDK、ORM或dotenv：分别使用unittest、httpx兼容接口、显式SQL及uv的 `--env-file`。Windows通常没有系统IANA时区库，tzdata确保 `ZoneInfo('Asia/Shanghai')`可用。具体小版本由 `backend/uv.lock` 固定。
 
-- [ ] **1.4 在 `test_core.py` 写配置选择检查并运行，确认失败原因是接口未实现。**
+- [ ] **1.4 创建独立React/Vite前端并锁定。** 不加入Next.js、Tailwind、Redux、Axios、图表库或组件库；浏览器原生fetch、React state和普通CSS足够首版。
+
+```powershell
+npm create vite@7 frontend -- --template react-ts
+Set-Location frontend
+npm install
+npm install --save-dev vitest
+npm pkg set scripts.test="vitest run"
+npm run build
+Set-Location ..
+```
+
+预期Vite默认页面构建成功；任务10会替换默认内容。`package-lock.json`必须提交，后续使用 `npm ci`。
+
+- [ ] **1.5 在 `backend/tests/test_core.py` 补充应用配置检查。** 现有provider选择检查应继续通过；新增FastAPI应用配置的失败用例，再补实现。
 
 ```python
 import unittest
@@ -182,9 +206,9 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("fake-deepseek-key", repr(settings))
 ```
 
-运行 `uv run python -m unittest tests.test_core.ConfigTests -v`，预期初次失败。
+从 `backend/` 运行 `uv run python -m unittest tests.test_core.ConfigTests -v`。已有provider用例应通过，新增应用配置用例先失败；不能把迁移导致的导入错误当成预期失败。
 
-- [ ] **1.5 用小映射完成配置加载；不建立配置注册中心。**
+- [ ] **1.6 复用现有小映射并拆开进程配置；不建立配置注册中心。**
 
 ```python
 provider = env["LLM_PROVIDER"]
@@ -196,15 +220,15 @@ if not api_key:
     raise ValueError(f"缺少 {key_name}")
 ```
 
-各加载器只取所属字段；Pydantic `SecretStr` 隐藏DSN和密钥；空模型ID/空店铺集报错。生产模型地址只允许HTTPS，由部署者设置，模型和普通用户不能改地址。
+保留现有provider行为，只把原配置读取拆成API、同步、模型三个入口。各加载器只取所属字段；Pydantic `SecretStr` 隐藏DSN和密钥；空模型ID/空店铺集报错。生产模型地址只允许HTTPS，由部署者设置，模型和普通用户不能改地址。`AUTH_SUBJECT_HEADER`默认 `X-Auth-Request-Sub`；开发模式固定为 `local-development`，production不得接受请求体、查询字符串或浏览器自报身份。
 
-- [ ] **1.6 写 `.env.example` 和运行说明，并让配置测试通过。** 示例只含空凭证及这些配置名：`APP_ENV`、`APP_ALLOWED_SUBJECTS`、`BI_SHOP_IDS`、`BI_READER_DSN`、`BI_WRITER_DSN`、`LLM_PROVIDER`、`LLM_MODEL`、`LLM_BASE_URL`、`QWEN_API_KEY`、`DEEPSEEK_API_KEY`、现有六个 `KUAI_MAI_*` 名称。注明 `APP_TITLE/COMPANY_ID` 不自动作为快麦公共参数。生产分别放 `.env.app` 和 `.env.sync`，应用环境不得含写入DSN和ERP凭证。
+- [ ] **1.7 写 `.env.example` 和运行说明，并让配置测试通过。** 示例只含空凭证及这些配置名：`APP_ENV`、`APP_ALLOWED_SUBJECTS`、`APP_PUBLIC_ORIGIN`、`AUTH_SUBJECT_HEADER`、`BI_SHOP_IDS`、`BI_APP_DSN`、`BI_WRITER_DSN`、`LLM_PROVIDER`、`LLM_MODEL`、`LLM_BASE_URL`、`QWEN_API_KEY`、`DEEPSEEK_API_KEY`、现有六个 `KUAI_MAI_*` 名称。注明 `APP_TITLE/COMPANY_ID` 不自动作为快麦公共参数。生产分别放 `.env.app` 和 `.env.sync`，API环境不得含写入DSN和ERP凭证。
 
-复跑1.4命令，预期通过；执行 `git check-ignore .env .env.app .streamlit/secrets.toml`，预期三条路径均被忽略。提交本任务文件：`chore: establish runtime and isolated configuration`。
+复跑迁移后的现有离线测试、1.5命令及 `npm --prefix frontend run build`，预期通过；执行 `git check-ignore .env .env.app frontend/node_modules frontend/dist`，预期四条路径均被忽略。用 `rg -n "Streamlit|streamlit|BI_READER_DSN|app.py|sql/001_init.sql|python -m tests" README.md docs .env.example` 找出并改完旧运行说明，路径统一指向 `backend/`，应用DSN改名为 `BI_APP_DSN`。提交本任务文件：`chore: establish separate frontend and backend environments`。
 
 ## Task 2：有证据的快麦只读客户端
 
-**Files:** Create `bi_agent/kuaimai.py`、`docs/metrics.md`；Modify `tests/test_core.py`、`docs/runbook.md`。
+**Files:** Modify `backend/bi_agent/kuaimai.py`、`backend/tests/test_core.py`、`docs/metrics.md`、`docs/runbook.md`。
 
 **Interfaces:**
 - Consumes `SyncSettings`。
@@ -283,7 +307,7 @@ payload = self.call("open.token.refresh", {
 
 ## Task 3：事实表、商业单去重与只读视图边界
 
-**Files:** Create `sql/001_init.sql`、`bi_agent/sync.py`、`tests/test_db.py`；Modify `docs/metrics.md`、`docs/runbook.md`。
+**Files:** Modify `backend/sql/001_init.sql`、`backend/bi_agent/sync.py`、`backend/tests/test_db.py`、`docs/metrics.md`、`docs/runbook.md`。
 
 **Interfaces:**
 - Produces数据库下列固定契约；`sync.py`中的 `normalise_trade(raw: dict[str, object]) -> dict[str, object]`、`normalise_aftersale(raw: dict[str, object]) -> dict[str, object]`、`apply_trade(conn, trade: dict[str, object], *, batch_id: str) -> bool`、`rebuild_payments(conn, shop_id: str, commercial_ids: set[str]) -> None`。
@@ -304,7 +328,7 @@ payload = self.call("open.token.refresh", {
 
 `covered`保存已完成的**业务时间覆盖区间**，watermark保存**修改时间水位**，二者不能混用。`data_as_of`保存已完整处理的源数据截止时刻，不能用写库时间 `last_success_at`替代。PostgreSQL原生multirange表示多个区间和缺口，不额外造覆盖区间服务。`quality_ok`只针对已核验的来源与指标质量，不因请求成功自动置true。
 
-- [ ] **3.1 建隔离测试数据库及事务检查。** 管理员创建 `bi_agent_test`；`tests/test_db.py`在任何清理前检查数据库名以 `_test` 结尾、主机为本地测试实例，缺测试DSN则显式skip。单个用例在管理员连接的外层事务中准备数据，再以 `SET LOCAL ROLE bi_reader`验证查询权限，结束回滚；实际reader DSN另用于拒写检查。这样只读检查能看到同事务合成数据，不依赖其他连接的未提交记录，禁止连接生产进行TRUNCATE。
+- [ ] **3.1 建隔离测试数据库及事务检查。** 管理员创建 `bi_agent_test`；`backend/tests/test_db.py`在任何清理前检查数据库名以 `_test` 结尾、主机为本地测试实例，缺测试DSN则显式skip。单个用例在管理员连接的外层事务中准备数据，再以 `SET LOCAL ROLE bi_app`验证查询权限，结束回滚；实际app DSN另用于拒写经营事实检查。这样应用检查能看到同事务合成数据，不依赖其他连接的未提交记录，禁止连接生产进行TRUNCATE。
 
 ```python
 import os
@@ -314,13 +338,13 @@ import psycopg
 @unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
 class DatabaseTests(unittest.TestCase):
     def test_read_role_cannot_write(self):
-        with psycopg.connect(os.environ["BI_TEST_READER_DSN"]) as conn:
+        with psycopg.connect(os.environ["BI_TEST_APP_DSN"]) as conn:
             self.assertTrue(conn.info.dbname.endswith("_test"))
             with self.assertRaises(psycopg.errors.InsufficientPrivilege):
                 conn.execute("INSERT INTO bi.shops(shop_id) VALUES ('forbidden')")
 ```
 
-初次运行 `uv run --env-file .env.test python -m unittest tests.test_db -v`，预期未建表/角色时失败；无测试库的skip不是通过证明。
+初次运行 `uv run --env-file ../.env.test python -m unittest tests.test_db -v`，预期未建表/角色时失败；无测试库的skip不是通过证明。
 
 - [ ] **3.2 写DDL和必要索引。** 使用上述列名；索引至少包含支付时间+店铺、退款完成时间+店铺、售后原单、交易原单映射、源更新时间。数量不能为NaN；金额有效性依字段语义区分，负ERP毛利保留。普通销售支付异常负值标记质量失败，不取绝对值。
 
@@ -333,7 +357,7 @@ CREATE INDEX payments_time_idx ON bi.order_payments(shop_id, paid_at);
 CREATE INDEX refunds_time_idx ON bi.aftersales(shop_id, platform_completed_at);
 ```
 
-DDL只由管理员执行；`bi_sync`有事实表读写权限，不能建表/角色；`bi_reader`只有reporting schema和指定视图SELECT权限，设置默认只读与5秒超时。不给 `PUBLIC` schema创建权；新视图逐项授权，避免给未来所有表默认读权限。角色密码通过管理员 `\password` 或现有密钥设施设置，SQL文件不含密码。
+DDL只由管理员执行；`bi_sync`有事实表读写权限，不能建表/角色；`bi_app`只有reporting指定视图SELECT及任务6会话表CRUD权限，不能写经营事实，设置5秒查询超时。不给 `PUBLIC` schema创建权；新视图逐项授权，避免给未来所有表默认读权限。角色密码通过管理员 `\password` 或现有密钥设施设置，SQL文件不含密码。
 
 - [ ] **3.3 实现白名单字段和版本保护。**
 
@@ -386,7 +410,7 @@ FROM bi.order_payments;
 
 ## Task 4：完整窗口同步、回填和可见覆盖
 
-**Files:** Modify `bi_agent/sync.py`、`bi_agent/kuaimai.py`、`tests/test_core.py`、`tests/test_db.py`、`docs/metrics.md`、`docs/runbook.md`。
+**Files:** Modify `backend/bi_agent/sync.py`、`backend/bi_agent/kuaimai.py`、`backend/tests/test_core.py`、`backend/tests/test_db.py`、`docs/metrics.md`、`docs/runbook.md`。
 
 **Interfaces:**
 - Consumes任务2的客户端、任务3的事实规范化和事务函数。
@@ -418,7 +442,7 @@ self.assertEqual(conn.execute(
 self.assertEqual(conn.execute("SELECT count(*) FROM bi.orders WHERE shop_id='S1'").fetchone()[0], 0)
 ```
 
-此测试的 `client` 为 `KuaimaiClient` 配 `httpx.MockTransport`，`window` 为 `Window(2026-09-05 00:00+08, 2026-09-06 00:00+08)`；不得使用真实网络。运行 `uv run --env-file .env.test python -m unittest tests.test_db -v`。
+此测试的 `client` 为 `KuaimaiClient` 配 `httpx.MockTransport`，`window` 为 `Window(2026-09-05 00:00+08, 2026-09-06 00:00+08)`；不得使用真实网络。运行 `uv run --env-file ../.env.test python -m unittest tests.test_db -v`。
 
 - [ ] **4.2 实现每个接口自己的查询参数。**
 
@@ -467,10 +491,10 @@ WHERE source=%s AND entity=%s AND shop_id=%s;
 - [ ] **4.5 增加补查和续期维护入口。**
 
 ```powershell
-uv run --env-file .env.sync python -m bi_agent.sync backfill --days 90
-uv run --env-file .env.sync python -m bi_agent.sync incremental
-uv run --env-file .env.sync python -m bi_agent.sync reconcile --days 7
-uv run --env-file .env.sync python -m bi_agent.sync replay --entity orders --start 2026-09-01 --end 2026-09-02
+uv run --env-file ../.env.sync python -m bi_agent.sync backfill --days 90
+uv run --env-file ../.env.sync python -m bi_agent.sync incremental
+uv run --env-file ../.env.sync python -m bi_agent.sync reconcile --days 7
+uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity orders --start 2026-09-01 --end 2026-09-02
 ```
 
 reconcile按支付日/退款完成日重核最近7天、按ID补查所有未结售后；增量收到更早商业单退款时保留未匹配记录，再按已发布的sid/tid条件补拉原单。超过归档边界的更正使用付款/创建窗口或单号补查。7天不保证所有历史修正；更早数据需要replay时显示该历史口径的新截止时间。不做历史任意时点快照重建。
@@ -482,7 +506,7 @@ reconcile按支付日/退款完成日重核最近7天、按ID补查所有未结�
 - [ ] **4.7 运行真实一店一天完整核验，再决定回填。**
 
 ```powershell
-uv run --env-file .env.sync python -m bi_agent.sync probe --start 2026-09-05 --end 2026-09-06
+uv run --env-file ../.env.sync python -m bi_agent.sync probe --start 2026-09-05 --end 2026-09-06
 ```
 
 probe拉全页但只输出数量、金额字段覆盖和质量统计，不输出客户/订单号。在后台同口径报表核对支付时间、实付、商业单数、拆合单、退款成功及金额；需要经营者提供口径确认时先完成可审阅的差异表，再请求事实确认。真实明细只存受控DB/忽略的private目录，文档写匿名案例和差异原因。支付/分摊/退款哪项未通过就禁用哪项，不能把本计划的合成数据规则当实际已验证。
@@ -491,7 +515,7 @@ probe拉全页但只输出数量、金额字段覆盖和质量统计，不输出
 
 ## Task 5：确定性经营指标及统一人工答案
 
-**Files:** Create `bi_agent/metrics.py`；Modify `sql/001_init.sql`、`tests/test_core.py`、`tests/test_db.py`、`docs/metrics.md`。
+**Files:** Modify `backend/bi_agent/metrics.py`、`backend/sql/001_init.sql`、`backend/tests/test_core.py`、`backend/tests/test_db.py`、`docs/metrics.md`。
 
 **Interfaces:**
 - Consumes任务3—4的报表视图和覆盖状态。
@@ -515,7 +539,7 @@ probe拉全页但只输出数量、金额字段覆盖和质量统计，不输出
 
 平台成功退款：R1/C1于09-02退30；R2/C1于09-04退20；R3/C0于09-03退50。R4/C2于09-09退40，超过本次截止，不能计入。R5/C3为待处理退款10；R6/C2工单已解决但线上退款关闭20，均不计。基准无未匹配退款；另加一条未匹配成功退款作单独降级检查。实耗完全未接入。
 
-区间 `[09-01,09-08)` 人工答案：支付1000、商业单6、ERP单6、客单价166.67（展示舍入）、退款发生100、期间收支差900、同批退款50/1000=5%；商品A金额600/数量7，B金额400/数量4。上一个等长区间 `[08-25,09-01)` 支付500，增长100%。其中09-02单独看是ERP单2、商业单1，用于证明没有混淆粒度。基准数据不含PII，存入 `tests/test_db.py` 的 `seed_business_case(conn) -> None`，同时供验收脚本使用。
+区间 `[09-01,09-08)` 人工答案：支付1000、商业单6、ERP单6、客单价166.67（展示舍入）、退款发生100、期间收支差900、同批退款50/1000=5%；商品A金额600/数量7，B金额400/数量4。上一个等长区间 `[08-25,09-01)` 支付500，增长100%。其中09-02单独看是ERP单2、商业单1，用于证明没有混淆粒度。基准数据不含PII，存入 `backend/tests/test_db.py` 的 `seed_business_case(conn) -> None`，同时供验收脚本使用。
 
 - [ ] **5.1 写金额与日期检查并观察失败。**
 
@@ -553,7 +577,7 @@ self.assertEqual(Decimal(row["cash_difference"]), Decimal("900"))
 self.assertEqual(Decimal(row["cohort_refund_rate"]), Decimal("0.05"))
 ```
 
-这里 `reader_conn` 是同一测试事务内已执行 `SET LOCAL ROLE bi_reader`的连接，`now`使用上方固定时刻；连接和 `seed_business_case` 在测试setUp创建，测试结束回滚。真实页面仍只拿reader DSN。运行 `uv run --env-file .env.test python -m unittest tests.test_db -v`，预期先因视图/函数缺失失败。
+这里 `reader_conn` 是同一测试事务内已执行 `SET LOCAL ROLE bi_app`的连接，`now`使用上方固定时刻；连接和 `seed_business_case` 在测试setUp创建，测试结束回滚。真实API只拿app DSN。运行 `uv run --env-file ../.env.test python -m unittest tests.test_db -v`，预期先因视图/函数缺失失败。
 
 - [ ] **5.3 建日聚合视图，金额事实分开聚合。**
 
@@ -628,70 +652,88 @@ FROM cohort c LEFT JOIN refunds r USING (shop_id, commercial_id);
 
 对照真实试点一天的人工报表，分值完全相同或差异有已确认的口径解释；未通过项目不得出现在已启用指标中。提交：`feat: calculate reconciled business metrics with coverage checks`。
 
-## Task 6：先交付不依赖模型的内部页面
+## Task 6：FastAPI身份边界和会话CRUD
 
-**Files:** Create `app.py`；Modify `docs/runbook.md`、`tests/test_core.py`。
+**Files:** Create `backend/bi_agent/chats.py`、`backend/bi_agent/api.py`、`backend/tests/test_api.py`；Modify `backend/sql/001_init.sql`、`docs/runbook.md`。
 
 **Interfaces:**
-- Consumes `AppSettings`、`QueryRequest`、`query_business`、`ToolResult`。
-- Produces `render_result(result: ToolResult) -> None`，任务9复用它展示工具结果；固定筛选和聊天的金额呈现路径相同。
-- 服务端身份 `subject` 与范围 `allowed_shop_ids` 不来自URL/工具参数。开发模式绑定localhost；生产使用Streamlit内置OIDC，优先复用公司已有身份提供者。
+- Consumes `AppSettings`和PostgreSQL应用连接。
+- Produces `create_app(settings: AppSettings) -> FastAPI`；模块级 `app`由真实配置创建，便于 `uvicorn bi_agent.api:app`。任务9在模型类型已定义后扩展工厂参数。
+- `current_subject(request: Request, settings: AppSettings) -> str`：development仅返回 `local-development`；production只读取反向代理覆盖的 `auth_subject_header`，检查allowlist。
+- `create_chat(conn, subject: str) -> ChatSummary`、`list_chats(conn, subject: str) -> list[ChatSummary]`、`load_messages(conn, subject: str, chat_id: UUID) -> list[ChatMessage]`、`rename_chat(...)`、`delete_chat(...)`。其他身份的会话与不存在会话都返回同一404。
+- Public API固定为 `GET /api/chats`、`POST /api/chats`、`GET /api/chats/{chat_id}/messages`、`POST /api/chats/{chat_id}/messages`（任务9补齐）、`PATCH /api/chats/{chat_id}`、`DELETE /api/chats/{chat_id}`、`GET /api/health`。没有 `/query`、`/metrics` 或任意SQL端点。
 
-- [ ] **6.1 实现认证入口及单用户会话隔离。**
+- [ ] **6.1 扩展DDL，保存最少会话数据。**
+
+```sql
+CREATE TABLE bi.app_chats (
+    id uuid PRIMARY KEY,
+    subject_id text NOT NULL,
+    title text NOT NULL CHECK (char_length(title) BETWEEN 1 AND 80),
+    title_source text NOT NULL DEFAULT 'auto' CHECK (title_source IN ('auto','user')),
+    filters jsonb NOT NULL DEFAULT '{}',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX app_chats_subject_updated_idx
+    ON bi.app_chats(subject_id, updated_at DESC);
+CREATE TABLE bi.app_messages (
+    id uuid PRIMARY KEY,
+    chat_id uuid NOT NULL REFERENCES bi.app_chats(id) ON DELETE CASCADE,
+    role text NOT NULL CHECK (role IN ('user','assistant')),
+    content text NOT NULL CHECK (char_length(content) BETWEEN 1 AND 20000),
+    artifacts jsonb NOT NULL DEFAULT '[]',
+    status text NOT NULL CHECK (status IN ('complete','error')),
+    ordinal bigint GENERATED ALWAYS AS IDENTITY,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (chat_id, ordinal)
+);
+```
+
+`subject_id`必须是OIDC不透明 `sub`，不能写邮箱/姓名。只把完整助手消息及匿名化附件长期保存，不存工具调用、provider私有推理、ERP ID或供应商原始响应。`bi_app`获得两表SELECT/INSERT/UPDATE/DELETE和所需sequence权限，仍不能写经营事实；同步账号不能读会话表。
+
+- [ ] **6.2 先写会话归属和路由清单检查。** 使用FastAPI `TestClient`，测试连接通过 `create_app`的依赖覆盖指向隔离测试DB；生产身份头在测试代理边界中显式注入。
 
 ```python
-if settings.environment == "production":
-    if not st.user.is_logged_in:
-        st.login()
-        st.stop()
-    subject = f"{st.user.get('iss', '')}|{st.user.get('sub', '')}"
-    if subject not in settings.allowed_subjects:
-        st.error("当前账号没有访问权限")
-        st.stop()
-else:
-    subject = "local-development"
-if st.session_state.get("subject") != subject:
-    st.session_state.clear()
-    st.session_state["subject"] = subject
+class ApiTests(unittest.TestCase):
+    def test_chat_is_hidden_from_other_subject(self):
+        created = self.client.post("/api/chats", headers=self.headers("user-a"),
+                                   json={}).json()
+        response = self.client.get(f"/api/chats/{created['id']}/messages",
+                                   headers=self.headers("user-b"))
+        self.assertEqual(response.status_code, 404)
+
+    def test_no_manual_query_route_exists(self):
+        paths = set(self.client.app.openapi()["paths"])
+        self.assertFalse(paths & {"/api/query", "/api/metrics", "/api/sql"})
 ```
 
-OIDC配置放忽略的 `.streamlit/secrets.toml`，按锁定Streamlit版本官方文档填写issuer/client/redirect配置；`APP_ALLOWED_SUBJECTS`是服务端名单。退出登录清空本会话。不缓存带用户状态的模型对象/数据库连接；不使用全局list保存聊天。development模式启动时校验 `st.get_option('server.address')`为127.0.0.1/localhost/::1，否则拒绝启动。若没有可用OIDC/公司认证设施，完成localhost验收，外部试用保持未开放，不能用裸页面代替认证。
+运行 `uv run --env-file ../.env.test python -m unittest tests.test_api.ApiTests -v`，预期先失败。数据库测试继续确认 `bi_app`可写会话、不可写orders，`bi_sync`不能读app_messages。
 
-- [ ] **6.2 连接只读DSN，实现日期、店铺、指标、维度筛选。**
+- [ ] **6.3 实现可信身份和写请求保护。** production启动时只允许Uvicorn绑定127.0.0.1/::1，公开访问由已认证反向代理转发；代理必须删除浏览器同名身份头并写入真实OIDC `sub`。没有代理时只运行development localhost。
+
+所有POST/PATCH/DELETE要求 `Content-Type: application/json`、`X-BI-Agent: web`，且 `Origin`精确等于 `APP_PUBLIC_ORIGIN`；缺失/不匹配返回403。生产不启用CORS中间件。请求体使用 `extra='forbid'`，标题trim后1～80字符，消息trim后1～4000字符。错误只返回稳定 `code/message`，不含DSN、SQL或调用栈。
+
+- [ ] **6.4 实现会话CRUD和稳定响应类型。**
 
 ```python
-with psycopg.connect(settings.reader_dsn.get_secret_value()) as conn:
-    result = query_business(conn, request, allowed_shop_ids=settings.shop_ids,
-                            now=datetime.now(ZoneInfo("Asia/Shanghai")),
-                            deadline=time.monotonic() + 30)
-render_result(result)
+@router.get("/chats", response_model=list[ChatSummary])
+def get_chats(subject: str = Depends(get_subject), conn=Depends(get_conn)):
+    return list_chats(conn, subject)
+
+@router.get("/chats/{chat_id}/messages", response_model=list[ChatMessage])
+def get_messages(chat_id: UUID, subject: str = Depends(get_subject), conn=Depends(get_conn)):
+    require_chat(conn, subject, chat_id)
+    return load_messages(conn, subject, chat_id)
 ```
 
-日期选择器中的包含结束日转换为排他end；按钮提交后再查询，避免每次rerun重复读库。侧栏固定展示“当前覆盖：抖音试点店铺”、覆盖日期和最后成功同步状态；指标可用性由数据库能力和数据质量决定。模型未配置/失败时固定查询照常工作。
+`ChatSummary`字段为 `id/title/created_at/updated_at`；`ChatMessage`字段为 `id/role/content/artifacts/status/created_at`。列表按updated_at倒序。新会话标题“新对话”；第一条用户消息提交成功后仅在 `title_source='auto'` 时用前20个Unicode字符生成标题，PATCH改名同时置 `title_source='user'`，以后不自动覆盖。DELETE返回204。
 
-- [ ] **6.3 用原生组件显示确定性结果和聚合下载。**
-
-```python
-st.caption(f"数据截止：{result.data_as_of}")
-st.dataframe(result.data, hide_index=True)
-with st.expander("指标口径与限制"):
-    st.write(result.metric_definition)
-    st.write(result.limitations)
-```
-
-概览卡片、趋势折线、商品排行柱图使用程序结果；金额格式化用Decimal，比率缺失显示“不可计算”，数据缺失不画一条0线。展示当前/上期过滤范围与同步缺口。CSV下载只包含当前授权聚合数据，使用标准库 `csv`；对可能以 `= + - @`、制表符开头的文本标签做公式注入转义，金额列按数值格式输出。文件名不含真实订单/客户信息。
-
-- [ ] **6.4 启动合成库页面并人工验证。**
-
-```powershell
-uv run --env-file .env.app streamlit run app.py --server.address 127.0.0.1
-```
-
-验证表格1000/100/900、A商品排行600、超范围日期被拒绝；断开模型配置仍能查询；无费用数据不能出现0消耗。两个登录身份的日期、聊天状态互不继承；匿名/非名单身份不可访问生产页面。纯布局不另写镜像测试，货币/下载转义分支在 `test_core.py` 留一个可运行检查。提交：`feat: expose authenticated deterministic business reports`。
+- [ ] **6.5 通过API边界检查。** 覆盖新建、列表、加载、改名、删除级联、空/超长标题、未知字段、错误Origin、自报subject被忽略、A/B跨身份全部404、health只返回 `{"status":"ok"}`。测试OpenAPI路径集合等于上方白名单（任务9加入消息路由后更新集合）。提交：`feat: add authenticated chat API boundary`。
 
 ## Task 7：一层薄模型适配，保留provider选择
 
-**Files:** Create `bi_agent/llm.py`；Modify `tests/test_core.py`、`docs/runbook.md`。
+**Files:** Modify `backend/bi_agent/llm.py`、`backend/tests/test_core.py`、`docs/runbook.md`。
 
 **Interfaces:**
 - Consumes `ModelSettings`；Produces `create_model(settings: ModelSettings) -> ChatModel`。
@@ -779,11 +821,11 @@ reply = asyncio.run(asyncio.wait_for(self._request(messages, tools), timeout=tim
 
 `_request(self, messages: list[Message], tools: list[dict[str, object]]) -> ModelReply`在 `async with httpx.AsyncClient(transport=self.transport, follow_redirects=False)`内完成一次POST；HTTP timeout不大于剩余预算。使用标准库 `asyncio.wait_for`限制总请求，避免把httpx各阶段timeout误当总时限。401/403归为authentication、429为rate_limit、超时为timeout、5xx为unavailable；不自动重试或切provider。限制响应体2MiB，越界终止；不把服务端错误body直送用户。
 
-- [ ] **7.5 通过离线回合，并记录真实联调门槛。** mock包含正文回合、两次工具请求/结果、非法JSON参数、缺usage、401/429/timeout、剩余预算耗尽。复跑ModelTests，预期通过。真实联调放任务10显式命令，常规测试不得读取真实key或联网；某provider没有凭证就记未实测。提交：`feat: support configurable model providers through one adapter`。
+- [ ] **7.5 通过离线回合，并记录真实联调门槛。** mock包含正文回合、两次工具请求/结果、非法JSON参数、缺usage、401/429/timeout、剩余预算耗尽。复跑ModelTests，预期通过。真实联调放任务11显式命令，常规测试不得读取真实key或联网；某provider没有凭证就记未实测。提交：`feat: support configurable model providers through one adapter`。
 
 ## Task 8：推广预算的确定性情景测算
 
-**Files:** Create `bi_agent/promotion.py`；Modify `tests/test_core.py`、`docs/metrics.md`。
+**Files:** Modify `backend/bi_agent/promotion.py`、`backend/tests/test_core.py`、`docs/metrics.md`。
 
 **Interfaces:**
 - Consumes `ToolResult/Coverage`；本版不连接广告接口，也不建费用表。
@@ -853,21 +895,25 @@ if request.mode in {"actual_budget", "contribution_cap"}:
 
 - [ ] **8.4 通过必要边界检查并提交。** 测试0预算、已超支20、周期结束、比率>100%、负数、NaN/Infinity、不同币种、未确认金额以及没有实际推广源。加入“假设预算100、已花120、截止09-06、周期至09-08”的结果：剩余0、超支20、剩2天、日均0。测试用有限Decimal，不写每个getter的检查。提交：`feat: calculate explicit promotion budget scenarios`。
 
-## Task 9：单Agent对话、两工具与连续追问
+## Task 9：单Agent、会话持久化与SSE消息接口
 
-**Files:** Create `bi_agent/agent.py`；Modify `app.py`、`tests/test_core.py`、`docs/runbook.md`。
+**Files:** Modify `backend/bi_agent/agent.py`、`backend/bi_agent/chats.py`、`backend/bi_agent/api.py`、`backend/tests/test_core.py`、`backend/tests/test_api.py`、`docs/runbook.md`。
 
 **Interfaces:**
-- Consumes `ChatModel/Message/ModelReply`、`QueryRequest/query_business`、`PromotionRequest/evaluate_promotion`、`render_result`。
-- Produces `SessionState(subject: str, shop_aliases: dict[str,str], filters: dict[str,object], turns: list[Message])`与 `TurnResult(text: str, results: list[ToolResult], clarification: str | None, state: SessionState)`，均使用Pydantic。
-- `answer(question: str, state: SessionState, *, model: ChatModel, conn, allowed_shop_ids: frozenset[str], now: datetime) -> TurnResult`。
-- `explicit_assumptions(question: str) -> dict[str, object]`只识别明确表达的金额/比率/日期，不能从历史推测；不能确定单位或字段归属时返回缺失字段并让Agent澄清。
-- `to_model_result(result: ToolResult, state: SessionState) -> dict[str, object]`负责聚合列白名单和匿名映射；原ToolResult留给本地UI，不能直接序列化发给provider。
+- Consumes `ChatModel/Message/ModelReply`、`QueryRequest/query_business`、`PromotionRequest/evaluate_promotion`及任务6的会话归属函数。
+- 复用已有 `SessionState(subject: str, shop_aliases: dict[str,str], filters: dict[str,object], turns: list[Message])`与 `TurnResult(text: str, results: list[ToolResult], clarification: str | None, state: SessionState)`，不为持久化改名或增加平行状态类型。
+- 保留 `answer(question: str, state: SessionState, *, model: ChatModel, conn, allowed_shop_ids: frozenset[str], now: datetime) -> TurnResult`；`run_chat_turn`从数据库最近消息构造 `state.turns`。
+- `claim_chat_turn(conn, chat_id: UUID, subject: str) -> None`在HTTP响应开始前校验归属并取得会话锁；冲突抛稳定409错误。
+- `run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: ChatModel, settings: AppSettings, now: datetime) -> Iterator[ChatEvent]`要求锁已取得，只产生事件；路由包装器负责finally解锁并关闭专用连接。
+- `ChatEvent(event: Literal["status","artifact","message","error","done"], data: dict[str, object])`；`encode_sse(event: ChatEvent) -> bytes`只发送一行JSON data。
+- `to_public_artifact(result: ToolResult, state: SessionState) -> dict[str, object]`去掉ERP标识并换成可见标签，供所属用户的SSE和消息持久化；`to_model_result(...)`只保留必要聚合列并使用匿名标签，不能把原始 `ToolResult`直接发浏览器、数据库或provider。
 
-- [ ] **9.1 写有限回合和多轮过滤检查。** 使用标准库Mock，给 `model.complete.side_effect`配置事先构造的ModelReply序列：经营工具调用→文字回答；下一问题“那上个月呢”→保留S1与指标，仅修改日期。`ModelReply._message`设置为对应assistant Message，tool ID使用 `call_1/call_2`。Mock `query_business`返回已知1000元结果，断言SQL工具实际收到的参数，不能只断言回答字符串。
+事件data保持一份小而固定的契约：`status`为 `{stage: thinking|querying|answering}`；`artifact`为公开版 `ToolResult`；`message`为完整 `ChatMessage`；`error`为 `{code,message}`；`done`为 `{status: complete|error}`。成功流是一个或多个status、零或多个artifact、一个message、一个done；失败流是status、error、done。澄清问题属于无artifact的成功message。
+
+- [ ] **9.1 写有限回合和多轮过滤检查。** 使用标准库Mock配置ModelReply序列：经营工具调用→文字回答；下一问题“那上个月呢”→保留S1与指标，仅修改日期。Mock `query_business`返回已知1000元结果，断言业务函数实际收到的参数。
 
 ```python
-with patch("bi_agent.agent.query_business", return_value=known_result) as query:
+with patch("bi_agent.metrics.query_business", return_value=known_result) as query:
     turn = answer("最近7天店铺A的支付金额", state, model=model, conn=conn,
                   allowed_shop_ids=frozenset({"S1"}), now=now)
     self.assertEqual(query.call_args.args[1].shop_ids, ["S1"])
@@ -875,9 +921,9 @@ with patch("bi_agent.agent.query_business", return_value=known_result) as query:
     self.assertEqual(turn.results[0].data, known_result.data)
 ```
 
-`known_result=ToolResult(status='ok', data=[{'paid_amount':'1000'}], coverage=Coverage(status='complete',start=date(2026,9,1),end=date(2026,9,8)))`；state仅有S1匿名映射；conn为Mock；now同任务5。运行 `uv run python -m unittest tests.test_core.AgentTests -v`，预期先失败。
+`known_result=ToolResult(status='ok', data=[{'paid_amount':'1000'}], coverage=Coverage(status='complete',start=date(2026,9,1),end=date(2026,9,8)))`；state的turns为空且仅有S1匿名映射；conn为Mock；now同任务5。现有Agent检查迁移后应先通过，再加入持久化场景的失败用例。
 
-- [ ] **9.2 暴露两个JSON Schema工具，不提供通用执行入口。**
+- [ ] **9.2 暴露两个模型工具，不公开对应HTTP路由。**
 
 ```python
 tools = [
@@ -890,17 +936,17 @@ tools = [
 ]
 ```
 
-系统提示写在agent.py常量：当前北京时间、业务词汇、支持维度、共同截止及未知能力；“销售额”若未确认支付/出库，或店铺同名，只问一个澄清问题。QueryRequest的 `shop_ids`在模型侧只接受 `shop_1`这类匿名值；模型不能选择S2/原始ID。权限验证在映射前后都执行，字段非法先于SQL拒绝。
+系统提示写在agent.py常量：当前北京时间、业务词汇、支持维度、共同截止及未知能力；“销售额”存在支付/出库歧义或店铺同名时，只问一个澄清问题。QueryRequest中的店铺只接受 `shop_1`匿名值；模型不能选择S2/原始ID。权限验证在映射前后都执行。
 
-- [ ] **9.3 保留少量会话状态，控制预算和工具ID。**
+- [ ] **9.3 实现最多4次工具调用、一次参数修正和30秒总预算。**
 
 ```python
 deadline = time.monotonic() + 30
 calls_used = 0
 correction_used = False
 results = []
-messages = list(state.turns)
-for _ in range(5):   # 最多4工具回合，外加最终解释；不是无限Agent循环
+messages = list(history)
+for _ in range(5):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         break
@@ -908,15 +954,13 @@ for _ in range(5):   # 最多4工具回合，外加最终解释；不是无限Ag
     messages.append(reply.as_message())
     if not reply.tool_calls:
         break
-    # 按顺序处理本轮tool_calls；每一个请求都计入calls_used。
 ```
 
-逐条分支调用对应Pydantic校验和业务函数，不用函数名反射/`eval`。每个工具结果必须 `Message(role='tool', tool_call_id=call.id, content=json.dumps(to_model_result(result, state), ensure_ascii=False))`关联原ID，不能直接发送含真实过滤ID的ToolResult。一次修正仅用于非法参数（包括arguments_error），返回结构化字段错误让模型改；第二次非法则结束。认证/权限/缺数据不盲目修复。批量返回超过剩余额度时，未执行调用逐一回传预算耗尽错误，随后停止模型回合，保留已取得结果。SQL和模型都使用同一deadline；超时仍返回已有确定性卡片。
+逐条调用对应Pydantic模型和业务函数，不用反射/`eval`。工具结果以同一tool_call_id回传；一次修正只用于非法参数，第二次非法结束。权限、缺数据、服务故障不盲目修复。批量5调用最多执行前4个，其余回传预算耗尽；SQL和模型共享deadline。模型解释不重算金额，不把统计分解写成因果。
 
-- [ ] **9.4 实现显式假设和追问合并。**
+- [ ] **9.4 合并明确假设和最近6个完整回合。**
 
 ```python
-# explicit_assumptions里只处理明确关键词附近的数值。
 match = re.search(r"(?:假设|预计).*?销售额\s*(\d+(?:\.\d+)?)\s*(万)?元", question)
 if match:
     values["sales_estimate"] = Decimal(match[1]) * (10000 if match[2] else 1)
@@ -925,30 +969,129 @@ if ratio:
     values["target_ratio"] = Decimal(ratio[1]) / 100
 ```
 
-其他支持的预算假设限定明确“假设预算…元、已花…元、实耗统计到…日、周期…日”的结构或页面表单；`values`为函数内dict。不确定表达如“照上次预算”需澄清。本轮QueryRequest验证成功后才更新日期/店铺/指标筛选；失败不能污染已确认state。保留最近6个完整用户回合及有效工具往返，裁剪时整体删除一个回合，不能留下孤立tool结果或丢失当前回合的provider元数据。
+其他预算表达不能确定时澄清，不从旧预算猜上限。本轮参数验证成功后才更新 `app_chats.filters`。构造history时只加载最近6个完整用户/助手回合，忽略status=error的助手消息并保证不留下孤立工具结果；provider私有上下文只活在当前工具循环，不入库。
 
-- [ ] **9.5 限制模型上下文并接入聊天页面。**
+- [ ] **9.5 写SSE与并发失败检查，再实现 `run_chat_turn`。**
 
 ```python
-question = st.chat_input("例如：最近7天支付金额如何？")
-if question:
-    turn = answer(question, st.session_state["agent_state"], model=model, conn=conn,
-                  allowed_shop_ids=settings.shop_ids, now=now)
-    st.session_state["agent_state"] = turn.state
-    for result in turn.results:
-        render_result(result)
-    st.write(turn.clarification or turn.text)
+events = list(run_chat_turn(conn, chat_id, "user-a", "最近7天支付额",
+                            model=model, settings=settings, now=now))
+self.assertEqual([event.event for event in events],
+                 ["status", "artifact", "message", "done"])
+self.assertEqual(events[1].data["data"][0]["paid_amount"], "1000")
 ```
 
-`to_model_result`先 `result.model_dump(mode='json')`将Decimal/日期转成JSON值，然后仅保留status、口径、聚合列、范围、coverage及限制；把data/filters中所有shop_id映射成state的匿名编号、商品ID映射为本回合商品A/B，不含原始ID和名称。state.filters同样通过此边界生成模型上下文，不直接dump整个state。实际店名/商品标题映射仅留服务端，ERP单号和买家数据不发给模型。用户输入中的已知店名/商品名先替换成匿名标签；若含可识别手机号/邮箱/订单号或要求贴明细，进入提示删去个人信息的分支，避免直接转发；不把正则检测宣称完整DLP。公司允许的provider与数据范围写入runbook。
+`claim_chat_turn`先校验会话属于subject，再执行 `SELECT pg_try_advisory_lock(hashtextextended(%s,0))`锁定chat_id；拿不到锁返回HTTP 409而不是启动第二次回答。锁必须在StreamingResponse发送响应头之前取得。`run_chat_turn`保存用户消息；仅当这是第一条用户消息且 `title_source='auto'` 时生成标题，然后发 `status:{stage:'thinking'}`。工具运行时可发 `status:{stage:'querying'}`，组织回答时发 `status:{stage:'answering'}`，同一stage不重复刷屏；随后依次发每个公开版artifact、持久化后的完整assistant message和done。模型/数据库错误保存status=error的可见助手消息，发送error和done，错误消息不含内部调用栈。浏览器断开不删除已保存用户消息；后端若已完成则仍保存结果，刷新可读取。
 
-模型解释提示要求不重算金额、不把相关性写成因果；数字、预算和图表以ToolResult直接展示。没有调用成功工具时，回答不能声称查询到某个实际经营数字；上游故障显示明确错误及固定查询入口。每次结果带范围、口径、截止和限制，费用假设与ERP实绩分开展示。
+- [ ] **9.6 实现POST消息路由和SSE编码。**
 
-- [ ] **9.6 通过边界回合检查后提交。** AgentTests覆盖：多轮只改日期、歧义澄清、未知工具、SQL注入参数、越权S2、非法JSON纠正仅一次、批量5调用最多执行4个、模型等待耗尽30秒预算、保持tool ID、provider上下文不丢、无模型仍可固定查询、用户A/B状态隔离。使用mock时钟/小超时，不让离线测试实际等30秒。记录发送到模型的数据不含真实ID/密钥；提交：`feat: orchestrate two bounded business tools in conversation`。
+```python
+@router.post("/chats/{chat_id}/messages")
+def post_message(chat_id: UUID, body: MessageCreate,
+                 subject: str = Depends(get_subject)):
+    conn = psycopg.connect(app.state.settings.app_dsn.get_secret_value(), autocommit=True)
+    try:
+        claim_chat_turn(conn, chat_id, subject)
+    except Exception:
+        conn.close()
+        raise
+    def guarded_events():
+        try:
+            yield from run_chat_turn(conn, chat_id, subject, body.content,
+                                     model=app.state.model, settings=app.state.settings,
+                                     now=datetime.now(ZoneInfo("Asia/Shanghai")))
+        finally:
+            try:
+                conn.execute("SELECT pg_advisory_unlock(hashtextextended(%s,0))", (str(chat_id),))
+            finally:
+                conn.close()
+    return StreamingResponse((encode_sse(event) for event in guarded_events()),
+                             media_type="text/event-stream",
+                             headers={"Cache-Control":"no-cache", "X-Accel-Buffering":"no"})
+```
 
-## Task 10：20题验收、运行维护和一周试用
+任务9将 `create_app`扩展为 `create_app(settings: AppSettings, model: ChatModel) -> FastAPI`，测试传入mock。消息流使用专用连接，不复用普通yield依赖，避免响应期间连接被提前释放。上面except在实现时只捕获预期业务/数据库异常并映射，不能向客户端返回原异常文本。SSE格式严格为 `event: <name>\ndata: <one-line-json>\n\n`；JSON使用 `ensure_ascii=False`，正文换行由JSON转义，禁止把用户文本拼进event字段。首次响应立即发送status以便代理刷新缓冲；同源代理对该路由关闭响应缓冲。
 
-**Files:** Create `tests/questions.jsonl`、`tests/acceptance.py`、`docs/demo.md`；Modify `docs/runbook.md`、`docs/metrics.md`、`tests/test_core.py`、`tests/test_db.py`。
+`to_public_artifact`只保留展示所需聚合列、口径、范围、coverage和限制，以店铺/商品显示标签替换ERP ID；`to_model_result`在此基础上再改用匿名标签。用户问题中的已知店名先替换成匿名标签。手机号、邮箱、订单号或明细粘贴请求触发删除个人信息提示，不发provider；不把正则称为完整DLP。
+
+- [ ] **9.7 通过Agent与API边界检查后提交。** 覆盖多轮只改日期、歧义、未知工具、注入参数、越权S2、非法JSON只修正一次、5调用只执行4个、模拟超时、tool ID、provider上下文、两个身份历史隔离、同chat并发409、错误事件、SSE分片为合法UTF-8和JSON、公开路由仍无手动查询端点。提交：`feat: stream persisted agent turns through chat API`。
+
+## Task 10：React聊天工作台
+
+**Files:** Create `frontend/src/types.ts`、`frontend/src/api.ts`、`frontend/src/api.test.ts`、`frontend/src/App.tsx`、`frontend/src/components/Sidebar.tsx`、`frontend/src/components/ChatView.tsx`、`frontend/src/components/MessageView.tsx`、`frontend/src/components/Composer.tsx`、`frontend/src/components/ArtifactView.tsx`、`frontend/src/styles.css`；Modify `frontend/src/main.tsx`、`frontend/vite.config.ts`、`frontend/package.json`、`docs/runbook.md`。
+
+**Interfaces:**
+- Consumes任务6/9的HTTP与SSE契约。`ChatSummary`为 `id/title/created_at/updated_at`；`ChatMessage`为 `id/role/content/artifacts/status/created_at`。
+- Produces `listChats/createChat/loadMessages/renameChat/deleteChat/sendMessage`；所有写请求包含 `Content-Type: application/json`、`X-BI-Agent: web`，使用相对 `/api` 和同源cookie。
+- `sendMessage(chatId: string, content: string, onEvent: (event: ChatEvent) => void, signal: AbortSignal): Promise<void>`用fetch读取SSE；不使用EventSource，因为消息接口是POST。
+
+- [ ] **10.1 手写前端类型并写SSE分片失败检查。**
+
+```typescript
+it('parses UTF-8 split inside a multibyte character', () => {
+  const parser = createSseParser(event => events.push(event))
+  const bytes = new TextEncoder().encode(
+    'event: error\ndata: {"code":"demo","message":"你好"}\n\n')
+  const split = bytes.findIndex(byte => byte > 0x7f) + 1
+  parser.push(bytes.slice(0, split))
+  parser.push(bytes.slice(split))
+  parser.finish()
+  expect(events).toEqual([
+    { event: 'error', data: { code: 'demo', message: '你好' } },
+  ])
+})
+```
+
+`ChatEvent`是 `status|artifact|message|error|done`判别联合。parser用 `TextDecoder('utf-8', {fatal:true})`保持跨chunk多字节字符，空行结束事件，只接受单行data JSON；未知event、坏JSON、流结束仍有残片均抛协议错误。运行 `npm test`，预期先失败。
+
+- [ ] **10.2 实现最小API客户端和流读取。**
+
+```typescript
+export async function sendMessage(chatId: string, content: string,
+  onEvent: (event: ChatEvent) => void, signal: AbortSignal): Promise<void> {
+  const response = await fetch(`/api/chats/${chatId}/messages`, {
+    method: 'POST', credentials: 'same-origin', signal,
+    headers: {'Content-Type':'application/json', 'X-BI-Agent':'web'},
+    body: JSON.stringify({content}),
+  })
+  if (!response.ok || !response.body) throw await apiError(response)
+  const parser = createSseParser(onEvent)
+  const reader = response.body.getReader()
+  for (;;) {
+    const {done, value} = await reader.read()
+    if (done) break
+    parser.push(value)
+  }
+  parser.finish()
+}
+```
+
+`createSseParser.push`只接收 `Uint8Array`；内部用同一个TextDecoder和 `{stream:true}` 解码，`finish()`负责刷新decoder并检查残片。CRUD统一解析稳定错误体，401跳到登录入口或显示会话已过期，404移除本地失效会话，409提示另一回答仍在运行。AbortController只停止浏览器接收，不声称取消后端模型调用；重新加载消息可取得已完成结果。
+
+- [ ] **10.3 实现DeepSeek风格的三段聊天布局。** 桌面左栏260px，包含产品名、新建会话和最近会话；主区消息列最大800px；底部输入区粘在主区并留安全区。空会话显示一句能力说明和3个可点击示例：“最近7天支付金额如何？”、“9月1日至7日退款发生多少？”、“假设下月销售10万元，推广费率12%”。
+
+用户消息为轻量右侧气泡，助手消息开放排版；不复制DeepSeek商标、图标和品牌色。标题改名使用原生input，删除使用 `window.confirm`，不引入模态框库。CSS支持 `prefers-color-scheme`，但只维护一套布局变量；窄于768px时侧栏变为覆盖抽屉。
+
+- [ ] **10.4 实现发送状态和结果附件。** Composer textarea 1～6行自动增高，Enter发送、Shift+Enter换行；空白、>4000字和当前chat运行中禁止发送。接到status在助手位置显示“正在理解问题/正在查询数据/正在组织回答”；接到artifact立即渲染但只有message到达后写入稳定历史；error显示可复制的可见错误并保留原问题，done解除输入锁。
+
+`ArtifactView`按data形状使用数字卡、HTML表格或简单CSS条形展示，不重新计算金额；始终显示filters日期、data_as_of、coverage和limitations。数值字符串原样格式化显示，不用JavaScript Number累计。第一版不提供手动日期/店铺/指标筛选、CSV下载、模型切换、文件上传、联网搜索、思维链面板或设置中心。
+
+- [ ] **10.5 完成无障碍和恢复行为。** 交互元素使用button/label/textarea，焦点可见；消息区 `aria-live="polite"`，状态不只靠颜色；侧栏抽屉可用Escape关闭。切换会话前Abort当前流或阻止切换，并避免旧事件写进新会话。刷新后先listChats，再加载最近会话；空列表自动创建一条空会话，创建失败显示重试按钮而非白屏。
+
+- [ ] **10.6 配置开发代理并验证前后端独立启动。**
+
+```typescript
+export default defineConfig({
+  plugins: [react()],
+  server: {proxy: {'/api': {target: 'http://127.0.0.1:8000'}}},
+})
+```
+
+两个终端分别从 `backend/` 运行 `uv run --env-file ../.env.app uvicorn bi_agent.api:app --host 127.0.0.1 --port 8000 --reload`，从 `frontend/` 运行 `npm run dev`。执行 `npm test`、`npm run build`，预期SSE检查和TypeScript生产构建通过。人工验证桌面/窄屏、新建/切换/改名/删除、刷新恢复、Enter/Shift+Enter、错误/409以及消息内1000/100/900结果。提交：`feat: add focused React chat workspace`。
+
+## Task 11：20题验收、运行维护和一周试用
+
+**Files:** Modify `backend/tests/questions.jsonl`、`backend/tests/acceptance.py`、`docs/demo.md`、`docs/runbook.md`、`docs/metrics.md`、`backend/tests/test_core.py`、`backend/tests/test_db.py`、`backend/tests/test_api.py`、`frontend/package.json`。
 
 **Interfaces:**
 - Consumes任务5 `seed_business_case` 和所有应用接口。
@@ -984,7 +1127,7 @@ if question:
 
 额外边界归入core/DB测试，不扩大问答集：零分母、NaN、366/367天、周期结束、未匹配退款、同版本冲突、平台售后重复工单、超过500组、超时、缺provider凭证。
 
-- [ ] **10.1 将20题落为JSONL，编写结构化验收runner。**
+- [ ] **11.1 将20题落为JSONL，编写结构化验收runner。**
 
 ```json
 {"id":"01","turns":["店铺A最近7天的支付金额是多少？"],"expected":{"tool":"query_business","parameters":{"start":"2026-09-01","end":"2026-09-08","shop_ids":["S1"],"metrics":["paid_amount"]},"values":{"paid_amount":"1000"},"status":"ok"}}
@@ -993,34 +1136,43 @@ if question:
 
 按表完整写20行；03/04/05用列表values，07用每轮expected，08/09用clarify=true。runner利用标准库 `unittest.mock`记录服务端实际工具参数，金额用Decimal比对，顺序不重要的指标/店铺集合规范化。offline用预制模型消息序列验证协议和业务执行，**不能证明模型理解准确率**；live才检查实际模型选工具/参数表现，澄清与因果边界人工核看。报告每题状态、错误分类、耗时、token用量（缺失写unknown），不只报总分。
 
-- [ ] **10.2 运行离线检查与测试数据库验收。**
+- [ ] **11.2 运行后端、API和前端离线检查。** 以下命令从项目根目录执行。
 
 ```powershell
+Set-Location backend
 uv run python -m unittest tests.test_core -v
-uv run --env-file .env.test python -m unittest tests.test_db -v
-uv run --env-file .env.test python -m tests.acceptance --offline
+uv run --env-file ../.env.test python -m unittest tests.test_db -v
+uv run --env-file ../.env.test python -m unittest tests.test_api -v
+uv run --env-file ../.env.test python -m tests.acceptance --offline
+Set-Location ..
+npm --prefix frontend test
+npm --prefix frontend run build
 ```
 
-预期：核心/DB检查通过、20题结构化断言通过，DB检查不能是全部skip。测试数据库初始化通过管理员执行 `psql -d bi_agent_test -f sql/001_init.sql`；测试环境文件仅含测试DSN和fake模型配置。失败优先修复业务口径、覆盖或边界，不调整人工答案迎合模型。
+预期：核心/DB/API检查通过、20题结构化断言通过、SSE分片检查和TypeScript构建通过，DB检查不能是全部skip。测试数据库初始化通过管理员执行 `psql -d bi_agent_test -f backend/sql/001_init.sql`；测试环境文件仅含测试DSN和fake模型配置。失败优先修复业务口径、覆盖、会话边界或事件契约，不调整人工答案迎合模型。
 
-- [ ] **10.3 分provider做显式真实联调，再锁定型号。**
+- [ ] **11.3 分provider做显式真实联调，再锁定型号。** 以下命令从 `backend/` 执行。
 
 ```powershell
-uv run --env-file .env.qwen-test python -m tests.acceptance --provider-smoke
-uv run --env-file .env.deepseek-test python -m tests.acceptance --provider-smoke
-uv run --env-file .env.qwen-test python -m tests.acceptance --live
-uv run --env-file .env.deepseek-test python -m tests.acceptance --live
+uv run --env-file ../.env.qwen-test python -m tests.acceptance --provider-smoke
+uv run --env-file ../.env.deepseek-test python -m tests.acceptance --provider-smoke
+uv run --env-file ../.env.qwen-test python -m tests.acceptance --live
+uv run --env-file ../.env.deepseek-test python -m tests.acceptance --live
 ```
 
 这两个忽略的本地配置分别只含自身密钥、明确型号、测试DB身份；真实模型只读合成数据。smoke必须经过“模型提出工具调用→回传同ID结果→模型回答”，不以纯文本问好代替。真实模型服务和付费调用按公司已允许的provider及预算执行；没有授权或凭证的provider记“未实测”，不算通过，也不阻碍离线适配和另一个provider验收。
 
 记录provider/model/base_url地域、日期、20题逐项结果、总耗时分布、实际计量依据。金额、越权、缺数据拒答不能容忍错误；失败问题修正后重跑受影响项和相关回合。两者都通过后才称“双provider验证通过”；仅一个通过时部署该provider，另一项保留未验收状态。选择依据是公司许可、业务问答通过情况、耗时和真实费用，不预写准确率或省钱比例。
 
-- [ ] **10.4 配置小时同步、每日重核和脱敏日志。** `docs/runbook.md`给出任务计划程序动作，运行位置为项目根目录，使用 `Get-Command uv`得到执行机的绝对路径；运行账户仅能读取同步凭证，设置“不启动新实例”。
+- [ ] **11.4 验证同源部署和可信身份边界。** 从 `frontend/` 依次执行 `npm ci`、`npm run build`，只发布 `frontend/dist`；从 `backend/` 以 `uv sync --locked`准备运行环境。现有公司反向代理将 `/api/*`转发到 `127.0.0.1:8000`、其余路径提供前端静态文件和SPA回退，关闭消息路由缓冲，并完成登录后删除外部 `X-Auth-Request-Sub`再注入OIDC `sub`。FastAPI使用 `--host 127.0.0.1 --workers 1`；首版没有进程内共享状态，多worker只有压测证明需要时再开。
+
+共享试用前用两个真实测试身份确认：未登录被代理拒绝，A无法加载/修改/删除B的会话，伪造身份头无效，错误Origin写请求403，SSE首个status在代理超时前到达，刷新能恢复最终消息。代理或OIDC设施不可用时，保持localhost开发试用，不把FastAPI直接监听 `0.0.0.0`。
+
+- [ ] **11.5 配置小时同步、每日重核和脱敏日志。** `docs/runbook.md`给出任务计划程序动作，运行位置为 `backend`，使用 `Get-Command uv`得到执行机的绝对路径；运行账户仅能读取同步凭证，设置“不启动新实例”。
 
 ```powershell
 $taskUv = (Get-Command uv).Source
-$syncAction = New-ScheduledTaskAction -Execute $taskUv -Argument 'run --locked --env-file .env.sync python -m bi_agent.sync incremental' -WorkingDirectory 'D:\Projects\bi-agent'
+$syncAction = New-ScheduledTaskAction -Execute $taskUv -Argument 'run --locked --env-file ../.env.sync python -m bi_agent.sync incremental' -WorkingDirectory 'D:\Projects\bi-agent\backend'
 $syncTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Hours 1)
 $syncSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
 Register-ScheduledTask -TaskName 'BI Agent Hourly Sync' -Action $syncAction -Trigger $syncTrigger -Settings $syncSettings
@@ -1028,9 +1180,9 @@ Register-ScheduledTask -TaskName 'BI Agent Hourly Sync' -Action $syncAction -Tri
 
 另建每日低峰 `reconcile --days 7` 动作；同用数据库锁，错过时下一次再跑。注册发生在执行部署时，本计划不创建定时任务。生产环境使用受控后台账户，运行参数不含密码；新起后台辅助进程使用隐藏窗口。
 
-日志用标准库logging输出一行JSON：request_id、模板ID/工具名、匿名店铺、日期范围、行数、耗时、data_as_of、错误类别，文件轮转10MiB×5。日志序列化只取字段白名单；禁止 `logger.exception`无审查输出包含请求体/DSN的异常。页面显示同步失败的影响范围和最后成功时间，历史成功报表仍可查看。用一次模拟上游超时确认水位不动、页面提示变为失败、随后恢复成功。
+日志用标准库logging输出一行JSON：request_id、chat_id的不可逆摘要、模板ID/工具名、匿名店铺、日期范围、行数、耗时、data_as_of、错误类别，文件轮转10MiB×5。日志序列化只取字段白名单；禁止 `logger.exception`无审查输出包含请求体/DSN的异常。聊天错误附件显示同步失败的影响范围和最后成功时间，历史消息仍可查看。用一次模拟上游超时确认水位不动、SSE发送error、随后恢复成功。
 
-- [ ] **10.5 做备份及真实恢复检查。** 用PostgreSQL服务配置和受保护的凭证文件管理备份身份；`bi_backup`与 `bi_restore_check`是本机pg_service.conf中的连接服务名，不是应用模型配置。备份身份需有事实表读取权限，不能误用只看视图的应用账号。
+- [ ] **11.6 做备份及真实恢复检查。** 用PostgreSQL服务配置和受保护的凭证文件管理备份身份；`bi_backup`与 `bi_restore_check`是本机pg_service.conf中的连接服务名，不是应用模型配置。备份身份需读取事实及会话表，不能误用权限受限的应用账号。
 
 ```powershell
 New-Item -ItemType Directory -Path backups -Force
@@ -1039,13 +1191,13 @@ psql "service=bi_restore_check" -c "SELECT current_database();"
 pg_restore --dbname="service=bi_restore_check" --no-owner --no-privileges backups/restore-check.dump
 ```
 
-恢复目标由管理员预建为独立空库 `bi_agent_restore`，先检查连接服务确实指向此库，再恢复；不得覆盖业务库。备份时通过同一advisory锁暂停同步写入，记录事实行数、金额汇总、覆盖状态的校验摘要；恢复后比较相同摘要，并验证关键报表可查询。备份文件位于受限ACL及加密磁盘；设置每日备份和7天保留。记录一次真正恢复成功的日期与步骤，单有dump文件不算通过。
+恢复目标由管理员预建为独立空库 `bi_agent_restore`，先检查连接服务确实指向此库，再恢复；不得覆盖业务库。备份时通过同一advisory锁暂停同步写入，记录事实行数、金额汇总、覆盖状态、会话/消息数的校验摘要；恢复后比较相同摘要，并验证关键报表和会话加载。备份文件位于受限ACL及加密磁盘；设置每日备份和7天保留。记录一次真正恢复成功的日期与步骤，单有dump文件不算通过。
 
-- [ ] **10.6 一店小范围试用一周，记录真实结果。** 每日检查同步覆盖和失败、抽查一个经营问题、记录失败问法及口径分歧。对接口审批/字段限制形成明确问题单；不为“所有平台都有店铺记录”提前开放全平台汇总。页面始终标出试点范围。
+- [ ] **11.7 一店小范围试用一周，记录真实结果。** 每日检查同步覆盖和失败、从聊天抽查一个经营问题、记录失败问法、SSE/API错误及口径分歧。对接口审批/字段限制形成明确问题单；不为“所有平台都有店铺记录”提前开放全平台汇总。结果附件始终标出试点范围。
 
 向快麦实施确认增值报表是否有推广实耗：具体方法名/文档、当前账号授权、费用粒度、币种、修正规则、更新时间、归因窗口。拿到并对账后才能另建 `promotion_daily` 及真实费用规则；如果快麦不提供，再由经营者选择广告平台导出或授权API。淘系/拼多多分别取得奇门/方舟的实际授权文档并对账后才能扩展支付能力。这些是条件扩展，不作为当前情景测算交付的隐形必选模块。
 
-- [ ] **10.7 写演示说明并完成发布前检查。** `docs/demo.md`用合成数据展示五分钟路径：固定经营查询→连续追问→退款跨期→预算假设→缺数据边界→provider启动配置。面试说明围绕五个模块的输入输出、数据去重和覆盖、Agent与确定性计算分工；借鉴OpenChatBI的工具选择和有限修复，不宣称实现通用Text2SQL。复用源码才保留对应MIT声明，单纯参考不复制整仓依赖。
+- [ ] **11.8 写演示说明并完成发布前检查。** `docs/demo.md`用合成数据展示五分钟路径：新建会话→经营问答→连续追问→退款跨期→预算假设→缺数据边界→provider启动配置。面试说明按前端、API/会话、Agent、指标、同步五个边界讲清输入输出；借鉴OpenChatBI的工具选择和有限修复，不宣称实现通用Text2SQL。复用源码才保留对应MIT声明，单纯参考不复制整仓依赖。
 
 最终检查 `git diff --check`、`git status --short`及暂存文件名单，确认无 `.env`/导出/备份/真实截图；重跑本阶段改变涉及的测试。提交：`chore: document acceptance and verified operating procedures`。只有相应检查完成后才使用“已上线”“双provider通过”“恢复成功”等完成时态。
 
@@ -1054,28 +1206,30 @@ pg_restore --dbname="service=bi_restore_check" --no-owner --no-privileges backup
 | 必须满足 | 证据位置 |
 | --- | --- |
 | 试点一店可读，完整一天及90天实际覆盖范围明确 | `docs/metrics.md`对账摘要、DB覆盖状态 |
-| 同步幂等，故障回滚，旧版本/拆合单/退款不会放大金额 | `tests/test_db.py`运行结果 |
-| 固定页面可独立查询，金额按分一致，缺数据与零分开 | 核心/DB检查与真实对账 |
+| 同步幂等，故障回滚，旧版本/拆合单/退款不会放大金额 | `backend/tests/test_db.py`运行结果 |
+| 后端确定性指标金额按分一致，缺数据与零分开 | 核心/DB检查与真实对账 |
 | 两provider可配置，已测/未测状态分别诚实记录 | `docs/runbook.md`provider联调表 |
-| 两工具、4次调用/一次修正/30秒预算有效，多轮状态隔离 | `tests/test_core.py`及20题逐项结果 |
+| 两工具、4次调用/一次修正/30秒预算有效，多轮状态隔离 | `backend/tests/test_core.py`及20题逐项结果 |
 | 预算假设测算精确，实际费用/利润未取得时明确不可用 | PromotionTests及问题16—18 |
+| API会话归属、SSE事件和前端聊天恢复通过 | `backend/tests/test_api.py`、`frontend/src/api.test.ts`及前端构建 |
 | 认证、小时同步、脱敏日志、备份恢复和试用检查完成 | `docs/runbook.md`操作记录 |
-| 没有把未授权平台、缺失费用或未测型号写成已交付 | 页面说明与 `docs/demo.md` |
+| 没有把未授权平台、缺失费用或未测型号写成已交付 | 聊天结果附件与 `docs/demo.md` |
 
-工期参考设计中的单人约2—3周初版开发量，一周试用用于收集运行证据；数据对账、第三方授权和公司认证设施的等待时间单列。按检查点推进，不用工期倒逼跳过金额/权限验证。
+工期参考修订设计中的单人约3周初版开发量，一周试用用于收集运行证据；数据对账、第三方授权和公司认证设施的等待时间单列。按检查点推进，不用工期倒逼跳过金额/权限验证。
 
 ## 计划自检映射
 
 | 设计要求 | 对应任务 |
 | --- | --- |
-| 已证实数据范围、未证实推广费、抖音先行 | 2、4、10 |
-| 单体技术栈、模块职责、避免框架扩张 | 1、文件职责表、全部任务边界 |
-| provider选择及上下文/工具ID/错误统一 | 1、7、9、10.3 |
+| 已证实数据范围、未证实推广费、抖音先行 | 2、4、11 |
+| 前后端分离、模块职责、避免框架扩张 | 1、6、10、文件职责表 |
+| provider选择及上下文/工具ID/错误统一 | 1、7、9、11.3 |
 | 商业单去重、退款跨期、金额单位、商品能力 | 2.5、3、5 |
 | 覆盖与水位、归档、分页、补查、Token续期 | 2、4 |
 | SQL白名单、只读权限、超时、范围和行数 | 3、5、9 |
-| 假设测算与真实费用/利润功能门槛 | 8、10.6 |
-| 无模型可用、认证、隐私、会话隔离 | 1、6、9 |
-| 问答、部署、日志、恢复、面试证据 | 10 |
+| 假设测算与真实费用/利润功能门槛 | 8、11.7 |
+| 身份、Origin、隐私、会话归属 | 1、6、9、11.4 |
+| 聊天专用API、DeepSeek风格UI、无手动查询入口 | 6、9、10 |
+| 问答、部署、日志、恢复、面试证据 | 11 |
 
 本计划完成时只检查文档中的覆盖、接口一致性、示例计算和命令路径；应用测试、真实模型调用、部署及恢复需要执行上述任务后才能报告结果。
