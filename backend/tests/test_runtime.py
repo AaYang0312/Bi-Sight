@@ -105,10 +105,122 @@ class RuntimeModelTests(unittest.TestCase):
             "artifact_persistence_error",
         )
 
+    def test_allowlisted_models_reject_exact_persistence_bypasses(self):
+        raw_question = "请查询店铺 S1 的销售额"
+        opaque_credential = "sk_live_51OpaqueCredentialValue"
+        generic_database_excerpt = "database engine returned status 42"
+        cases = (
+            (raw_question, lambda: NewQueryRun(
+                chat_id=uuid4(), user_message_id=uuid4(), subject_id="u1",
+                tool_call_id="call_1", attempt_no=1,
+                state={"message": raw_question},
+            )),
+            ("reasoning_content", lambda: RunTransition(
+                expected_revision=0, node="resolve_parameters", status=RunStatus.RUNNING,
+                state={"node": "resolve_parameters", "revision": 1},
+                payload={"reasoning_content": "opaque"},
+            )),
+            ("S1", lambda: NewArtifact(
+                payload={"status": "ok", "data": [{"shop_id": "S1"}]},
+            )),
+            ("ERP-P-9", lambda: NewArtifact(
+                payload={"status": "ok", "data": [{"product_id": "ERP-P-9"}]},
+            )),
+            (opaque_credential, lambda: NewArtifact(
+                payload={"status": "ok", "data": [{"paid_amount": opaque_credential}]},
+            )),
+            (generic_database_excerpt, lambda: ErrorEnvelope(
+                code="unavailable", stage="execute_fixed_query", retryable=True,
+                recovery=RecoveryAction.RETRY_LATER,
+                public_message=generic_database_excerpt,
+            )),
+        )
+        for unsafe_value, command in cases:
+            with self.subTest(unsafe_value=unsafe_value), self.assertRaises(ValidationError) as context:
+                command()
+            self.assertNotIn(unsafe_value, str(context.exception))
+
+    def test_allowlisted_future_state_event_and_artifact_shapes_are_valid(self):
+        normalized_request = {
+            "shop_aliases": ["shop_1"],
+            "metrics": ["paid_amount"],
+            "start": "2026-09-01",
+            "end": "2026-09-08",
+            "group_by": "shop",
+            "compare": "none",
+            "top_n": 10,
+            "currency": "CNY",
+        }
+        coverage = {
+            "status": "complete",
+            "start": "2026-09-01",
+            "end": "2026-09-08",
+            "gaps": [],
+        }
+        state = {
+            "node": "resolve_parameters",
+            "status": "running",
+            "revision": 1,
+            "normalized_request": normalized_request,
+            "problems": [],
+            "coverage": coverage,
+            "data_as_of": "2026-09-08T09:00:00+08:00",
+            "limitations": ["coverage_incomplete"],
+            "artifact_refs": [],
+        }
+        event_payload = {
+            "problem_codes": ["invalid_parameters"],
+            "coverage_status": "complete",
+            "data_as_of": "2026-09-08T09:00:00+08:00",
+            "limitation_codes": ["coverage_incomplete"],
+            "result_count": 1,
+        }
+        public_artifact = {
+            "status": "ok",
+            "metric_definition": {
+                "paid_amount": "已验证商业订单支付金额之和（人民币，按支付时间归属，[start,end)）",
+            },
+            "coverage": coverage,
+            "limitations": ["同批支付额为0或无支付，同批退款率不可计算"],
+            "data_as_of": "2026-09-08T09:00:00+08:00",
+            "filters": {
+                "start": "2026-09-01",
+                "end": "2026-09-08",
+                "shop_ids": ["店铺1"],
+                "metrics": ["paid_amount"],
+                "group_by": "shop",
+                "compare": "none",
+                "currency": "CNY",
+            },
+            "data": [{"shop_id": "店铺1", "paid_amount": "1000"}],
+        }
+        record = NewQueryRun(
+            chat_id=uuid4(), user_message_id=uuid4(), subject_id="u1",
+            tool_call_id="call_1", attempt_no=1,
+            normalized_request=normalized_request,
+            state={"node": "received", "status": "running", "revision": 0},
+        )
+        transition = RunTransition(
+            expected_revision=0, node="resolve_parameters", status=RunStatus.RUNNING,
+            state=state, payload=event_payload,
+        )
+        artifact = NewArtifact(payload=public_artifact, coverage=coverage)
+        completion = RunCompletion(
+            expected_revision=1, node="finalize", status=RunStatus.SUCCEEDED,
+            state={**state, "node": "finalize", "status": "succeeded", "revision": 2},
+            payload={"result_count": 1},
+        )
+        store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
+        run_id = store.create_run(record)
+        store.transition(run_id, transition)
+        self.assertEqual(store.save_artifact(run_id, artifact).type, "metric_result")
+        store.finish(run_id, completion)
+        self.assertEqual(store.runs[run_id]["status"], "succeeded")
+
 
 class MemoryQueryRunStoreTests(unittest.TestCase):
     def setUp(self):
-        self.store = MemoryQueryRunStore()
+        self.store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
         self.record = NewQueryRun(
             chat_id=uuid4(), user_message_id=uuid4(), subject_id="u1",
             tool_call_id="call_1", attempt_no=1,
@@ -133,7 +245,12 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
         run_id = self.store.create_run(self.record)
         ref = self.store.save_artifact(run_id, NewArtifact(
             payload={"status": "ok", "data": []},
-            coverage={"status": "complete"},
+            coverage={
+                "status": "complete",
+                "start": "2026-09-01",
+                "end": "2026-09-08",
+                "gaps": [],
+            },
         ))
         self.assertEqual(ref.type, "metric_result")
         self.store.finish(run_id, RunCompletion(
@@ -152,9 +269,10 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
     def test_store_rejects_known_real_erp_identifiers_without_persisting_them(self):
         store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
         run_id = store.create_run(self.record)
-        transition = RunTransition(
+        transition = RunTransition.model_construct(
             expected_revision=0, node="resolve_parameters", status=RunStatus.RUNNING,
-            state={"shop_id": "S1"},
+            event_type=RunTransition.model_fields["event_type"].default,
+            state={"shop_id": "S1"}, payload={}, error_code=None,
         )
         with self.assertRaises(ValueError) as context:
             store.transition(run_id, transition)
@@ -162,11 +280,104 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
         self.assertEqual(store.runs[run_id]["revision"], 0)
         self.assertEqual(store.events[run_id], [])
         with self.assertRaises(ValueError) as context:
-            store.save_artifact(run_id, NewArtifact(
-                payload={"product_id": "ERP-P-9"},
+            store.save_artifact(run_id, NewArtifact.model_construct(
+                artifact_type="metric_result",
+                payload={"status": "ok", "data": [{"product_id": "ERP-P-9"}]},
+                data_as_of=None,
+                coverage=None,
             ))
         self.assertEqual(str(context.exception), "unsafe_persistence_payload")
         self.assertEqual(store.artifacts, {})
+        with self.assertRaises(ValueError) as context:
+            store.save_artifact(run_id, NewArtifact.model_construct(
+                artifact_type="metric_result",
+                payload={"status": "ok", "data": [{"paid_amount": "sk_live_51Opaque"}]},
+                data_as_of=None,
+                coverage=None,
+            ))
+        self.assertEqual(str(context.exception), "unsafe_persistence_payload")
+        self.assertEqual(store.artifacts, {})
+
+    def test_store_requires_real_erp_identifiers(self):
+        with self.assertRaises(TypeError):
+            MemoryQueryRunStore()
+        with self.assertRaises(ValueError) as context:
+            MemoryQueryRunStore(forbidden_values=set())
+        self.assertEqual(str(context.exception), "forbidden_values_required")
+
+    def test_store_revalidates_constructed_event_payload(self):
+        run_id = self.store.create_run(self.record)
+        unsafe_transition = RunTransition.model_construct(
+            expected_revision=0,
+            node="resolve_parameters",
+            event_type=RunTransition.model_fields["event_type"].default,
+            status=RunStatus.RUNNING,
+            state={"node": "resolve_parameters", "revision": 1},
+            payload={"reasoning_content": "opaque"},
+            error_code=None,
+        )
+        with self.assertRaises(ValueError) as context:
+            self.store.transition(run_id, unsafe_transition)
+        self.assertEqual(str(context.exception), "unsafe_persistence_payload")
+        self.assertEqual(self.store.events[run_id], [])
+
+    def test_store_revalidates_constructed_command_envelope(self):
+        run_id = self.store.create_run(self.record)
+        unsafe_completion = RunCompletion.model_construct(
+            expected_revision=0,
+            node="message",
+            status=RunStatus.SUCCEEDED,
+            state={"node": "finalize", "status": "succeeded", "revision": 1},
+            payload={},
+            error_code=None,
+        )
+        with self.assertRaises(ValueError) as context:
+            self.store.finish(run_id, unsafe_completion)
+        self.assertEqual(str(context.exception), "unsafe_persistence_payload")
+        self.assertEqual(self.store.runs[run_id]["revision"], 0)
+
+    def test_store_revalidates_constructed_state_and_error_content(self):
+        unsafe_record = NewQueryRun.model_construct(
+            chat_id=uuid4(),
+            user_message_id=uuid4(),
+            subject_id="u1",
+            tool_call_id="call_1",
+            domain="business_query",
+            attempt_no=1,
+            normalized_request={},
+            state={"message": "请查询店铺 S1 的销售额"},
+        )
+        with self.assertRaises(ValueError) as context:
+            self.store.create_run(unsafe_record)
+        self.assertEqual(str(context.exception), "unsafe_persistence_payload")
+        self.assertEqual(self.store.runs, {})
+
+        run_id = self.store.create_run(self.record)
+        unsafe_error = ErrorEnvelope.model_construct(
+            code="unavailable",
+            stage="execute_fixed_query",
+            retryable=True,
+            recovery=RecoveryAction.RETRY_LATER,
+            public_message="database engine returned status 42",
+            problems=[],
+        )
+        unsafe_completion = RunCompletion.model_construct(
+            expected_revision=0,
+            node="finalize",
+            status=RunStatus.FAILED,
+            state={
+                "node": "finalize",
+                "status": "failed",
+                "revision": 1,
+                "error": unsafe_error.model_dump(),
+            },
+            payload={},
+            error_code="unavailable",
+        )
+        with self.assertRaises(ValueError) as context:
+            self.store.finish(run_id, unsafe_completion)
+        self.assertEqual(str(context.exception), "unsafe_persistence_payload")
+        self.assertEqual(self.store.runs[run_id]["revision"], 0)
 
     def test_save_artifact_rejects_unknown_run(self):
         with self.assertRaises(RunNotFound):

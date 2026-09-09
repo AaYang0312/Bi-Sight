@@ -7,6 +7,8 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
+from pydantic import ValidationError
+
 from .models import (
     ArtifactRef,
     NewArtifact,
@@ -17,22 +19,29 @@ from .models import (
     RunStatus,
     RunTransition,
     StaleRunRevision,
-    validate_safe_payload,
+    validate_artifact_payload,
+    validate_coverage_payload,
+    validate_event_payload,
+    validate_normalized_request,
+    validate_persisted_state,
 )
 
 
 class MemoryQueryRunStore:
     """Store query-run records in dictionaries with repository-equivalent semantics."""
 
-    def __init__(self, *, forbidden_values: Collection[str] = ()) -> None:
+    def __init__(self, *, forbidden_values: Collection[str]) -> None:
+        self._forbidden_values = frozenset(value for value in forbidden_values if value)
+        if not self._forbidden_values:
+            raise ValueError("forbidden_values_required")
         self.runs: dict[UUID, dict[str, object]] = {}
         self.events: dict[UUID, list[dict[str, object]]] = {}
         self.artifacts: dict[UUID, dict[str, object]] = {}
-        self._forbidden_values = frozenset(value for value in forbidden_values if value)
 
     def create_run(self, record: NewQueryRun) -> UUID:
-        self._validate_payload(record.normalized_request)
-        self._validate_payload(record.state)
+        self._revalidate_new_run(record)
+        self._validate_normalized_request(record.normalized_request)
+        self._validate_state(record.state)
         if self._has_run_context(record):
             raise ValueError("duplicate_query_run")
         run_id = uuid4()
@@ -48,8 +57,8 @@ class MemoryQueryRunStore:
             "status": RunStatus.RUNNING.value,
             "current_node": record.state.get("node"),
             "revision": 0,
-            "normalized_request": self._copy_safe_payload(record.normalized_request),
-            "state": self._copy_safe_payload(record.state),
+            "normalized_request": deepcopy(record.normalized_request),
+            "state": deepcopy(record.state),
             "error_code": None,
             "started_at": now,
             "updated_at": now,
@@ -59,8 +68,9 @@ class MemoryQueryRunStore:
         return run_id
 
     def transition(self, run_id: UUID, transition: RunTransition) -> None:
-        self._validate_payload(transition.state)
-        self._validate_payload(transition.payload)
+        self._revalidate_transition(transition)
+        self._validate_state(transition.state)
+        self._validate_event(transition.payload)
         run = self._require_current_revision(run_id, transition.expected_revision)
         revision = transition.expected_revision + 1
         now = _now()
@@ -68,7 +78,7 @@ class MemoryQueryRunStore:
             "status": transition.status.value,
             "current_node": transition.node,
             "revision": revision,
-            "state": self._copy_safe_payload(transition.state),
+            "state": deepcopy(transition.state),
             "error_code": transition.error_code,
             "updated_at": now,
         })
@@ -78,24 +88,24 @@ class MemoryQueryRunStore:
             node=transition.node,
             event_type=transition.event_type,
             status=transition.status,
-            payload=self._copy_safe_payload(transition.payload),
+            payload=deepcopy(transition.payload),
             created_at=now,
         ))
 
     def save_artifact(self, run_id: UUID, artifact: NewArtifact) -> ArtifactRef:
         self._require_run(run_id)
-        self._validate_payload(artifact.payload)
+        self._revalidate_artifact(artifact)
+        self._validate_artifact(artifact.payload)
         if artifact.coverage is not None:
-            self._validate_payload(artifact.coverage)
+            self._validate_coverage(artifact.coverage)
         artifact_id = uuid4()
         self.artifacts[artifact_id] = {
             "id": artifact_id,
             "run_id": run_id,
             "artifact_type": artifact.artifact_type,
-            "payload": self._copy_safe_payload(artifact.payload),
+            "payload": deepcopy(artifact.payload),
             "data_as_of": artifact.data_as_of,
-            "coverage": (self._copy_safe_payload(artifact.coverage)
-                         if artifact.coverage is not None else None),
+            "coverage": deepcopy(artifact.coverage) if artifact.coverage is not None else None,
             "created_at": _now(),
         }
         return ArtifactRef(id=artifact_id, type=artifact.artifact_type)
@@ -103,8 +113,9 @@ class MemoryQueryRunStore:
     def finish(self, run_id: UUID, completion: RunCompletion) -> None:
         if completion.status is RunStatus.RUNNING:
             raise ValueError("finish_requires_terminal_status")
-        self._validate_payload(completion.state)
-        self._validate_payload(completion.payload)
+        self._revalidate_completion(completion)
+        self._validate_state(completion.state)
+        self._validate_event(completion.payload)
         run = self._require_current_revision(run_id, completion.expected_revision)
         revision = completion.expected_revision + 1
         now = _now()
@@ -112,7 +123,7 @@ class MemoryQueryRunStore:
             "status": completion.status.value,
             "current_node": completion.node,
             "revision": revision,
-            "state": self._copy_safe_payload(completion.state),
+            "state": deepcopy(completion.state),
             "error_code": completion.error_code,
             "updated_at": now,
             "completed_at": now,
@@ -124,7 +135,7 @@ class MemoryQueryRunStore:
             event_type=(RunEventType.FAILED if completion.status is RunStatus.FAILED
                         else RunEventType.COMPLETED),
             status=completion.status,
-            payload=self._copy_safe_payload(completion.payload),
+            payload=deepcopy(completion.payload),
             created_at=now,
         ))
 
@@ -150,12 +161,63 @@ class MemoryQueryRunStore:
             for run in self.runs.values()
         )
 
-    def _validate_payload(self, payload: dict[str, object]) -> None:
-        validate_safe_payload(payload, forbidden_values=self._forbidden_values)
+    def _validate_normalized_request(self, value: object) -> None:
+        validate_normalized_request(value)
+        self._reject_forbidden_values(value)
 
-    def _copy_safe_payload(self, payload: dict[str, object]) -> dict[str, object]:
-        self._validate_payload(payload)
-        return deepcopy(payload)
+    def _validate_state(self, value: object) -> None:
+        validate_persisted_state(value)
+        self._reject_forbidden_values(value)
+
+    def _validate_event(self, value: object) -> None:
+        validate_event_payload(value)
+        self._reject_forbidden_values(value)
+
+    def _validate_artifact(self, value: object) -> None:
+        validate_artifact_payload(value)
+        self._reject_forbidden_values(value)
+
+    def _validate_coverage(self, value: object) -> None:
+        validate_coverage_payload(value)
+        self._reject_forbidden_values(value)
+
+    def _reject_forbidden_values(self, value: object) -> None:
+        if isinstance(value, dict):
+            for nested in value.values():
+                self._reject_forbidden_values(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                self._reject_forbidden_values(nested)
+        elif isinstance(value, str) and value in self._forbidden_values:
+            raise ValueError("unsafe_persistence_payload")
+
+    @staticmethod
+    def _revalidate_new_run(record: NewQueryRun) -> None:
+        try:
+            NewQueryRun.model_validate(record.model_dump())
+        except ValidationError as error:
+            raise ValueError("unsafe_persistence_payload") from error
+
+    @staticmethod
+    def _revalidate_transition(transition: RunTransition) -> None:
+        try:
+            RunTransition.model_validate(transition.model_dump())
+        except ValidationError as error:
+            raise ValueError("unsafe_persistence_payload") from error
+
+    @staticmethod
+    def _revalidate_artifact(artifact: NewArtifact) -> None:
+        try:
+            NewArtifact.model_validate(artifact.model_dump())
+        except ValidationError as error:
+            raise ValueError("unsafe_persistence_payload") from error
+
+    @staticmethod
+    def _revalidate_completion(completion: RunCompletion) -> None:
+        try:
+            RunCompletion.model_validate(completion.model_dump())
+        except ValidationError as error:
+            raise ValueError("unsafe_persistence_payload") from error
 
 
 def _event(*, run_id: UUID, revision: int, node: str, event_type: RunEventType,
