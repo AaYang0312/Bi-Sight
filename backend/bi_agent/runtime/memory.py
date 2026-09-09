@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from copy import deepcopy
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -16,18 +17,24 @@ from .models import (
     RunStatus,
     RunTransition,
     StaleRunRevision,
+    validate_safe_payload,
 )
 
 
 class MemoryQueryRunStore:
     """Store query-run records in dictionaries with repository-equivalent semantics."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, forbidden_values: Collection[str] = ()) -> None:
         self.runs: dict[UUID, dict[str, object]] = {}
         self.events: dict[UUID, list[dict[str, object]]] = {}
         self.artifacts: dict[UUID, dict[str, object]] = {}
+        self._forbidden_values = frozenset(value for value in forbidden_values if value)
 
     def create_run(self, record: NewQueryRun) -> UUID:
+        self._validate_payload(record.normalized_request)
+        self._validate_payload(record.state)
+        if self._has_run_context(record):
+            raise ValueError("duplicate_query_run")
         run_id = uuid4()
         now = _now()
         self.runs[run_id] = {
@@ -41,8 +48,8 @@ class MemoryQueryRunStore:
             "status": RunStatus.RUNNING.value,
             "current_node": record.state.get("node"),
             "revision": 0,
-            "normalized_request": deepcopy(record.normalized_request),
-            "state": deepcopy(record.state),
+            "normalized_request": self._copy_safe_payload(record.normalized_request),
+            "state": self._copy_safe_payload(record.state),
             "error_code": None,
             "started_at": now,
             "updated_at": now,
@@ -52,6 +59,8 @@ class MemoryQueryRunStore:
         return run_id
 
     def transition(self, run_id: UUID, transition: RunTransition) -> None:
+        self._validate_payload(transition.state)
+        self._validate_payload(transition.payload)
         run = self._require_current_revision(run_id, transition.expected_revision)
         revision = transition.expected_revision + 1
         now = _now()
@@ -59,7 +68,7 @@ class MemoryQueryRunStore:
             "status": transition.status.value,
             "current_node": transition.node,
             "revision": revision,
-            "state": deepcopy(transition.state),
+            "state": self._copy_safe_payload(transition.state),
             "error_code": transition.error_code,
             "updated_at": now,
         })
@@ -69,20 +78,24 @@ class MemoryQueryRunStore:
             node=transition.node,
             event_type=transition.event_type,
             status=transition.status,
-            payload=transition.payload,
+            payload=self._copy_safe_payload(transition.payload),
             created_at=now,
         ))
 
     def save_artifact(self, run_id: UUID, artifact: NewArtifact) -> ArtifactRef:
         self._require_run(run_id)
+        self._validate_payload(artifact.payload)
+        if artifact.coverage is not None:
+            self._validate_payload(artifact.coverage)
         artifact_id = uuid4()
         self.artifacts[artifact_id] = {
             "id": artifact_id,
             "run_id": run_id,
             "artifact_type": artifact.artifact_type,
-            "payload": deepcopy(artifact.payload),
+            "payload": self._copy_safe_payload(artifact.payload),
             "data_as_of": artifact.data_as_of,
-            "coverage": deepcopy(artifact.coverage),
+            "coverage": (self._copy_safe_payload(artifact.coverage)
+                         if artifact.coverage is not None else None),
             "created_at": _now(),
         }
         return ArtifactRef(id=artifact_id, type=artifact.artifact_type)
@@ -90,6 +103,8 @@ class MemoryQueryRunStore:
     def finish(self, run_id: UUID, completion: RunCompletion) -> None:
         if completion.status is RunStatus.RUNNING:
             raise ValueError("finish_requires_terminal_status")
+        self._validate_payload(completion.state)
+        self._validate_payload(completion.payload)
         run = self._require_current_revision(run_id, completion.expected_revision)
         revision = completion.expected_revision + 1
         now = _now()
@@ -97,7 +112,7 @@ class MemoryQueryRunStore:
             "status": completion.status.value,
             "current_node": completion.node,
             "revision": revision,
-            "state": deepcopy(completion.state),
+            "state": self._copy_safe_payload(completion.state),
             "error_code": completion.error_code,
             "updated_at": now,
             "completed_at": now,
@@ -109,7 +124,7 @@ class MemoryQueryRunStore:
             event_type=(RunEventType.FAILED if completion.status is RunStatus.FAILED
                         else RunEventType.COMPLETED),
             status=completion.status,
-            payload=completion.payload,
+            payload=self._copy_safe_payload(completion.payload),
             created_at=now,
         ))
 
@@ -126,6 +141,21 @@ class MemoryQueryRunStore:
         if run["revision"] != expected_revision:
             raise StaleRunRevision()
         return run
+
+    def _has_run_context(self, record: NewQueryRun) -> bool:
+        return any(
+            run["user_message_id"] == record.user_message_id
+            and run["domain"] == record.domain
+            and run["attempt_no"] == record.attempt_no
+            for run in self.runs.values()
+        )
+
+    def _validate_payload(self, payload: dict[str, object]) -> None:
+        validate_safe_payload(payload, forbidden_values=self._forbidden_values)
+
+    def _copy_safe_payload(self, payload: dict[str, object]) -> dict[str, object]:
+        self._validate_payload(payload)
+        return deepcopy(payload)
 
 
 def _event(*, run_id: UUID, revision: int, node: str, event_type: RunEventType,
