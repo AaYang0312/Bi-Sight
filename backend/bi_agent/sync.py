@@ -176,7 +176,9 @@ def _normalise_item(raw_item: dict[str, Any], erp_id: str, index: int,
     quantity = to_decimal(raw_item.get("num")) or Decimal(0)
     gift_quantity = to_decimal(raw_item.get("giftNum")) or Decimal(0)
     source_type = _source_int(raw_item.get("type"))
-    if gift_quantity > 0:
+    # 只有纯赠品行（无销售数量）才整行判为赠品；混合行保留销售口径，
+    # 赠品数量由 gift_quantity 单列承载，否则该行分摊金额会被商品排行误排除。
+    if gift_quantity > 0 and quantity == 0:
         line_kind = "gift"
     else:
         line_kind = {

@@ -258,15 +258,29 @@ class SyncNormalisationTests(unittest.TestCase):
             **base, "unifiedStatus": "FINISHED", "sysStatus": "CLOSED",
         })["active"])
 
-    def test_positive_gift_quantity_overrides_line_type_for_metric_filtering(self):
+    def test_mixed_gift_line_keeps_sale_kind_and_reports_gift_quantity(self):
+        """回归：`num>0` 且 `giftNum>0` 的混合行不得整行判为赠品。否则
+        `line_kind <> 'gift'` 过滤会连同销售数量与该行分摊金额一起从商品排行消失。"""
         from bi_agent.sync import normalise_trade
 
         trade = normalise_trade({
             "sid": "E1", "userId": "S1", "updTime": 1788537600000,
-            "orders": [{"oid": "L1", "type": 0, "num": "1", "giftNum": "1"}],
+            "orders": [
+                {"oid": "L_MIX", "type": 0, "num": "2", "giftNum": "1",
+                 "payAmount": "30"},
+                {"oid": "L_PURE_GIFT", "type": 0, "num": "0", "giftNum": "3",
+                 "payAmount": "0"},
+            ],
         })
 
-        self.assertEqual(trade["items"][0]["line_kind"], "gift")
+        mixed, pure = trade["items"]
+        self.assertEqual(mixed["line_kind"], "sale")
+        self.assertEqual(mixed["quantity"], Decimal("2"))
+        self.assertEqual(mixed["gift_quantity"], Decimal("1"))
+        self.assertEqual(mixed["allocated_paid_amount"], Decimal("30"))
+        self.assertEqual(pure["line_kind"], "gift")
+        self.assertEqual(pure["gift_quantity"], Decimal("3"))
+        self.assertEqual(pure["quantity"], Decimal("0"))
 
     def test_aftersale_uses_finished_and_excludes_multi_value_void_status(self):
         from bi_agent.sync import normalise_aftersale
