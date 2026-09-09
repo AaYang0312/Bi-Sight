@@ -379,6 +379,50 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
         self.assertEqual(str(context.exception), "unsafe_persistence_payload")
         self.assertEqual(self.store.runs[run_id]["revision"], 0)
 
+    def test_constructed_running_completion_is_rejected_as_non_terminal(self):
+        run_id = self.store.create_run(self.record)
+        completion = RunCompletion.model_construct(
+            expected_revision=0,
+            node="finalize",
+            status="running",
+            state={"node": "finalize", "status": "running", "revision": 1},
+            payload={},
+            error_code=None,
+        )
+        with self.assertRaises(ValueError) as context:
+            self.store.finish(run_id, completion)
+        self.assertEqual(str(context.exception), "finish_requires_terminal_status")
+        self.assertEqual(self.store.runs[run_id]["revision"], 0)
+
+    def test_constructed_transition_normalizes_raw_status(self):
+        run_id = self.store.create_run(self.record)
+        transition = RunTransition.model_construct(
+            expected_revision=0,
+            node="resolve_parameters",
+            event_type="transitioned",
+            status="running",
+            state={"node": "resolve_parameters", "status": "running", "revision": 1},
+            payload={},
+            error_code=None,
+        )
+        self.store.transition(run_id, transition)
+        self.assertEqual(self.store.runs[run_id]["status"], "running")
+        self.assertEqual(self.store.events[run_id][0]["status"], "running")
+
+    def test_constructed_transition_normalizes_raw_event_type(self):
+        run_id = self.store.create_run(self.record)
+        transition = RunTransition.model_construct(
+            expected_revision=0,
+            node="resolve_parameters",
+            event_type="entered",
+            status=RunStatus.RUNNING,
+            state={"node": "resolve_parameters", "status": "running", "revision": 1},
+            payload={},
+            error_code=None,
+        )
+        self.store.transition(run_id, transition)
+        self.assertEqual(self.store.events[run_id][0]["event_type"], "entered")
+
     def test_save_artifact_rejects_unknown_run(self):
         with self.assertRaises(RunNotFound):
             self.store.save_artifact(uuid4(), NewArtifact(payload={"status": "ok"}))

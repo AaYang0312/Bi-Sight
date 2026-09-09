@@ -39,7 +39,7 @@ class MemoryQueryRunStore:
         self.artifacts: dict[UUID, dict[str, object]] = {}
 
     def create_run(self, record: NewQueryRun) -> UUID:
-        self._revalidate_new_run(record)
+        record = self._revalidate_new_run(record)
         self._validate_normalized_request(record.normalized_request)
         self._validate_state(record.state)
         if self._has_run_context(record):
@@ -68,7 +68,7 @@ class MemoryQueryRunStore:
         return run_id
 
     def transition(self, run_id: UUID, transition: RunTransition) -> None:
-        self._revalidate_transition(transition)
+        transition = self._revalidate_transition(transition)
         self._validate_state(transition.state)
         self._validate_event(transition.payload)
         run = self._require_current_revision(run_id, transition.expected_revision)
@@ -94,7 +94,7 @@ class MemoryQueryRunStore:
 
     def save_artifact(self, run_id: UUID, artifact: NewArtifact) -> ArtifactRef:
         self._require_run(run_id)
-        self._revalidate_artifact(artifact)
+        artifact = self._revalidate_artifact(artifact)
         self._validate_artifact(artifact.payload)
         if artifact.coverage is not None:
             self._validate_coverage(artifact.coverage)
@@ -111,9 +111,9 @@ class MemoryQueryRunStore:
         return ArtifactRef(id=artifact_id, type=artifact.artifact_type)
 
     def finish(self, run_id: UUID, completion: RunCompletion) -> None:
+        completion = self._revalidate_completion(completion)
         if completion.status is RunStatus.RUNNING:
             raise ValueError("finish_requires_terminal_status")
-        self._revalidate_completion(completion)
         self._validate_state(completion.state)
         self._validate_event(completion.payload)
         run = self._require_current_revision(run_id, completion.expected_revision)
@@ -192,30 +192,30 @@ class MemoryQueryRunStore:
             raise ValueError("unsafe_persistence_payload")
 
     @staticmethod
-    def _revalidate_new_run(record: NewQueryRun) -> None:
+    def _revalidate_new_run(record: NewQueryRun) -> NewQueryRun:
         try:
-            NewQueryRun.model_validate(record.model_dump())
+            return NewQueryRun.model_validate(record.model_dump(warnings=False))
         except ValidationError as error:
             raise ValueError("unsafe_persistence_payload") from error
 
     @staticmethod
-    def _revalidate_transition(transition: RunTransition) -> None:
+    def _revalidate_transition(transition: RunTransition) -> RunTransition:
         try:
-            RunTransition.model_validate(transition.model_dump())
+            return RunTransition.model_validate(transition.model_dump(warnings=False))
         except ValidationError as error:
             raise ValueError("unsafe_persistence_payload") from error
 
     @staticmethod
-    def _revalidate_artifact(artifact: NewArtifact) -> None:
+    def _revalidate_artifact(artifact: NewArtifact) -> NewArtifact:
         try:
-            NewArtifact.model_validate(artifact.model_dump())
+            return NewArtifact.model_validate(artifact.model_dump(warnings=False))
         except ValidationError as error:
             raise ValueError("unsafe_persistence_payload") from error
 
     @staticmethod
-    def _revalidate_completion(completion: RunCompletion) -> None:
+    def _revalidate_completion(completion: RunCompletion) -> RunCompletion:
         try:
-            RunCompletion.model_validate(completion.model_dump())
+            return RunCompletion.model_validate(completion.model_dump(warnings=False))
         except ValidationError as error:
             raise ValueError("unsafe_persistence_payload") from error
 
