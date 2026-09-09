@@ -1,8 +1,0 @@
-@echo off
-REM Copy this file to public_test.local.cmd and fill in local values.
-REM Do not commit public_test.local.cmd.
-set "BI_SSH_HOST=your-ssh-alias"
-set "BI_PUBLIC_HOST=bi.example.com"
-set "BI_AUTH_USER=bi"
-set "BI_REMOTE_PORT=18501"
-set "BI_LOCAL_PORT=8501"

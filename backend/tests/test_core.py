@@ -17,6 +17,24 @@ from bi_agent.metrics import Coverage, ToolResult
 
 
 class ConfigTests(unittest.TestCase):
+    def test_app_settings_use_the_chat_role_and_trusted_origin(self):
+        from bi_agent.config import load_app_settings
+
+        env = {
+            "APP_ENV": "production",
+            "APP_ALLOWED_SUBJECTS": "subject-a",
+            "APP_PUBLIC_ORIGIN": "https://bi.example.com",
+            "AUTH_SUBJECT_HEADER": "X-Auth-Request-Sub",
+            "BI_SHOP_IDS": "S1",
+            "BI_APP_DSN": "postgresql://bi_app:password@localhost/bi_agent",
+        }
+        settings = load_app_settings(env)
+        self.assertEqual(settings.app_dsn.get_secret_value(), env["BI_APP_DSN"])
+        self.assertEqual(settings.public_origin, "https://bi.example.com")
+        self.assertEqual(settings.auth_subject_header, "X-Auth-Request-Sub")
+        with self.assertRaises(ValueError):
+            load_app_settings({**env, "APP_PUBLIC_ORIGIN": "http://bi.example.com"})
+
     def test_selected_provider_uses_its_own_key(self):
         from bi_agent.config import load_model_settings
 
@@ -264,37 +282,6 @@ class MetricInputTests(unittest.TestCase):
         self.assertEqual(resolve_period("今天的支付额", now=now),
                          (date(2026, 9, 8), date(2026, 9, 9)))
         self.assertIsNone(resolve_period("照上次那样", now=now))
-
-
-class PresentationTests(unittest.TestCase):
-    def test_csv_escape_and_amounts(self):
-        from app import _csv_bytes
-
-        rows = [{"shop_id": "S1", "label": "=SUM(A1)", "cmd": "@cmd",
-                 "plus": "+1", "note": "-note", "tab": "\tvalue",
-                 "paid_amount": "1000.00", "negative_amount": "-50"}]
-        text = _csv_bytes(rows).decode("utf-8-sig")
-        self.assertIn("'=SUM(A1)", text)
-        self.assertIn("'@cmd", text)
-        self.assertIn("+1", text)  # 数值形式按数字输出，无注入风险
-        self.assertNotIn("'+1", text)
-        self.assertIn("'-note", text)
-        self.assertIn("'\tvalue", text)
-        self.assertIn("1000.00", text)
-        self.assertIn("-50", text)
-        self.assertNotIn("'-50", text)
-
-    def test_money_format_and_missing(self):
-        from app import _money
-
-        self.assertEqual(_money("166.6666"), "166.67")
-        self.assertEqual(_money(1000), "1000.00")
-        self.assertEqual(_money(None), "不可计算")
-
-    def test_exclusive_end_conversion(self):
-        from app import _exclusive_end
-
-        self.assertEqual(_exclusive_end(date(2026, 9, 7)), date(2026, 9, 8))
 
 
 def _model_settings(provider: str):
@@ -661,6 +648,11 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(query.call_args.args[1].shop_ids, ["S1"])
             self.assertEqual(query.call_args.args[1].start, date(2026, 9, 1))
             self.assertEqual(turn.results[0].data, self.KNOWN.data)
+        first_model_messages = model.complete.call_args_list[0].args[0]
+        model_question = [message.content for message in first_model_messages
+                          if message.role == "user"][-1]
+        self.assertIn("shop_1", model_question)
+        self.assertNotIn("S1", model_question)
         self.assertEqual(turn.text, "最近7天支付金额1000元")
 
     def test_follow_up_keeps_filters_only_dates_change(self):
@@ -841,6 +833,23 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tool_messages[0].tool_call_id, "call_1")
         # 匿名映射：发给模型的结果不含真实店铺ID
         self.assertNotIn("S1", tool_messages[0].content)
+
+    def test_model_result_hides_erp_identifiers(self):
+        from bi_agent.agent import SessionState, to_model_result
+
+        result = ToolResult(
+            status="ok",
+            data=[{"shop_id": "S1", "product_id": "ERP-P-9", "paid_amount": "1000"}],
+            filters={"shop_ids": ["S1"]},
+            coverage=Coverage(status="complete", start=date(2026, 9, 1),
+                              end=date(2026, 9, 8)),
+        )
+        payload = to_model_result(result, SessionState(
+            subject="u1", shop_aliases={"S1": "shop_1"}))
+        self.assertEqual(payload["data"][0]["shop_id"], "shop_1")
+        self.assertEqual(payload["filters"]["shop_ids"], ["shop_1"])
+        self.assertNotIn("S1", json.dumps(payload, ensure_ascii=False))
+        self.assertNotIn("ERP-P-9", json.dumps(payload, ensure_ascii=False))
 
     def test_state_isolation_between_users(self):
         from bi_agent.agent import SessionState, answer

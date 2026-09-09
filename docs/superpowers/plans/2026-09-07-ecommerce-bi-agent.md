@@ -1087,7 +1087,7 @@ export default defineConfig({
 })
 ```
 
-两个终端分别从 `backend/` 运行 `uv run --env-file ../.env.app uvicorn bi_agent.api:app --host 127.0.0.1 --port 8000 --reload`，从 `frontend/` 运行 `npm run dev`。执行 `npm test`、`npm run build`，预期SSE检查和TypeScript生产构建通过。人工验证桌面/窄屏、新建/切换/改名/删除、刷新恢复、Enter/Shift+Enter、错误/409以及消息内1000/100/900结果。提交：`feat: add focused React chat workspace`。
+两个终端分别从 `backend/` 运行 `uv run --env-file ../.env.app uvicorn bi_agent.api:create_runtime_app --factory --host 127.0.0.1 --port 8001 --reload`，从 `frontend/` 运行 `npm run dev -- --host 127.0.0.1`。执行 `npm test`、`npm run build`，预期SSE检查和TypeScript生产构建通过。人工验证桌面/窄屏、新建/切换/改名/删除、刷新恢复、Enter/Shift+Enter、错误/409以及消息内1000/100/900结果。提交：`feat: add focused React chat workspace`。
 
 ## Task 11：20题验收、运行维护和一周试用
 

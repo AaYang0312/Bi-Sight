@@ -14,14 +14,16 @@ Environment = Literal["development", "production"]
 
 
 class AppSettings(BaseModel):
-    """页面应用配置：只读身份。"""
+    """聊天 API 配置：只读报表并读写所属会话。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    reader_dsn: SecretStr
+    app_dsn: SecretStr
     shop_ids: frozenset[str]
     environment: Environment
     allowed_subjects: frozenset[str]
+    public_origin: str
+    auth_subject_header: str
 
 
 class SyncSettings(BaseModel):
@@ -66,7 +68,7 @@ def _shop_ids(env: Mapping[str, str]) -> frozenset[str]:
 
 
 def load_app_settings(env: Mapping[str, str]) -> AppSettings:
-    """加载页面应用配置；应用环境不得包含写入 DSN。"""
+    """加载聊天 API 配置；API 环境不得包含同步凭证。"""
     environment = (_required(env, "APP_ENV") or "development").strip()
     if environment not in ("development", "production"):
         raise ValueError("APP_ENV 只能是 development 或 production")
@@ -77,11 +79,22 @@ def load_app_settings(env: Mapping[str, str]) -> AppSettings:
     )
     if environment == "production" and not allowed:
         raise ValueError("生产环境必须配置 APP_ALLOWED_SUBJECTS")
+    public_origin = _required(env, "APP_PUBLIC_ORIGIN").rstrip("/")
+    if environment == "production" and not public_origin.startswith("https://"):
+        raise ValueError("生产环境 APP_PUBLIC_ORIGIN 必须为 HTTPS")
+    if not public_origin.startswith(("http://", "https://")):
+        raise ValueError("APP_PUBLIC_ORIGIN 必须为 HTTP(S) origin")
+    forbidden = ("BI_WRITER_DSN", "KUAI_MAI_APP_KEY", "KUAI_MAI_APP_SECRET",
+                 "KUAI_MAI_ACCESS_TOKEN", "KUAI_MAI_REFRESH_TOKEN")
+    if any((env.get(key) or "").strip() for key in forbidden):
+        raise ValueError("聊天 API 环境不得包含同步凭证")
     return AppSettings(
-        reader_dsn=SecretStr(_required(env, "BI_READER_DSN")),
+        app_dsn=SecretStr(_required(env, "BI_APP_DSN")),
         shop_ids=_shop_ids(env),
         environment=environment,  # type: ignore[arg-type]
         allowed_subjects=allowed,
+        public_origin=public_origin,
+        auth_subject_header=(env.get("AUTH_SUBJECT_HEADER") or "X-Auth-Request-Sub").strip(),
     )
 
 

@@ -17,11 +17,16 @@ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'bi_reader') THEN
     CREATE ROLE bi_reader LOGIN;
   END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'bi_app') THEN
+    CREATE ROLE bi_app LOGIN;
+  END IF;
 END
 $$;
 
 ALTER ROLE bi_reader SET default_transaction_read_only = on;
 ALTER ROLE bi_reader SET statement_timeout = '5s';
+ALTER ROLE bi_app RESET default_transaction_read_only;
+ALTER ROLE bi_app SET statement_timeout = '5s';
 
 -- ---------------------------------------------------------------------------
 -- bi.shops：ERP userId 转字符串；capabilities 只由对账维护
@@ -147,6 +152,31 @@ CREATE TABLE IF NOT EXISTS bi.sync_state (
 );
 
 -- ---------------------------------------------------------------------------
+-- 聊天会话：只保存对用户可见的文本和去除ERP标识的结果附件
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS bi.app_chats (
+  id           uuid PRIMARY KEY,
+  subject_id   text NOT NULL,
+  title        text NOT NULL CHECK (char_length(title) BETWEEN 1 AND 80),
+  title_source text NOT NULL DEFAULT 'auto' CHECK (title_source IN ('auto', 'user')),
+  filters      jsonb NOT NULL DEFAULT '{}',
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS bi.app_messages (
+  id         uuid PRIMARY KEY,
+  chat_id    uuid NOT NULL REFERENCES bi.app_chats(id) ON DELETE CASCADE,
+  role       text NOT NULL CHECK (role IN ('user', 'assistant')),
+  content    text NOT NULL CHECK (char_length(content) BETWEEN 1 AND 20000),
+  artifacts  jsonb NOT NULL DEFAULT '[]',
+  status     text NOT NULL CHECK (status IN ('complete', 'error')),
+  ordinal    bigint GENERATED ALWAYS AS IDENTITY,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (chat_id, ordinal)
+);
+
+-- ---------------------------------------------------------------------------
 -- 索引
 -- ---------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS orders_commercial_ids_idx ON bi.orders USING gin(commercial_ids);
@@ -159,6 +189,8 @@ CREATE INDEX IF NOT EXISTS refunds_time_idx ON bi.aftersales(shop_id, platform_c
 CREATE INDEX IF NOT EXISTS aftersales_commercial_idx ON bi.aftersales(shop_id, commercial_id);
 CREATE INDEX IF NOT EXISTS aftersales_platform_refund_idx ON bi.aftersales(shop_id, platform_refund_id);
 CREATE INDEX IF NOT EXISTS sync_state_covered_idx ON bi.sync_state USING gist(covered);
+CREATE INDEX IF NOT EXISTS app_chats_subject_updated_idx
+  ON bi.app_chats(subject_id, updated_at DESC);
 
 -- ---------------------------------------------------------------------------
 -- reporting 只读视图：无PII；模型仍不能直接访问它们
@@ -229,12 +261,20 @@ WHERE active AND line_kind = 'sale' AND product_id IS NOT NULL
 GROUP BY shop_id, day, product_id;
 
 -- ---------------------------------------------------------------------------
--- 权限：bi_sync 事实表读写，不能建表/角色；bi_reader 仅 reporting 指定视图
+-- 权限：bi_sync 事实表读写，bi_app 只读报表并维护聊天；不能建表/角色
 -- ---------------------------------------------------------------------------
 GRANT USAGE ON SCHEMA bi TO bi_sync;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA bi TO bi_sync;
+REVOKE ALL ON bi.app_chats, bi.app_messages FROM bi_sync;
 
 GRANT USAGE ON SCHEMA reporting TO bi_reader;
 GRANT SELECT ON reporting.v_payments, reporting.v_refunds,
                 reporting.v_coverage, reporting.v_shops,
                 reporting.v_shop_daily, reporting.v_product_daily TO bi_reader;
+
+GRANT USAGE ON SCHEMA bi, reporting TO bi_app;
+GRANT SELECT ON reporting.v_payments, reporting.v_refunds,
+                reporting.v_coverage, reporting.v_shops,
+                reporting.v_shop_daily, reporting.v_product_daily TO bi_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON bi.app_chats, bi.app_messages TO bi_app;
+GRANT USAGE, SELECT ON SEQUENCE bi.app_messages_ordinal_seq TO bi_app;

@@ -11,7 +11,8 @@ import re
 import time as time_module
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Iterator, Literal
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -72,7 +73,15 @@ class TurnResult(BaseModel):
     text: str
     results: list[ToolResult] = Field(default_factory=list)
     clarification: str | None = None
+    error_code: str | None = None
     state: SessionState
+
+
+class ChatEvent(BaseModel):
+    """浏览器SSE事件；正文永远放入一行JSON data字段。"""
+
+    event: Literal["status", "artifact", "message", "error", "done"]
+    data: dict[str, object]
 
 
 def explicit_assumptions(question: str) -> dict[str, object]:
@@ -162,10 +171,11 @@ def _contains_pii(question: str) -> bool:
     return any(pattern.search(question) for pattern in _PII_PATTERNS)
 
 
-def _anonymize_question(question: str, shops: list[tuple[str, str]]) -> str:
+def _anonymize_question(question: str, shops: list[tuple[str, str]],
+                        aliases: dict[str, str]) -> str:
     for shop_id, display_name in shops:
         if display_name:
-            question = question.replace(display_name, shop_id)
+            question = question.replace(display_name, aliases.get(shop_id, "未授权店铺"))
     return question
 
 
@@ -179,12 +189,26 @@ def _trim_turns(turns: list[Message]) -> list[Message]:
     return turns
 
 
-def to_model_result(result: ToolResult, state: SessionState) -> dict[str, object]:
-    """聚合列白名单+匿名映射；原ToolResult留给本地UI，不能直接发给provider。"""
+_PUBLIC_RESULT_COLUMNS = {
+    "day", "shop_id", "product_id", "currency", "basis",
+    "paid_amount", "paid_orders", "erp_documents", "aov", "refund_amount",
+    "cash_difference", "cohort_refund_rate", "quantity", "product_paid_amount",
+    "spend_cap", "budget", "actual_spend", "remaining_budget", "over_budget",
+    "remaining_days", "daily_cap", "contribution_cap",
+}
+
+
+def _safe_result(result: ToolResult, state: SessionState, *, model_view: bool) -> dict[str, object]:
+    """只保留聚合字段，并替换所有可识别ERP标识。"""
     payload = result.model_dump(mode="json")
     aliases = state.shop_aliases
-    alias_reverse = {alias: shop_id for shop_id, alias in aliases.items()}
     product_alias: dict[str, str] = {}
+
+    def map_shop(value: object) -> str:
+        alias = aliases.get(str(value))
+        if alias is None:
+            return "未授权店铺"
+        return alias if model_view else f"店铺{alias.removeprefix('shop_')}"
 
     def map_product(value: object) -> object:
         if not isinstance(value, str):
@@ -193,17 +217,19 @@ def to_model_result(result: ToolResult, state: SessionState) -> dict[str, object
             product_alias[value] = f"商品{chr(ord('A') + len(product_alias) % 26)}"
         return product_alias[value]
 
-    rows = payload.get("data") or []
-    for row in rows:
+    rows: list[dict[str, object]] = []
+    for row in payload.get("data") or []:
         if isinstance(row, dict):
-            if "shop_id" in row and row["shop_id"] in alias_reverse:
-                row["shop_id"] = alias_reverse[row["shop_id"]]
-            if "product_id" in row:
-                row["product_id"] = map_product(row["product_id"])
+            clean = {key: value for key, value in row.items() if key in _PUBLIC_RESULT_COLUMNS}
+            if "shop_id" in clean:
+                clean["shop_id"] = map_shop(clean["shop_id"])
+            if "product_id" in clean:
+                clean["product_id"] = map_product(clean["product_id"])
+            rows.append(clean)
     filters = dict(payload.get("filters") or {})
     if isinstance(filters.get("shop_ids"), list):
         filters["shop_ids"] = [
-            alias_reverse.get(shop_id, shop_id) if isinstance(shop_id, str) else shop_id
+            map_shop(shop_id)
             for shop_id in filters["shop_ids"]
         ]
     return {
@@ -215,6 +241,75 @@ def to_model_result(result: ToolResult, state: SessionState) -> dict[str, object
         "filters": filters,
         "data": rows,
     }
+
+
+def to_model_result(result: ToolResult, state: SessionState) -> dict[str, object]:
+    """模型只看匿名店铺、匿名商品和必要聚合结果。"""
+    return _safe_result(result, state, model_view=True)
+
+
+def to_public_artifact(result: ToolResult, state: SessionState) -> dict[str, object]:
+    """聊天附件同样不保存ERP ID，但使用适合经营者阅读的标签。"""
+    return _safe_result(result, state, model_view=False)
+
+
+def encode_sse(event: ChatEvent) -> bytes:
+    data = json.dumps(event.data, ensure_ascii=False, default=str, separators=(",", ":"))
+    return f"event: {event.event}\ndata: {data}\n\n".encode("utf-8")
+
+
+def run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: ChatModel,
+                  allowed_shop_ids: frozenset[str], now: datetime) -> Iterator[ChatEvent]:
+    """保存可见消息并输出有限阶段事件；调用方负责会话锁和连接生命周期。"""
+    from .chats import (
+        load_chat_context,
+        save_assistant_message,
+        save_user_message,
+        update_chat_filters,
+    )
+
+    filters, history = load_chat_context(conn, subject, chat_id)
+    state = SessionState(
+        subject=subject,
+        filters=filters,
+        turns=[Message(role=role, content=text) for role, text in history],
+    )
+    save_user_message(conn, chat_id, subject, content)
+    yield ChatEvent(event="status", data={"stage": "thinking"})
+    try:
+        turn = answer(content, state, model=model, conn=conn,
+                      allowed_shop_ids=allowed_shop_ids, now=now)
+        artifacts = [to_public_artifact(result, turn.state) for result in turn.results]
+        if artifacts:
+            yield ChatEvent(event="status", data={"stage": "querying"})
+            for artifact in artifacts:
+                yield ChatEvent(event="artifact", data=artifact)
+        update_chat_filters(conn, chat_id, subject, turn.state.filters)
+        if turn.error_code:
+            save_assistant_message(
+                conn, chat_id, subject, turn.text, artifacts, status="error",
+            )
+            yield ChatEvent(event="error", data={
+                "code": turn.error_code,
+                "message": "模型服务暂时不可用，请稍后重试。",
+            })
+            yield ChatEvent(event="done", data={"status": "error"})
+            return
+        saved = save_assistant_message(
+            conn, chat_id, subject, turn.clarification or turn.text or "暂未获得回答",
+            artifacts, status="complete",
+        )
+        yield ChatEvent(event="status", data={"stage": "answering"})
+        yield ChatEvent(event="message", data=saved.model_dump(mode="json"))
+        yield ChatEvent(event="done", data={"status": "complete"})
+    except Exception:  # noqa: BLE001 - 不向浏览器泄露模型、数据库或堆栈细节
+        message = "本轮回答未完成，请稍后重试。"
+        try:
+            save_assistant_message(conn, chat_id, subject, message, [], status="error")
+        except Exception:  # noqa: BLE001 - 数据库不可用时仍向浏览器结束事件
+            pass
+        yield ChatEvent(event="error", data={"code": "unavailable", "message": message})
+        yield ChatEvent(event="done", data={"status": "error"})
 
 
 # ---------------------------------------------------------------------------
@@ -359,12 +454,13 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                                                    alias_doc=alias_doc or "（无店铺）"))
     messages = [system] + list(state.turns)
     messages.append(Message(role="user",
-                            content=_anonymize_question(question, shops)))
+                            content=_anonymize_question(question, shops, state.shop_aliases)))
     results: list[ToolResult] = []
     calls_used = 0
     correction_used = False
     text_answer: str | None = None
     last_error: str | None = None
+    error_code: str | None = None
     pending_call_ids: list[str] = []
 
     for _ in range(MAX_MODEL_TURNS):
@@ -376,6 +472,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
             reply: ModelReply = model.complete(messages, tools, timeout_s=remaining)
         except ModelError as exc:
             last_error = f"模型调用失败（{exc.code}）；固定查询入口仍可用"
+            error_code = exc.code
             break
         messages.append(reply.as_message())
         if not reply.tool_calls:
@@ -452,7 +549,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
         "turns": _trim_turns(messages[1:]),
     })
     return TurnResult(text=text_answer or last_error or "", results=results,
-                      clarification=None, state=new_state)
+                      clarification=None, error_code=error_code, state=new_state)
 
 
 def _resolved_shops(call: ToolCall, state: SessionState,

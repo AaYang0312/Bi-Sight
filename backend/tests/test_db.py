@@ -9,6 +9,7 @@ import unittest
 from datetime import datetime, timedelta
 from decimal import Decimal
 from unittest.mock import patch
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -44,6 +45,45 @@ class DatabaseTests(unittest.TestCase):
         )
 
     # -- 权限 ----------------------------------------------------------------
+
+    def test_app_role_writes_chats_but_not_business_facts(self):
+        self.conn.execute("SET LOCAL ROLE bi_app")
+        self.conn.execute(
+            "INSERT INTO bi.app_chats(id, subject_id, title) VALUES (%s, 'subject-a', '新对话')",
+            (uuid4(),),
+        )
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+            with self.conn.transaction():
+                self.conn.execute("INSERT INTO bi.shops(shop_id) VALUES ('forbidden')")
+        self.conn.execute("RESET ROLE")
+
+    def test_chat_turn_lock_rejects_a_second_connection(self):
+        from bi_agent.chats import (ChatBusy, claim_chat_turn, create_chat,
+                                    delete_chat, release_chat_turn)
+
+        dsn = os.environ["BI_TEST_ADMIN_DSN"]
+        first = psycopg.connect(dsn, autocommit=True)
+        second = psycopg.connect(dsn, autocommit=True)
+        subject = f"lock-{uuid4()}"
+        chat = create_chat(first, subject)
+        first_locked = second_locked = False
+        try:
+            claim_chat_turn(first, chat.id, subject)
+            first_locked = True
+            with self.assertRaises(ChatBusy):
+                claim_chat_turn(second, chat.id, subject)
+            release_chat_turn(first, chat.id)
+            first_locked = False
+            claim_chat_turn(second, chat.id, subject)
+            second_locked = True
+        finally:
+            if first_locked:
+                release_chat_turn(first, chat.id)
+            if second_locked:
+                release_chat_turn(second, chat.id)
+            delete_chat(first, subject, chat.id)
+            first.close()
+            second.close()
 
     def test_read_role_cannot_write(self):
         with psycopg.connect(os.environ["BI_TEST_READER_DSN"]) as conn:
