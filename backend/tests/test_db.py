@@ -121,6 +121,22 @@ class DatabaseTests(unittest.TestCase):
                 "VALUES ('S1', 'EX', 'erp.trade.list.query', now(), 'b1')")
         self.conn.execute("RESET ROLE")
 
+    def test_shop_sync_persists_the_documented_active_flag(self):
+        from bi_agent.sync import sync_shops
+
+        class Client:
+            def call(self, method, parameters):
+                return {"success": True, "total": 2, "hasNext": False, "list": [
+                    {"userId": "S_DISABLED", "state": 1, "active": 0},
+                    {"userId": "S_ACTIVE", "state": 4, "active": 1},
+                ]}
+
+        self.assertEqual(sync_shops(self.conn, Client()), 2)
+        rows = self.conn.execute(
+            "SELECT shop_id, enabled FROM bi.shops "
+            "WHERE shop_id IN ('S_DISABLED', 'S_ACTIVE') ORDER BY shop_id").fetchall()
+        self.assertEqual(rows, [("S_ACTIVE", True), ("S_DISABLED", False)])
+
     # -- 交易规范化与支付重建 -------------------------------------------------
 
     def _trade(self, erp_id: str, commercial_ids: list[str], pay_amount: str,
@@ -239,6 +255,7 @@ class DatabaseTests(unittest.TestCase):
         with self.conn.transaction():
             self.assertTrue(apply_trade(self.conn, new_trade, batch_id=batch))
             self.assertFalse(apply_trade(self.conn, old_trade, batch_id=batch))
+            self.assertFalse(apply_trade(self.conn, old_trade, batch_id=batch, force=True))
             amount = self.conn.execute(
                 "SELECT amount FROM bi.order_payments WHERE commercial_id='C1'").fetchone()[0]
             items = self.conn.execute(
@@ -266,6 +283,73 @@ class DatabaseTests(unittest.TestCase):
                 "SELECT count(*) FROM bi.order_items WHERE erp_id='E1'").fetchone()[0]
         self.assertEqual(count, 1)
         self.assertEqual(items, 1)
+
+    def test_replay_can_re_normalise_an_equal_source_version(self):
+        """显式 replay 只允许同版本重规范化，供字段映射修复回填使用。"""
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self._seed_shop()
+        updated_at = datetime(2026, 9, 1, 13, 0, tzinfo=BEIJING)
+        base = {
+            "sid": "E_REPLAY", "userId": "S1", "tid": "C_REPLAY",
+            "updTime": _ms(updated_at), "orders": [{"oid": "L_REPLAY"}],
+        }
+        corrected = {
+            **base, "unifiedStatus": "CLOSED", "sysStatus": "FINISHED",
+            "orders": [{"oid": "L_REPLAY", "type": 2}],
+        }
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(
+                self.conn, normalise_trade(base), batch_id="original"))
+            self.assertTrue(apply_trade(
+                self.conn, normalise_trade(corrected), batch_id="replay", force=True))
+            order = self.conn.execute(
+                "SELECT active, unified_status FROM bi.orders WHERE erp_id='E_REPLAY'").fetchone()
+            item = self.conn.execute(
+                "SELECT source_type, line_kind FROM bi.order_items WHERE erp_id='E_REPLAY'").fetchone()
+        self.assertEqual(order, (False, "CLOSED"))
+        self.assertEqual(item, (2, "suite"))
+
+    def test_closed_order_has_no_product_daily_row(self):
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self._seed_shop()
+        paid_at = datetime(2026, 9, 2, 12, tzinfo=BEIJING)
+        trade = normalise_trade({
+            "sid": "E_CLOSED", "userId": "S1", "tid": "C_CLOSED",
+            "updTime": _ms(paid_at), "payTime": _ms(paid_at),
+            "unifiedStatus": "CLOSED",
+            "orders": [{"oid": "L_CLOSED", "itemSysId": "P_CLOSED", "type": 0,
+                        "num": "1", "payAmount": "10"}],
+        })
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(self.conn, trade, batch_id="closed"))
+            count = self.conn.execute(
+                "SELECT count(*) FROM reporting.v_product_daily WHERE product_id='P_CLOSED'").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_status_only_trade_update_deactivates_existing_product_rows(self):
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self._seed_shop()
+        paid_at = datetime(2026, 9, 2, 12, tzinfo=BEIJING)
+        active = normalise_trade({
+            "sid": "E_STATUS", "userId": "S1", "tid": "C_STATUS",
+            "updTime": _ms(paid_at), "payTime": _ms(paid_at),
+            "orders": [{"oid": "L_STATUS", "tid": "C_STATUS", "itemSysId": "P_STATUS",
+                        "type": 0, "num": "1", "payAmount": "10"}],
+        })
+        closed = normalise_trade({
+            "sid": "E_STATUS", "userId": "S1", "tid": "C_STATUS",
+            "updTime": _ms(paid_at + timedelta(hours=1)), "payTime": _ms(paid_at),
+            "unifiedStatus": "CLOSED",
+        })
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(self.conn, active, batch_id="active"))
+            self.assertTrue(apply_trade(self.conn, closed, batch_id="closed"))
+            count = self.conn.execute(
+                "SELECT count(*) FROM reporting.v_product_daily WHERE product_id='P_STATUS'").fetchone()[0]
+        self.assertEqual(count, 0)
 
     def test_orphan_payment_marked_unverified(self):
         from bi_agent.sync import apply_trade
@@ -312,6 +396,30 @@ class DatabaseTests(unittest.TestCase):
                 "SELECT count(*) FROM bi.order_items WHERE erp_id='E1'").fetchone()[0]
         self.assertEqual(items, 1)
 
+    def test_documented_trade_mapping_fields_persist(self):
+        """A1/A3/A4/A6：新字段及派生规则应一起写入事实表。"""
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self._seed_shop()
+        trade = normalise_trade({
+            "sid": "E_MAP", "userId": "S1", "tid": "C_MAP",
+            "updTime": _ms(datetime(2026, 9, 2, 12, tzinfo=BEIJING)),
+            "unifiedStatus": "CLOSED", "sysStatus": "FINISHED",
+            "splitType": 1, "splitSid": "E_PARENT",
+            "orders": [{"id": "L_MAP", "oid": "P_MAP", "type": 2,
+                        "num": "1", "payAmount": "10"}],
+        })
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(self.conn, trade, batch_id="mapping"))
+            order = self.conn.execute(
+                "SELECT unified_status, system_status, split_parent_id, active "
+                "FROM bi.orders WHERE erp_id='E_MAP'").fetchone()
+            item = self.conn.execute(
+                "SELECT platform_line_id, source_type, line_kind "
+                "FROM bi.order_items WHERE erp_id='E_MAP'").fetchone()
+        self.assertEqual(order, ("CLOSED", "FINISHED", "E_PARENT", False))
+        self.assertEqual(item, ("P_MAP", 2, "suite"))
+
     # -- 售后规范化与去重 ------------------------------------------------------
 
     def test_aftersale_platform_success_candidate(self):
@@ -350,6 +458,83 @@ class DatabaseTests(unittest.TestCase):
                 "WHERE aftersale_id='A_ok'").fetchone()
         self.assertTrue(row[0])
         self.assertTrue(row[1])
+
+    def test_aftersale_finished_and_multi_status_are_persisted_safely(self):
+        from bi_agent.sync import apply_aftersale, normalise_aftersale
+
+        self._seed_shop()
+        finished = datetime(2026, 9, 2, 8, 0, tzinfo=BEIJING)
+        record = normalise_aftersale({
+            "aftersaleId": "A_MAP", "userId": "S1", "status": "2,10",
+            "onlineStatus": 7, "modified": _ms(finished),
+            "finished": _ms(finished), "platformCompleteTime": _ms(finished),
+        })
+        with self.conn.transaction():
+            self.assertTrue(apply_aftersale(self.conn, record, batch_id="mapping"))
+            row = self.conn.execute(
+                "SELECT work_status, system_completed_at, platform_success "
+                "FROM bi.aftersales WHERE aftersale_id='A_MAP'").fetchone()
+        self.assertEqual(row, (2, finished, False))
+
+    def test_aftersale_replay_can_re_normalise_an_equal_source_version(self):
+        from bi_agent.sync import apply_aftersale, normalise_aftersale
+
+        self._seed_shop()
+        modified = datetime(2026, 9, 2, 8, 0, tzinfo=BEIJING)
+        base = {
+            "aftersaleId": "A_REPLAY", "userId": "S1", "status": 9,
+            "onlineStatus": 7, "modified": _ms(modified),
+        }
+        corrected = {**base, "finished": _ms(modified), "status": "2,10"}
+        with self.conn.transaction():
+            self.assertTrue(apply_aftersale(
+                self.conn, normalise_aftersale(base), batch_id="original"))
+            self.assertTrue(apply_aftersale(
+                self.conn, normalise_aftersale(corrected), batch_id="replay", force=True))
+            row = self.conn.execute(
+                "SELECT system_completed_at, platform_success FROM bi.aftersales "
+                "WHERE aftersale_id='A_REPLAY'").fetchone()
+        self.assertEqual(row, (modified, False))
+
+    def test_aftersale_replay_does_not_regress_an_older_source_version(self):
+        from bi_agent.sync import apply_aftersale, normalise_aftersale
+
+        self._seed_shop()
+        newer = datetime(2026, 9, 3, 8, 0, tzinfo=BEIJING)
+        older = datetime(2026, 9, 2, 8, 0, tzinfo=BEIJING)
+        current = normalise_aftersale({
+            "aftersaleId": "A_NEWER", "userId": "S1", "status": 9,
+            "onlineStatus": 7, "modified": _ms(newer), "finished": _ms(newer),
+        })
+        stale = normalise_aftersale({
+            "aftersaleId": "A_NEWER", "userId": "S1", "status": "2,10",
+            "onlineStatus": 7, "modified": _ms(older), "finished": _ms(older),
+        })
+        with self.conn.transaction():
+            self.assertTrue(apply_aftersale(self.conn, current, batch_id="newer"))
+            self.assertFalse(apply_aftersale(self.conn, stale, batch_id="replay", force=True))
+            finished = self.conn.execute(
+                "SELECT system_completed_at FROM bi.aftersales WHERE aftersale_id='A_NEWER'").fetchone()[0]
+        self.assertEqual(finished, newer)
+
+    def test_all_disabled_shops_return_no_metric_scope(self):
+        import time as time_module
+
+        from bi_agent.metrics import QueryRequest, query_business
+
+        self._seed_shop()
+        self.conn.execute("UPDATE bi.shops SET enabled=false WHERE shop_id='S1'")
+        result = query_business(
+            self.conn,
+            QueryRequest(start="2026-09-01", end="2026-09-02", shop_ids=["S1"],
+                         metrics=["paid_amount"]),
+            allowed_shop_ids=frozenset({"S1"}),
+            now=datetime(2026, 9, 3, tzinfo=BEIJING),
+            deadline=time_module.monotonic() + 30,
+        )
+        self.assertEqual(result.status, "missing_data")
+        self.assertEqual(result.data, [])
+        self.assertIn("所选店铺均已停用，无法查询", result.limitations)
 
     def test_duplicate_platform_refund_dedup(self):
         from bi_agent.sync import apply_aftersale, mark_refund_canonical, normalise_aftersale

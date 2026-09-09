@@ -227,6 +227,94 @@ class KuaimaiPageTests(unittest.TestCase):
         self.assertIs(page.has_next, False)
 
 
+class SyncNormalisationTests(unittest.TestCase):
+    def test_trade_uses_documented_status_split_and_line_fields(self):
+        """A1/A3/A4/A6：API字段应产生可复核的规范化结果。"""
+        from bi_agent.sync import normalise_trade
+
+        trade = normalise_trade({
+            "sid": "E1", "userId": "S1", "updTime": 1788537600000,
+            "unifiedStatus": "CLOSED", "sysStatus": "FINISHED",
+            "splitType": 1, "splitSid": "E_PARENT",
+            "orders": [{"id": "L1", "oid": "PLATFORM-L1", "type": 2,
+                        "giftNum": "0"}],
+        })
+
+        self.assertFalse(trade["active"])
+        self.assertEqual(trade["unified_status"], "CLOSED")
+        self.assertEqual(trade["system_status"], "FINISHED")
+        self.assertEqual(trade["split_parent_id"], "E_PARENT")
+        self.assertEqual(trade["items"][0]["platform_line_id"], "PLATFORM-L1")
+        self.assertEqual(trade["items"][0]["source_type"], 2)
+        self.assertEqual(trade["items"][0]["line_kind"], "suite")
+        self.assertFalse(trade["items"][0]["active"])
+
+    def test_trade_uses_system_status_only_when_unified_status_is_missing(self):
+        from bi_agent.sync import normalise_trade
+
+        base = {"sid": "E1", "userId": "S1", "updTime": 1788537600000}
+        self.assertFalse(normalise_trade({**base, "sysStatus": "CLOSED"})["active"])
+        self.assertTrue(normalise_trade({
+            **base, "unifiedStatus": "FINISHED", "sysStatus": "CLOSED",
+        })["active"])
+
+    def test_positive_gift_quantity_overrides_line_type_for_metric_filtering(self):
+        from bi_agent.sync import normalise_trade
+
+        trade = normalise_trade({
+            "sid": "E1", "userId": "S1", "updTime": 1788537600000,
+            "orders": [{"oid": "L1", "type": 0, "num": "1", "giftNum": "1"}],
+        })
+
+        self.assertEqual(trade["items"][0]["line_kind"], "gift")
+
+    def test_aftersale_uses_finished_and_excludes_multi_value_void_status(self):
+        from bi_agent.sync import normalise_aftersale
+
+        record = normalise_aftersale({
+            "aftersaleId": "A1", "userId": "S1", "modified": 1788537600000,
+            "onlineStatus": 7, "status": "2,10", "finished": 1788624000000,
+            "platformCompleteTime": 1788624000000,
+        })
+
+        self.assertEqual(record["work_status"], 2)
+        self.assertEqual(record["system_completed_at"],
+                         datetime.fromtimestamp(1788624000, tz=ZoneInfo("Asia/Shanghai")))
+        self.assertFalse(record["platform_success"])
+
+    def test_shop_sync_uses_active_flag(self):
+        from bi_agent.sync import sync_shops
+
+        class Transaction:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        class Connection:
+            def __init__(self):
+                self.parameters = []
+
+            def transaction(self):
+                return Transaction()
+
+            def execute(self, sql, parameters):
+                self.parameters.append(parameters)
+
+        class Client:
+            def call(self, method, parameters):
+                return {"success": True, "total": 2, "hasNext": False, "list": [
+                    {"userId": "S_DISABLED", "state": 1, "active": 0},
+                    {"userId": "S_ACTIVE", "state": 4, "active": 1},
+                ]}
+
+        conn = Connection()
+        self.assertEqual(sync_shops(conn, Client()), 2)
+        self.assertFalse(conn.parameters[0][-1])
+        self.assertTrue(conn.parameters[1][-1])
+
+
 class MetricInputTests(unittest.TestCase):
     def test_date_defaults_and_bounds(self):
         from bi_agent.metrics import QueryRequest, resolve_period

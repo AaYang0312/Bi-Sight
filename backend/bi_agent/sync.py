@@ -113,20 +113,63 @@ def _commercial_ids(raw: dict[str, Any], items: list[dict[str, Any]]) -> list[st
     return _unique(values)
 
 
+def _source_int(value: Any) -> int | None:
+    """解析 API 枚举整数；非单一整数不猜测。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
+
+
+def _source_statuses(value: Any) -> list[int]:
+    """解析逗号分隔的售后状态，保留其全部判定语义。"""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return [value]
+    if not isinstance(value, str):
+        return []
+    values = [_source_int(part) for part in value.split(",")]
+    return [item for item in values if item is not None]
+
+
+def _source_bool(value: Any) -> bool | None:
+    """解析店铺 API 的 active 标志；未知值交由调用方安全回退。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "disabled"}:
+            return False
+    return None
+
+
 def _normalise_item(raw_item: dict[str, Any], erp_id: str, index: int,
                     fallback_paid_at: datetime | None) -> dict[str, Any]:
     quantity = to_decimal(raw_item.get("num")) or Decimal(0)
     gift_quantity = to_decimal(raw_item.get("giftNum")) or Decimal(0)
-    if gift_quantity > 0 and quantity == 0:
+    source_type = _source_int(raw_item.get("type"))
+    if gift_quantity > 0:
         line_kind = "gift"
     else:
-        line_kind = str(raw_item.get("lineKind") or "sale")
+        line_kind = {
+            0: "sale",
+            2: "suite",
+            3: "combination",
+            4: "processing",
+        }.get(source_type, "sale")
     allocated = to_decimal(raw_item.get("payAmount"))
     return {
         "line_id": str(raw_item.get("id") or raw_item.get("oid")
                        or f"{erp_id}#{index}"),
         "commercial_id": (str(raw_item.get("tid") or "").strip() or None),
-        "platform_line_id": (str(raw_item.get("platformOid") or "").strip() or None),
+        "platform_line_id": (str(raw_item.get("oid") or "").strip() or None),
+        "source_type": source_type,
         "product_id": (str(raw_item.get("itemSysId") or "").strip() or None),
         "sku_id": (str(raw_item.get("skuSysId") or "").strip() or None),
         "paid_at": parse_timestamp(raw_item.get("payTime")) or fallback_paid_at,
@@ -158,7 +201,14 @@ def normalise_trade(raw: dict[str, Any], *, source: str = ORDER_SOURCE) -> dict[
     raw_items = raw.get("orders") if isinstance(raw.get("orders"), list) else []
     items = [_normalise_item(item, erp_id, index, paid_at)
              for index, item in enumerate(raw_items) if isinstance(item, dict)]
-    split_parent = str(raw.get("splitParentId") or "").strip() or None
+    split_parent = (str(raw.get("splitSid") or "").strip() or None
+                    if _source_int(raw.get("splitType")) == 1 else None)
+    unified_status = str(raw.get("unifiedStatus") or "").strip() or None
+    system_status = str(raw.get("sysStatus") or "").strip() or None
+    effective_status = unified_status if unified_status is not None else system_status
+    active = (effective_status or "").upper() != "CLOSED"
+    for item in items:
+        item["active"] = active
     trade: dict[str, Any] = {
         "shop_id": shop_id,
         "erp_id": erp_id,
@@ -173,8 +223,9 @@ def normalise_trade(raw: dict[str, Any], *, source: str = ORDER_SOURCE) -> dict[
         "raw_platform_payment": to_decimal(raw.get("platformPaymentAmount")),
         "raw_cost": to_decimal(raw.get("cost")),
         "raw_gross_profit": to_decimal(raw.get("grossProfit")),
-        "active": str(raw.get("status") or "").strip().lower()
-        not in {"cancel", "cancelled", "canceled", "trade_closed"},
+        "unified_status": unified_status,
+        "system_status": system_status,
+        "active": active,
         "normalization_status": status,
         "items_present": items_present,
         "items": items,
@@ -286,7 +337,8 @@ def rebuild_payments(conn, shop_id: str, commercial_ids: set[str]) -> None:
 _ORDER_COLUMNS = (
     "shop_id, erp_id, commercial_ids, split_parent_id, source, source_updated_at, "
     "platform_modified_at, paid_at, raw_pay_amount, raw_payment, raw_platform_payment, "
-    "raw_cost, raw_gross_profit, active, normalization_status, batch_id"
+    "raw_cost, raw_gross_profit, unified_status, system_status, active, "
+    "normalization_status, batch_id"
 )
 
 
@@ -296,12 +348,13 @@ def _trade_row(trade: dict[str, Any], batch_id: str) -> tuple:
         trade["source"], trade["source_updated_at"], trade["platform_modified_at"],
         trade["paid_at"], trade["raw_pay_amount"], trade["raw_payment"],
         trade["raw_platform_payment"], trade["raw_cost"], trade["raw_gross_profit"],
-        trade["active"], trade["normalization_status"], batch_id,
+        trade["unified_status"], trade["system_status"], trade["active"],
+        trade["normalization_status"], batch_id,
     )
 
 
-def apply_trade(conn, trade: dict[str, Any], *, batch_id: str) -> bool:
-    """版本保护入库；不自行提交。返回是否接受此版本，False时不得替换明细。"""
+def apply_trade(conn, trade: dict[str, Any], *, batch_id: str, force: bool = False) -> bool:
+    """版本保护入库；replay 仅可重规范化时间戳相等的同版本记录。"""
     if trade["normalization_status"] == "invalid":
         return False
     existing = conn.execute(
@@ -313,7 +366,7 @@ def apply_trade(conn, trade: dict[str, Any], *, batch_id: str) -> bool:
     updated = conn.execute(
         f"""
         INSERT INTO bi.orders ({_ORDER_COLUMNS})
-        VALUES ({", ".join(["%s"] * 16)})
+        VALUES ({", ".join(["%s"] * 18)})
         ON CONFLICT (shop_id, erp_id) DO UPDATE SET
             commercial_ids = EXCLUDED.commercial_ids,
             split_parent_id = EXCLUDED.split_parent_id,
@@ -326,13 +379,16 @@ def apply_trade(conn, trade: dict[str, Any], *, batch_id: str) -> bool:
             raw_platform_payment = EXCLUDED.raw_platform_payment,
             raw_cost = EXCLUDED.raw_cost,
             raw_gross_profit = EXCLUDED.raw_gross_profit,
+            unified_status = EXCLUDED.unified_status,
+            system_status = EXCLUDED.system_status,
             active = EXCLUDED.active,
             normalization_status = EXCLUDED.normalization_status,
             batch_id = EXCLUDED.batch_id
         WHERE EXCLUDED.source_updated_at > bi.orders.source_updated_at
+           OR (%s AND EXCLUDED.source_updated_at = bi.orders.source_updated_at)
         RETURNING erp_id
         """,
-        row,
+        (*row, force),
     ).fetchone()
     if updated is None:
         existing = conn.execute(
@@ -348,6 +404,10 @@ def apply_trade(conn, trade: dict[str, Any], *, batch_id: str) -> bool:
             (trade["shop_id"], trade["erp_id"]),
         )
         return False
+    conn.execute(
+        "UPDATE bi.order_items SET active=%s WHERE shop_id=%s AND erp_id=%s",
+        (trade["active"], trade["shop_id"], trade["erp_id"]),
+    )
     if trade["items_present"]:
         conn.execute(
             "DELETE FROM bi.order_items WHERE shop_id=%s AND erp_id=%s",
@@ -358,14 +418,15 @@ def apply_trade(conn, trade: dict[str, Any], *, batch_id: str) -> bool:
                 """
                 INSERT INTO bi.order_items
                     (shop_id, erp_id, line_id, commercial_id, platform_line_id, product_id,
-                     sku_id, paid_at, quantity, gift_quantity, raw_paid_amount, raw_payment,
-                     raw_unit_cost, allocated_paid_amount, allocation_verified, line_kind, active)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     source_type, sku_id, paid_at, quantity, gift_quantity, raw_paid_amount,
+                     raw_payment, raw_unit_cost, allocated_paid_amount, allocation_verified,
+                     line_kind, active)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     trade["shop_id"], trade["erp_id"], item["line_id"], item["commercial_id"],
-                    item["platform_line_id"], item["product_id"], item["sku_id"],
-                    item["paid_at"], item["quantity"], item["gift_quantity"],
+                    item["platform_line_id"], item["product_id"], item["source_type"],
+                    item["sku_id"], item["paid_at"], item["quantity"], item["gift_quantity"],
                     item["raw_paid_amount"], item["raw_payment"], item["raw_unit_cost"],
                     item["allocated_paid_amount"], item["allocation_verified"],
                     item["line_kind"], item["active"],
@@ -390,16 +451,17 @@ def normalise_aftersale(raw: dict[str, Any], *,
                          or parse_timestamp(raw.get("modifiedTime"))
                          or parse_timestamp(raw.get("updTime")))
     platform_completed_at = parse_timestamp(raw.get("platformCompleteTime"))
-    system_completed_at = (parse_timestamp(raw.get("systemCompleteTime"))
-                           or parse_timestamp(raw.get("completeTime")))
+    system_completed_at = parse_timestamp(raw.get("finished"))
     online_status = raw.get("onlineStatus")
     work_status = raw.get("status")
-    online_value = int(online_status) if isinstance(online_status, (int, str)) and str(online_status).lstrip("-").isdigit() else None
-    work_value = int(work_status) if isinstance(work_status, (int, str)) and str(work_status).lstrip("-").isdigit() else None
+    online_value = _source_int(online_status)
+    work_values = _source_statuses(work_status)
+    work_value = work_values[0] if work_values else None
     platform_success = bool(
         online_value == 7
         and platform_completed_at is not None
-        and work_value not in (10, 11)
+        and bool(work_values)
+        and not any(value in (10, 11) for value in work_values)
     )
     return {
         "shop_id": shop_id,
@@ -420,8 +482,9 @@ def normalise_aftersale(raw: dict[str, Any], *,
     }
 
 
-def apply_aftersale(conn, aftersale: dict[str, Any], *, batch_id: str) -> bool:
-    """售后版本化UPSERT；无原订单也入库；matched随原单到达可再刷新。"""
+def apply_aftersale(conn, aftersale: dict[str, Any], *, batch_id: str,
+                    force: bool = False) -> bool:
+    """售后版本化UPSERT；replay 仅可重规范化时间戳相等的同版本记录。"""
     if not aftersale.get("valid"):
         return False
     commercial_id = aftersale["commercial_id"]
@@ -453,6 +516,7 @@ def apply_aftersale(conn, aftersale: dict[str, Any], *, batch_id: str) -> bool:
             platform_success = EXCLUDED.platform_success,
             batch_id = EXCLUDED.batch_id
         WHERE EXCLUDED.source_updated_at > bi.aftersales.source_updated_at
+           OR (%s AND EXCLUDED.source_updated_at = bi.aftersales.source_updated_at)
         RETURNING aftersale_id
         """,
         (
@@ -460,7 +524,7 @@ def apply_aftersale(conn, aftersale: dict[str, Any], *, batch_id: str) -> bool:
             commercial_id, aftersale["erp_id"], aftersale["raw_platform_amount"],
             aftersale["raw_system_amount"], aftersale["online_status"], aftersale["work_status"],
             aftersale["platform_completed_at"], aftersale["system_completed_at"],
-            aftersale["source_updated_at"], aftersale["platform_success"], matched, batch_id,
+            aftersale["source_updated_at"], aftersale["platform_success"], matched, batch_id, force,
         ),
     ).fetchone()
     if updated is None:
@@ -806,12 +870,12 @@ def sync_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
                 trade = normalise_trade(raw)
                 if trade["normalization_status"] == "invalid":
                     continue
-                apply_trade(conn, trade, batch_id=batch_id)
+                apply_trade(conn, trade, batch_id=batch_id, force=(mode == "replay"))
                 accepted += 1
                 touched_commercials.update(trade["commercial_ids"])
             else:
                 aftersale = normalise_aftersale(raw)
-                if apply_aftersale(conn, aftersale, batch_id=batch_id):
+                if apply_aftersale(conn, aftersale, batch_id=batch_id, force=(mode == "replay")):
                     accepted += 1
                 if aftersale["platform_refund_id"]:
                     refund_ids.add(aftersale["platform_refund_id"])
@@ -970,7 +1034,9 @@ def sync_shops(conn, client: KuaimaiClient) -> int:
                 if not shop_id:
                     continue
                 state = str(raw.get("state") or "").strip().lower()
-                enabled = state not in {"disable", "disabled", "deleted", "0"}
+                enabled = _source_bool(raw.get("active"))
+                if enabled is None:
+                    enabled = state in {"3", "4", "enable", "enabled"}
                 conn.execute(
                     "INSERT INTO bi.shops(shop_id, platform, display_name, enabled) "
                     "VALUES (%s, %s, %s, %s) "

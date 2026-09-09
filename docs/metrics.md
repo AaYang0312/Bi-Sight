@@ -21,10 +21,15 @@
 | 字段 | 规范化规则 |
 | --- | --- |
 | 订单 `payAmount/payment/platformPaymentAmount` | 分别为买家已付/应付/平台支付，均独立保留；不得互换 |
+| 订单 `unifiedStatus` / `sysStatus` | 两者原样保留；`unifiedStatus=CLOSED` 时订单无效，仅在它缺失时以 `sysStatus=CLOSED` 回退。平台 `status` 是平台码，不参与此判定 |
+| 订单 `splitType` / `splitSid` | 仅 `splitType=1` 时，将 `splitSid` 写入 `split_parent_id` |
+| 订单 `orders[].oid` / `orders[].type` / `orders[].giftNum` | `oid` 为平台行号；`type` 原样保留为 `source_type`；赠品判定以 `giftNum>0` 为准，套件/组合/加工行不进入销售父行商品排行 |
 | 订单 `updTime` / `modified` | 前者为ERP数据更新时间，后者为平台修改时间；对 `upd_time` 增量先核对二者含义和样本，不直接把后者当ERP版本 |
 | 订单 `cost` / `orders[].cost` / `orders[].suits[].cost` | 分别为总成本/普通行单位成本（需×num）/部分套件子结构总成本，分别标注；不统一乘数量 |
 | 售后 `rawRefundMoney` / `items[].rawRefundMoney` | 单头是元，商品明细是分；首版退款聚合仅使用单头，商品退款暂不开放 |
-| 售后 `onlineStatus=7` + `platformCompleteTime` | 平台退款成功候选条件；还需检查工单作废/合并、平台售后号去重 |
+| 售后 `onlineStatus=7` + `platformCompleteTime` | 平台退款成功候选条件；还需检查工单作废/合并、平台售后号去重。`status` 可为逗号分隔多值，含10/11时一律不计成功 |
+| 售后 `finished` | 系统完成时间，映射为 `system_completed_at`；`systemCompleteTime`/`completeTime` 不作为来源 |
+| 店铺 `active` | 映射为 `shops.enabled`；字段缺失才按已核验的 `state` 枚举（3/4启用）安全回退。查询混合范围时停用店铺被排除；若全部停用则拒绝返回指标 |
 | 采购 `totalAmount/actualTotalAmount`、明细 `price/amount` | 文档为分；本版不接入，不得误复用订单转换函数 |
 | `orders[].itemSysId/skuSysId` | 显式映射为商品查询的 `sysItemId/sysSkuId`；不按名字模糊匹配 |
 | 订单 `grossProfit` | ERP毛利参考；实际运费/包材/平台扣费缺失，不得称净利润 |
@@ -49,6 +54,7 @@
 ## 4. 已知功能门槛
 
 - 平台实退与系统实退分开；系统退款成功指标未对账前不发布。
+- `platformPaymentAmount` 在当前已核验样本未返回，`raw_platform_payment` 不可作为指标来源；`order_payments.currency='CNY'` 是平台默认币种假设，尚无 `tradeExt.currency` 来源核验。
 - 同批退款率需原单匹配完成；未匹配退款返回缺数据并显示数量。
 - 「最近7天」= 最近7个完整自然日；「今天」未完成，返回缺数据而非0。
 - 日期跨度最多366天；结果最多500组。

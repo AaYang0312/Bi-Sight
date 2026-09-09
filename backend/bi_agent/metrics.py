@@ -401,6 +401,15 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
     disabled = [s for s in request.shop_ids if not shops[s][0]]
     if disabled:
         limitations.append("部分店铺已停用，仅返回剩余范围")
+        enabled_shop_ids = [s for s in request.shop_ids if shops[s][0]]
+        if not enabled_shop_ids:
+            return ToolResult(
+                status="missing_data", coverage=Coverage(status="missing", start=None, end=None),
+                filters=filters, limitations=["所选店铺均已停用，无法查询"])
+        requested_shop_ids = sorted(request.shop_ids)
+        request = request.model_copy(update={"shop_ids": enabled_shop_ids})
+        filters = _filters(request)
+        filters["requested_shop_ids"] = requested_shop_ids
 
     # 覆盖门禁：当前期
     statuses = []
