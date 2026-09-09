@@ -674,6 +674,7 @@ git commit -m "feat: validate and authorize business queries"
 - Modify: `backend/bi_agent/business_query/nodes.py`
 - Modify: `backend/bi_agent/business_query/graph.py`
 - Create: `backend/bi_agent/business_query/tool.py`
+- Modify: `backend/bi_agent/agent.py`
 - Modify: `backend/tests/test_business_query_graph.py`
 
 **Interfaces:**
@@ -724,7 +725,7 @@ Expected: FAIL because execution and graph runner are incomplete。
 
 - [ ] **Step 6: 实现安全投影、Artifact 和终结节点。**
 
-在 `business_query/tool.py` 先复制现有 `_PUBLIC_RESULT_COLUMNS` 和安全投影算法，改为接收 `shop_aliases: dict[str, str]`，不要导入 `SessionState`，避免与 `agent.py` 循环依赖。Task 6 暂不删除 Agent 中的旧投影函数；Task 7 接入后再去重。对所有合法 `ToolResult` 生成模型安全投影与公共安全投影，再把公共投影交给 Store。保存成功后将 ref 加入 State；失败生成 `artifact_persistence_failed`。`finalize_run` 使用已分类 target status 映射到 RunStatus，并调用 `store.finish()`。
+将现有 `_PUBLIC_RESULT_COLUMNS` 和安全投影算法从 `agent.py` 移入 `business_query/tool.py`，改为接收 `shop_aliases: dict[str, str]`，不要导入 `SessionState`，避免循环依赖。`agent.py` 在查询路由尚未切换的情况下改为导入兼容的 `to_model_result` 和 `to_public_artifact` 包装，确保中间提交没有重复逻辑且原测试继续通过。对所有合法 `ToolResult` 生成模型安全投影与公共安全投影，再把公共投影交给 Store。保存成功后将 ref 加入 State；失败生成 `artifact_persistence_failed`。`finalize_run` 使用已分类 target status 映射到 RunStatus，并调用 `store.finish()`。
 
 - [ ] **Step 7: 实现固定调度器。**
 
@@ -771,7 +772,7 @@ Expected: 新增运行审计断言 FAIL。
 
 - [ ] **Step 4: 实现 Tool Adapter。**
 
-将 `_PUBLIC_RESULT_COLUMNS`、`_safe_result`、`to_model_result` 和 `to_public_artifact` 从 `agent.py` 移入 `business_query/tool.py`，保持输出逐字段兼容。Adapter 使用 Task 4 的 `BusinessQueryExecution`：公开 `run_business_query()` 只返回其中的 `domain_result`；兼容现有 Agent 的 `execute_business_query_tool()` 返回完整的内部 Execution。`session_filters` 由已验证 `QueryRequest` 生成，包含真实店铺 ID，但只存在于进程内和 `SessionState.filters`，不得写入运行状态、事件、模型 payload 或 Artifact。
+在 Task 6 已迁移的安全投影基础上实现 Adapter，保持输出逐字段兼容。Adapter 使用 Task 4 的 `BusinessQueryExecution`：公开 `run_business_query()` 只返回其中的 `domain_result`；兼容现有 Agent 的 `execute_business_query_tool()` 返回完整的内部 Execution。`session_filters` 由已验证 `QueryRequest` 生成，包含真实店铺 ID，但只存在于进程内和 `SessionState.filters`，不得写入运行状态、事件、模型 payload 或 Artifact。
 
 - [ ] **Step 5: 接入 `answer()`。**
 
