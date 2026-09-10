@@ -226,8 +226,8 @@ def _execution_result(runtime: BusinessQueryRuntime) -> BusinessQueryExecution:
             coverage=state.coverage,
             error=state.error,
         ),
-        tool_result=runtime.result,
-        session_filters=_session_filters(runtime),
+        tool_result=runtime.result if output_is_safe else None,
+        session_filters=_session_filters(runtime) if output_is_safe else {},
     )
 
 

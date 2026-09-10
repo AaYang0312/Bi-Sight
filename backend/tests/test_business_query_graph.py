@@ -574,9 +574,32 @@ class BusinessQueryExecutionTests(unittest.TestCase):
         self.assertEqual(execution.domain_result.status, DomainStatus.FAILED)
         self.assertEqual(execution.domain_result.error.code, "artifact_persistence_failed")  # type: ignore[union-attr]
         self.assertEqual(execution.domain_result.artifacts, [])
+        self.assertIsNone(execution.tool_result)
+        self.assertEqual(execution.session_filters, {})
         self.assertEqual(store.artifacts, {})
         public_output = json.dumps(execution.domain_result.model_dump(mode="json"))
         self.assertNotIn("database password=not-for-public-output", public_output)
+
+    def test_result_contract_violation_cannot_expose_result_or_session_filters(self):
+        from bi_agent.business_query.graph import _execute_business_query_graph
+
+        store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
+        with patch(
+            "bi_agent.metrics.query_business", return_value=self._result()
+        ) as query_business, patch(
+            "bi_agent.business_query.nodes.to_public_artifact",
+            side_effect=ValueError("malformed projection"),
+        ):
+            execution = _execute_business_query_graph(
+                object(), store, self._tool_input(), self._context()
+            )
+
+        query_business.assert_called_once()
+        self.assertEqual(execution.domain_result.status, DomainStatus.FAILED)
+        self.assertEqual(execution.domain_result.error.code, "result_contract_violation")  # type: ignore[union-attr]
+        self.assertIsNone(execution.tool_result)
+        self.assertEqual(execution.session_filters, {})
+        self.assertEqual(execution.domain_result.artifacts, [])
 
     def test_expired_deadline_fails_without_calling_metrics(self):
         store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})

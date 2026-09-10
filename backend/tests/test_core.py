@@ -964,6 +964,46 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(turn.results), 1)
         self.assertIn("固定查询入口仍可用", turn.text)
 
+    def test_artifact_persistence_failure_stops_without_results_or_filter_updates(self):
+        from bi_agent.agent import SessionState, answer
+        from bi_agent.runtime import ArtifactPersistenceError, MemoryQueryRunStore
+
+        class FailingArtifactStore(MemoryQueryRunStore):
+            def save_artifact(self, run_id, artifact):  # type: ignore[no-untyped-def]
+                raise ArtifactPersistenceError("database password=not-for-public-output")
+
+        initial_filters = {
+            "start": "2026-08-01",
+            "end": "2026-09-01",
+            "shop_ids": ["S1"],
+            "metrics": ["paid_amount"],
+        }
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[self._call()]),
+            _reply(text="this answer must not be generated"),
+        ]
+        with patch(
+            "bi_agent.business_query.nodes.metrics.query_business",
+            return_value=self.KNOWN,
+        ):
+            turn = answer(
+                "最近7天店铺A的支付金额",
+                SessionState(subject="u1", filters=initial_filters),
+                model=model,
+                conn=self._conn(),
+                allowed_shop_ids=frozenset({"S1"}),
+                now=self.NOW,
+                run_store=FailingArtifactStore(forbidden_values={"S1", "ERP-P-9"}),
+            )
+
+        self.assertEqual(turn.results, [])
+        self.assertEqual(turn.state.filters, initial_filters)
+        self.assertEqual(turn.error_code, "artifact_persistence_failed")
+        self.assertEqual(turn.text, "结果保存失败，请稍后重试。")
+        self.assertEqual(model.complete.call_count, 1)
+        self.assertEqual([message for message in turn.state.turns if message.role == "tool"], [])
+
     def test_time_budget_not_rewaited(self):
         from bi_agent.agent import SessionState, answer
 

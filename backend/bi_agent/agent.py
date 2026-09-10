@@ -251,14 +251,24 @@ def run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: Cha
             yield ChatEvent(event="status", data={"stage": "querying"})
             for artifact in artifacts:
                 yield ChatEvent(event="artifact", data=artifact)
-        update_chat_filters(conn, chat_id, subject, turn.state.filters)
+        if turn.error_code not in {
+            "artifact_persistence_failed", "result_contract_violation"
+        }:
+            update_chat_filters(conn, chat_id, subject, turn.state.filters)
         if turn.error_code:
+            message = (
+                turn.text
+                if turn.error_code in {
+                    "artifact_persistence_failed", "result_contract_violation"
+                }
+                else "模型服务暂时不可用，请稍后重试。"
+            )
             save_assistant_message(
-                conn, chat_id, subject, turn.text, artifacts, status="error",
+                conn, chat_id, subject, message, artifacts, status="error",
             )
             yield ChatEvent(event="error", data={
                 "code": turn.error_code,
-                "message": "模型服务暂时不可用，请稍后重试。",
+                "message": message,
             })
             yield ChatEvent(event="done", data={"status": "error"})
             return
@@ -444,6 +454,17 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                                 else ["invalid_parameters"])
                     messages.append(_correction_message(call.id, problems))
                     continue
+                if (
+                    execution.domain_result.error is not None
+                    and execution.domain_result.error.code
+                    in {"artifact_persistence_failed", "result_contract_violation"}
+                ):
+                    last_error = execution.domain_result.error.public_message
+                    error_code = execution.domain_result.error.code
+                    results.clear()
+                    filters = dict(state.filters)
+                    stop_after_batch = True
+                    break
                 if execution.tool_result is not None:
                     calls_used += 1
                     results.append(execution.tool_result)

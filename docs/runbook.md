@@ -119,7 +119,7 @@ ORDER BY started_at DESC
 LIMIT 1;
 
 -- 某次查询的状态变化顺序
-SELECT revision, node, event_type, status, error_code, created_at
+SELECT revision, node, event_type, status, created_at
 FROM bi.query_run_events
 WHERE run_id = '<run-uuid>'
 ORDER BY revision;

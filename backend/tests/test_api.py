@@ -3,7 +3,7 @@
 import unittest
 import warnings
 import os
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import Mock, patch, sentinel
 from uuid import uuid4
@@ -220,6 +220,78 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("traceback", browser_text)
         self.assertNotIn("STACK_MARKER_RUNTIME_FAILURE", browser_text)
         self.assertNotIn("/srv/bi_agent/runtime/repository.py", browser_text)
+
+    def test_artifact_persistence_failure_has_no_artifact_sse_or_message_payload(self):
+        """A failed audit write cannot produce a user-visible query result."""
+        from bi_agent.agent import run_chat_turn
+        from bi_agent.llm import Message, ModelReply, ToolCall
+        from bi_agent.metrics import Coverage, ToolResult
+        from bi_agent.runtime import ArtifactPersistenceError, MemoryQueryRunStore
+
+        class QueryingModel:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, messages, tools, *, timeout_s):
+                self.calls += 1
+                call = ToolCall(
+                    id="call_1", name="query_business", arguments={
+                        "start": "2026-09-01", "end": "2026-09-08",
+                        "shop_ids": ["shop_1"], "metrics": ["paid_amount"],
+                    },
+                )
+                reply = ModelReply(tool_calls=[call])
+                reply._message = Message(role="assistant", content=None, tool_calls=[call])
+                return reply
+
+        class FailingArtifactStore(MemoryQueryRunStore):
+            def __init__(self, _conn, *, forbidden_values):
+                super().__init__(forbidden_values=forbidden_values)
+
+            def save_artifact(self, run_id, artifact):  # type: ignore[no-untyped-def]
+                raise ArtifactPersistenceError("database password=not-for-public-output")
+
+        conn = Mock()
+        conn.execute.return_value.fetchall.return_value = [("S1", "店铺A")]
+        saved_user = SimpleNamespace(id=uuid4())
+        chat_id = uuid4()
+        model = QueryingModel()
+        with patch("bi_agent.agent.PostgresQueryRunStore", FailingArtifactStore), patch(
+            "bi_agent.business_query.nodes.metrics.query_business",
+            return_value=ToolResult(
+                status="ok", data=[{"paid_amount": "1000"}],
+                coverage=Coverage(
+                    status="complete", start=date(2026, 9, 1), end=date(2026, 9, 8),
+                ),
+            ),
+        ), patch(
+            "bi_agent.chats.load_chat_context", return_value=({}, [])
+        ), patch(
+            "bi_agent.chats.save_user_message", return_value=saved_user
+        ), patch("bi_agent.chats.save_assistant_message") as save_assistant, patch(
+            "bi_agent.chats.update_chat_filters"
+        ) as update_filters:
+            events = list(run_chat_turn(
+                conn, chat_id, "user-a", "最近7天店铺A支付金额", model=model,
+                allowed_shop_ids=frozenset({"S1"}),
+                now=datetime(2026, 9, 8, 9, tzinfo=ZoneInfo("Asia/Shanghai")),
+            ))
+
+        self.assertEqual(model.calls, 1)
+        self.assertEqual([event.event for event in events], ["status", "error", "done"])
+        self.assertEqual(events[-2].data, {
+            "code": "artifact_persistence_failed", "message": "结果保存失败，请稍后重试。",
+        })
+        self.assertEqual(events[-1].data, {"status": "error"})
+        update_filters.assert_not_called()
+        save_assistant.assert_called_once_with(
+            conn, chat_id, "user-a", "结果保存失败，请稍后重试。", [], status="error",
+        )
+        browser_text = "\n".join(f"{event.event}:{event.data}" for event in events)
+        self.assertNotIn("artifact:", browser_text)
+        self.assertNotIn("1000", browser_text)
+        self.assertNotIn("S1", browser_text)
+        self.assertNotIn("database password=not-for-public-output", browser_text)
 
     @unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
     def test_message_stream_audits_a_completed_business_query_without_sensitive_json(self):
