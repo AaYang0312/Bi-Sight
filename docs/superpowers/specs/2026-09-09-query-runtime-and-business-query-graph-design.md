@@ -31,7 +31,7 @@
 
 没有采用立即引入 LangGraph 的方案，因为当前查询路径节点少、转移固定，引入框架不会增加当前阶段的业务能力，反而会把依赖升级、检查点和序列化语义加入迁移范围。没有采用只定义内存状态的方案，因为无法满足错误、重试、查询结果与聊天消息分离以及可审计要求。
 
-数据库变更使用新的 `backend/sql/003_query_runtime.sql`，顺接已经提交的 `002_kuaimai_mapping_repair.sql`。现有数据库映射修复由另一个 Agent 处理，本项目不修改 `sync.py`、既有业务表定义或 `metrics.py` 的查询语义。实施任务开始前必须检查工作区最新差异，避免覆盖并行工作。
+数据库变更使用新的 `backend/sql/004_query_runtime.sql`，顺接已经提交的 `002_kuaimai_mapping_repair.sql`。现有数据库映射修复由另一个 Agent 处理，本项目不修改 `sync.py`、既有业务表定义或 `metrics.py` 的查询语义。实施任务开始前必须检查工作区最新差异，避免覆盖并行工作。
 
 ## 4. 目标模块
 
@@ -298,7 +298,7 @@ run_chat_turn
 
 - 所有 Pydantic 边界契约拒绝额外字段。
 - `ErrorEnvelope`、运行状态和事件 payload 拒绝数据库原文、真实 ERP ID 和模型隐藏推理。
-- `003_query_runtime.sql` 可重复执行。
+- `004_query_runtime.sql` 可重复执行。
 - 一次迁移的运行更新和事件插入原子提交。
 - revision 与事件顺序一致，过期 revision 更新失败。
 - 删除聊天时运行、事件和 Artifact 级联删除。

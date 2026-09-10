@@ -12,14 +12,21 @@ import time as time_module
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterator, Literal
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .business_query.tool import (
+    execute_business_query_tool,
+    to_model_result as _to_model_result,
+    to_public_artifact as _to_public_artifact,
+)
+from .business_query import BusinessQueryContext
 from .llm import ChatModel, Message, ModelError, ModelReply, ToolCall
 from .metrics import QueryRequest, ToolResult, resolve_period
 from .promotion import PromotionRequest, evaluate_promotion
+from .runtime import MemoryQueryRunStore, PostgresQueryRunStore, QueryRunStore, TurnContext
 
 BEIJING = ZoneInfo("Asia/Shanghai")
 TOTAL_BUDGET_SECONDS = 30
@@ -189,68 +196,14 @@ def _trim_turns(turns: list[Message]) -> list[Message]:
     return turns
 
 
-_PUBLIC_RESULT_COLUMNS = {
-    "day", "shop_id", "product_id", "line_kind", "currency", "basis",
-    "paid_amount", "paid_orders", "erp_documents", "aov", "refund_amount",
-    "cash_difference", "cohort_refund_rate", "quantity", "product_paid_amount",
-    "spend_cap", "budget", "actual_spend", "remaining_budget", "over_budget",
-    "remaining_days", "daily_cap", "contribution_cap",
-}
-
-
-def _safe_result(result: ToolResult, state: SessionState, *, model_view: bool) -> dict[str, object]:
-    """只保留聚合字段，并替换所有可识别ERP标识。"""
-    payload = result.model_dump(mode="json")
-    aliases = state.shop_aliases
-    product_alias: dict[str, str] = {}
-
-    def map_shop(value: object) -> str:
-        alias = aliases.get(str(value))
-        if alias is None:
-            return "未授权店铺"
-        return alias if model_view else f"店铺{alias.removeprefix('shop_')}"
-
-    def map_product(value: object) -> object:
-        if not isinstance(value, str):
-            return value
-        if value not in product_alias:
-            product_alias[value] = f"商品{chr(ord('A') + len(product_alias) % 26)}"
-        return product_alias[value]
-
-    rows: list[dict[str, object]] = []
-    for row in payload.get("data") or []:
-        if isinstance(row, dict):
-            clean = {key: value for key, value in row.items() if key in _PUBLIC_RESULT_COLUMNS}
-            if "shop_id" in clean:
-                clean["shop_id"] = map_shop(clean["shop_id"])
-            if "product_id" in clean:
-                clean["product_id"] = map_product(clean["product_id"])
-            rows.append(clean)
-    filters = dict(payload.get("filters") or {})
-    if isinstance(filters.get("shop_ids"), list):
-        filters["shop_ids"] = [
-            map_shop(shop_id)
-            for shop_id in filters["shop_ids"]
-        ]
-    return {
-        "status": payload.get("status"),
-        "metric_definition": payload.get("metric_definition"),
-        "coverage": payload.get("coverage"),
-        "limitations": payload.get("limitations"),
-        "data_as_of": payload.get("data_as_of"),
-        "filters": filters,
-        "data": rows,
-    }
-
-
 def to_model_result(result: ToolResult, state: SessionState) -> dict[str, object]:
     """模型只看匿名店铺、匿名商品和必要聚合结果。"""
-    return _safe_result(result, state, model_view=True)
+    return _to_model_result(result, state.shop_aliases)
 
 
 def to_public_artifact(result: ToolResult, state: SessionState) -> dict[str, object]:
     """聊天附件同样不保存ERP ID，但使用适合经营者阅读的标签。"""
-    return _safe_result(result, state, model_view=False)
+    return _to_public_artifact(result, state.shop_aliases)
 
 
 def encode_sse(event: ChatEvent) -> bytes:
@@ -274,24 +227,48 @@ def run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: Cha
         filters=filters,
         turns=[Message(role=role, content=text) for role, text in history],
     )
-    save_user_message(conn, chat_id, subject, content)
+    saved_user = save_user_message(conn, chat_id, subject, content)
     yield ChatEvent(event="status", data={"stage": "thinking"})
     try:
-        turn = answer(content, state, model=model, conn=conn,
-                      allowed_shop_ids=allowed_shop_ids, now=now)
+        turn = answer(
+            content,
+            state,
+            model=model,
+            conn=conn,
+            allowed_shop_ids=allowed_shop_ids,
+            now=now,
+            run_store=PostgresQueryRunStore(
+                conn, forbidden_values=allowed_shop_ids,
+            ),
+            turn_context=TurnContext(
+                chat_id=chat_id,
+                user_message_id=saved_user.id,
+                subject_id=subject,
+            ),
+        )
         artifacts = [to_public_artifact(result, turn.state) for result in turn.results]
         if artifacts:
             yield ChatEvent(event="status", data={"stage": "querying"})
             for artifact in artifacts:
                 yield ChatEvent(event="artifact", data=artifact)
-        update_chat_filters(conn, chat_id, subject, turn.state.filters)
+        if turn.error_code not in {
+            "artifact_persistence_failed", "result_contract_violation"
+        }:
+            update_chat_filters(conn, chat_id, subject, turn.state.filters)
         if turn.error_code:
+            message = (
+                turn.text
+                if turn.error_code in {
+                    "artifact_persistence_failed", "result_contract_violation"
+                }
+                else "模型服务暂时不可用，请稍后重试。"
+            )
             save_assistant_message(
-                conn, chat_id, subject, turn.text, artifacts, status="error",
+                conn, chat_id, subject, message, artifacts, status="error",
             )
             yield ChatEvent(event="error", data={
                 "code": turn.error_code,
-                "message": "模型服务暂时不可用，请稍后重试。",
+                "message": message,
             })
             yield ChatEvent(event="done", data={"status": "error"})
             return
@@ -321,58 +298,6 @@ def _correction_message(call_id: str, problems: list[str]) -> Message:
     return Message(role="tool", tool_call_id=call_id,
                    content=json.dumps({"error": "invalid_parameters",
                                        "problems": problems}, ensure_ascii=False))
-
-
-def _handle_query_business(call: ToolCall, *, state: SessionState, conn,
-                           allowed_shop_ids: frozenset[str], now: datetime,
-                           deadline: float, question: str,
-                           previous_filters: dict[str, object]) -> ToolResult | list[str]:
-    """映射并校验后执行查询；返回ToolResult或需纠正的问题列表。"""
-    args = dict(call.arguments or {})
-    aliases = state.shop_aliases
-    alias_reverse = {alias: shop_id for shop_id, alias in aliases.items()}
-    raw_shops = args.get("shop_ids")
-    if isinstance(raw_shops, list) and raw_shops:
-        mapped: list[str] = []
-        for value in raw_shops:
-            shop_id = alias_reverse.get(str(value), str(value))
-            if shop_id not in allowed_shop_ids:
-                return [f"店铺 {value} 不在授权范围"]
-            mapped.append(shop_id)
-        args["shop_ids"] = mapped
-    elif not raw_shops:
-        previous = previous_filters.get("shop_ids")
-        if previous:
-            args["shop_ids"] = list(previous)  # type: ignore[assignment]
-    if "start" not in args or "end" not in args:
-        period = resolve_period(question, now=now)
-        previous_start = previous_filters.get("start")
-        previous_end = previous_filters.get("end")
-        if period:
-            args.setdefault("start", period[0].isoformat())
-            args.setdefault("end", period[1].isoformat())
-        elif previous_start and previous_end:
-            args.setdefault("start", previous_start)
-            args.setdefault("end", previous_end)
-    if "metrics" not in args or not args.get("metrics"):
-        previous_metrics = previous_filters.get("metrics")
-        args["metrics"] = list(previous_metrics) if previous_metrics else ["paid_amount"]
-    if "shop_ids" not in args or not args.get("shop_ids"):
-        return ["缺少店铺范围，请使用匿名店铺编号"]
-    try:
-        request = QueryRequest.model_validate(args)
-    except Exception as exc:  # noqa: BLE001 - pydantic校验错误转结构化纠正
-        return [str(exc).split("\n")[0]]
-    return _run_query_business(conn, request, allowed_shop_ids=allowed_shop_ids,
-                               now=now, deadline=deadline)
-
-
-def _run_query_business(conn, request: QueryRequest, *, allowed_shop_ids: frozenset[str],
-                        now: datetime, deadline: float) -> ToolResult:
-    from .metrics import query_business
-
-    return query_business(conn, request, allowed_shop_ids=allowed_shop_ids,
-                          now=now, deadline=deadline)
 
 
 def _handle_evaluate_promotion(call: ToolCall, *, question: str, now: datetime) -> (
@@ -446,8 +371,18 @@ def _final_text_answer(model: ChatModel, messages: list[Message],
 
 
 def answer(question: str, state: SessionState, *, model: ChatModel, conn,
-           allowed_shop_ids: frozenset[str], now: datetime) -> TurnResult:
+           allowed_shop_ids: frozenset[str], now: datetime,
+           run_store: QueryRunStore | None = None,
+           turn_context: TurnContext | None = None) -> TurnResult:
     deadline = time_module.monotonic() + TOTAL_BUDGET_SECONDS
+    if run_store is None:
+        run_store = MemoryQueryRunStore(forbidden_values=allowed_shop_ids)
+    if turn_context is None:
+        turn_context = TurnContext(
+            chat_id=uuid5(NAMESPACE_URL, f"business-query-chat:{state.subject}"),
+            user_message_id=uuid4(),
+            subject_id=state.subject,
+        )
     filters = dict(state.filters)
     if _contains_pii(question):
         return TurnResult(
@@ -491,6 +426,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
     fallback_text: str | None = None
     last_error: str | None = None
     error_code: str | None = None
+    business_attempt_no = 0
 
     for _ in range(MAX_MODEL_TURNS):
         remaining = deadline - time_module.monotonic()
@@ -520,6 +456,58 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                                             ensure_ascii=False)))
                 stop_after_batch = True
                 continue
+            if call.name == "query_business":
+                business_attempt_no += 1
+                execution = execute_business_query_tool(
+                    call,
+                    state,
+                    BusinessQueryContext(
+                        chat_id=turn_context.chat_id,
+                        user_message_id=turn_context.user_message_id,
+                        subject_id=turn_context.subject_id,
+                        question=question,
+                        previous_filters=filters,
+                        shop_aliases=state.shop_aliases,
+                        allowed_shop_ids=allowed_shop_ids,
+                        now=now,
+                        deadline=deadline,
+                        attempt_no=business_attempt_no,
+                    ),
+                    conn,
+                    run_store,
+                )
+                if execution.domain_result.status.value == "needs_input":
+                    if correction_used:
+                        last_error = "参数两次非法，已停止本次回答"
+                        stop_after_batch = True
+                        break
+                    correction_used = True
+                    problems = (execution.domain_result.error.problems
+                                if execution.domain_result.error is not None
+                                else ["invalid_parameters"])
+                    messages.append(_correction_message(call.id, problems))
+                    continue
+                if (
+                    execution.domain_result.error is not None
+                    and execution.domain_result.error.code
+                    in {"artifact_persistence_failed", "result_contract_violation"}
+                ):
+                    last_error = execution.domain_result.error.public_message
+                    error_code = execution.domain_result.error.code
+                    results.clear()
+                    filters = dict(state.filters)
+                    stop_after_batch = True
+                    break
+                if execution.tool_result is not None:
+                    calls_used += 1
+                    results.append(execution.tool_result)
+                    if execution.session_filters:
+                        filters.update(execution.session_filters)
+                messages.append(Message(
+                    role="tool", tool_call_id=call.id,
+                    content=json.dumps(execution.domain_result.model_payload,
+                                       ensure_ascii=False)))
+                continue
             if call.arguments_error is not None or call.arguments is None:
                 if correction_used:
                     last_error = "参数两次非法，已停止本次回答"
@@ -529,12 +517,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                 messages.append(_correction_message(
                     call.id, [call.arguments_error or "arguments不是对象"]))
                 continue
-            if call.name == "query_business":
-                outcome: ToolResult | list[str] = _handle_query_business(
-                    call, state=state, conn=conn, allowed_shop_ids=allowed_shop_ids,
-                    now=now, deadline=deadline, question=question,
-                    previous_filters=filters)
-            elif call.name == "evaluate_promotion":
+            if call.name == "evaluate_promotion":
                 outcome = _handle_evaluate_promotion(call, question=question, now=now)
             else:
                 messages.append(Message(role="tool", tool_call_id=call.id,
@@ -553,21 +536,6 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                 continue
             calls_used += 1
             results.append(outcome)
-            # 查询成功才更新会话筛选，失败不污染已确认state
-            if call.name == "query_business":
-                try:
-                    applied_args = dict(call.arguments or {})
-                    applied_args["shop_ids"] = _resolved_shops(
-                        call, state, filters, allowed_shop_ids)
-                    applied = QueryRequest.model_validate(applied_args)
-                    filters.update({
-                        "start": applied.start.isoformat(),
-                        "end": applied.end.isoformat(),
-                        "shop_ids": applied.shop_ids,
-                        "metrics": list(applied.metrics),
-                    })
-                except Exception:  # noqa: BLE001 - 参数合并失败不影响结果返回
-                    pass
             messages.append(Message(
                 role="tool", tool_call_id=call.id,
                 content=json.dumps(to_model_result(outcome, state), ensure_ascii=False)))
@@ -585,17 +553,3 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
     })
     return TurnResult(text=text_answer or last_error or "", results=results,
                       clarification=None, error_code=error_code, state=new_state)
-
-
-def _resolved_shops(call: ToolCall, state: SessionState,
-                    filters: dict[str, object],
-                    allowed_shop_ids: frozenset[str]) -> list[str]:
-    args = call.arguments or {}
-    raw = args.get("shop_ids")
-    alias_reverse = {alias: shop_id for shop_id, alias in state.shop_aliases.items()}
-    if isinstance(raw, list) and raw:
-        return [alias_reverse.get(str(value), str(value)) for value in raw]
-    previous = filters.get("shop_ids")
-    if isinstance(previous, list) and previous:
-        return [str(value) for value in previous]
-    return sorted(allowed_shop_ids)

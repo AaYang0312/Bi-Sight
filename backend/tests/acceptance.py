@@ -19,6 +19,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from unittest.mock import Mock, patch
+from uuid import NAMESPACE_URL, uuid5
 
 from bi_agent.agent import SessionState, answer
 from bi_agent.llm import Message, ModelReply, ToolCall
@@ -168,8 +169,27 @@ def _param_problems(expected_params: dict, request) -> list[str]:
 
 
 def _run_turn(question: str, state: SessionState, model, conn, allowed, now):
-    return answer(question, state, model=model, conn=conn,
-                  allowed_shop_ids=allowed, now=now)
+    from bi_agent.runtime import MemoryQueryRunStore, TurnContext
+
+    turn_number = len([message for message in state.turns if message.role == "user"])
+    chat_id = uuid5(NAMESPACE_URL, f"acceptance-chat:{state.subject}")
+    return answer(
+        question,
+        state,
+        model=model,
+        conn=conn,
+        allowed_shop_ids=allowed,
+        now=now,
+        run_store=MemoryQueryRunStore(forbidden_values=allowed),
+        turn_context=TurnContext(
+            chat_id=chat_id,
+            user_message_id=uuid5(
+                NAMESPACE_URL,
+                f"acceptance-message:{state.subject}:{turn_number}:{question}",
+            ),
+            subject_id=state.subject,
+        ),
+    )
 
 
 def _verify_turn(expected: dict, turn, recorded: list) -> list[str]:
@@ -249,7 +269,7 @@ def run_offline() -> int:
                          else [question["expected"]] * len(question["turns"]))
         problems: list[str] = []
         try:
-            with patch("bi_agent.metrics.query_business", side_effect=spy):
+            with patch("bi_agent.business_query.nodes.metrics.query_business", side_effect=spy):
                 for turn_text, expected in zip(question["turns"], expected_list):
                     turn = _run_turn(turn_text, state, model, conn, allowed, FROZEN_NOW)
                     state = turn.state
@@ -306,14 +326,15 @@ def run_provider_smoke() -> int:
     if not os.getenv("BI_TEST_ADMIN_DSN"):
         print(json.dumps({"result": "未实测", "reason": "缺少测试数据库配置"}))
         return 0
-    from bi_agent.metrics import query_business
+    from bi_agent.business_query import BusinessQueryContext, execute_business_query_tool
+    from bi_agent.runtime import MemoryQueryRunStore, TurnContext
     from tests.test_db import FROZEN_NOW, seed_business_case
 
     conn = psycopg.connect(os.environ["BI_TEST_ADMIN_DSN"])
     seed_business_case(conn)
     from bi_agent.agent import _tool_schemas
 
-    state = SessionState(subject="smoke")
+    state = SessionState(subject="smoke", shop_aliases={"S1": "shop_1"})
     messages: list[Message] = [Message(
         role="user",
         content="店铺shop_1最近7天（截至2026-09-08）的支付金额是多少？请调用工具查询。")]
@@ -323,21 +344,32 @@ def run_provider_smoke() -> int:
         print(json.dumps({"result": "fail", "reason": "模型未提出工具调用"}))
         return 1
     messages.append(reply.as_message())
-    for call in reply.tool_calls:
-        from bi_agent.agent import _handle_query_business
-
-        outcome = _handle_query_business(
-            call, state=state, conn=conn, allowed_shop_ids=frozenset({"S1"}),
-            now=FROZEN_NOW, deadline=time.monotonic() + 30,
-            question=messages[-1].content or "", previous_filters={})
-        if isinstance(outcome, list):
-            content = json.dumps({"problems": outcome}, ensure_ascii=False)
-        else:
-            state = state.model_copy(update={"shop_aliases": {
-                "S1": "shop_1"}})
-            from bi_agent.agent import to_model_result
-
-            content = json.dumps(to_model_result(outcome, state), ensure_ascii=False)
+    turn_context = TurnContext(
+        chat_id=uuid5(NAMESPACE_URL, "provider-smoke-chat"),
+        user_message_id=uuid5(NAMESPACE_URL, "provider-smoke-message"),
+        subject_id="smoke",
+    )
+    store = MemoryQueryRunStore(forbidden_values={"S1"})
+    for attempt_no, call in enumerate(reply.tool_calls, start=1):
+        execution = execute_business_query_tool(
+            call,
+            state,
+            BusinessQueryContext(
+                chat_id=turn_context.chat_id,
+                user_message_id=turn_context.user_message_id,
+                subject_id=turn_context.subject_id,
+                question=messages[-1].content or "",
+                previous_filters={},
+                shop_aliases=state.shop_aliases,
+                allowed_shop_ids=frozenset({"S1"}),
+                now=FROZEN_NOW,
+                deadline=time.monotonic() + 30,
+                attempt_no=attempt_no,
+            ),
+            conn,
+            store,
+        )
+        content = json.dumps(execution.domain_result.model_payload, ensure_ascii=False)
         messages.append(Message(role="tool", tool_call_id=call.id, content=content))
     final = model.complete(messages, tools, timeout_s=30)
     ok = bool(final.text)
@@ -387,7 +419,7 @@ def run_live() -> int:
                          else [question["expected"]] * len(question["turns"]))
         problems: list[str] = []
         try:
-            with patch("bi_agent.metrics.query_business", side_effect=spy):
+            with patch("bi_agent.business_query.nodes.metrics.query_business", side_effect=spy):
                 for turn_text, expected in zip(question["turns"], expected_list):
                     turn = _run_turn(turn_text, state, model, conn, allowed, FROZEN_NOW)
                     state = turn.state
