@@ -1,6 +1,7 @@
 """Contracts and persistence abstractions for deterministic query runs."""
 
 from .memory import MemoryQueryRunStore
+from .repository import PostgresQueryRunStore
 from .models import (
     ArtifactPersistenceError,
     ArtifactRef,
@@ -30,6 +31,7 @@ __all__ = [
     "DomainStatus",
     "ErrorEnvelope",
     "MemoryQueryRunStore",
+    "PostgresQueryRunStore",
     "NewArtifact",
     "NewQueryRun",
     "QueryRunStore",

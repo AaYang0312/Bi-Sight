@@ -12,13 +12,116 @@ from uuid import uuid4
 
 import psycopg
 
+from bi_agent.runtime import PostgresQueryRunStore
+from bi_agent.runtime.models import (
+    ArtifactPersistenceError,
+    NewArtifact,
+    NewQueryRun,
+    RunCompletion,
+    RunContextNotFound,
+    RunEventType,
+    RunNotFound,
+    RunStatus,
+    RunTransition,
+    StaleRunRevision,
+)
+
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 MIGRATION = Path(__file__).parents[1] / "sql" / "004_query_runtime.sql"
 
 
-@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
-class RuntimeDatabaseTests(unittest.TestCase):
+class RuntimeStoreValidationTests(unittest.TestCase):
+    """Ingestion checks that run without a configured PostgreSQL instance."""
+
+    def setUp(self):
+        self.store = PostgresQueryRunStore(None, forbidden_values={"S1", "ERP-P-9"})
+
+    def test_create_run_revalidates_constructed_record_before_database_access(self):
+        record = NewQueryRun.model_construct(
+            chat_id=uuid4(),
+            user_message_id=uuid4(),
+            subject_id="u1",
+            tool_call_id="call_1",
+            domain="business_query",
+            attempt_no=1,
+            normalized_request={},
+            state={"message": "请查询店铺 S1 的销售额"},
+        )
+
+        with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
+            self.store.create_run(record)
+
+    def test_transition_revalidates_constructed_command_before_database_access(self):
+        transition = RunTransition.model_construct(
+            expected_revision=0,
+            node="resolve_parameters",
+            event_type=RunEventType.TRANSITIONED,
+            status=RunStatus.RUNNING,
+            state={"node": "resolve_parameters", "revision": 1},
+            payload={"reasoning_content": "opaque"},
+            error_code=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
+            self.store.transition(uuid4(), transition)
+
+    def test_save_artifact_revalidates_constructed_command_before_database_access(self):
+        artifact = NewArtifact.model_construct(
+            artifact_type="metric_result",
+            payload={"status": "ok", "data": [{"product_id": "ERP-P-9"}]},
+            data_as_of=None,
+            coverage=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
+            self.store.save_artifact(uuid4(), artifact)
+
+    def test_finish_revalidates_constructed_running_status_before_database_access(self):
+        completion = RunCompletion.model_construct(
+            expected_revision=0,
+            node="finalize",
+            status="running",
+            state={"node": "finalize", "status": "running", "revision": 1},
+            payload={},
+            error_code=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "^finish_requires_terminal_status$"):
+            self.store.finish(uuid4(), completion)
+
+    def test_store_requires_forbidden_values(self):
+        with self.assertRaisesRegex(ValueError, "^forbidden_values_required$"):
+            PostgresQueryRunStore(None, forbidden_values=set())
+
+    def test_artifact_foreign_key_failure_is_a_safe_missing_run_error(self):
+        class MissingRunConnection:
+            def execute(self, _statement, _parameters):
+                raise psycopg.errors.ForeignKeyViolation("password=supersecret")
+
+        store = PostgresQueryRunStore(MissingRunConnection(), forbidden_values={"S1"})
+
+        with self.assertRaises(RunNotFound) as context:
+            store.save_artifact(uuid4(), NewArtifact(payload={"status": "ok"}))
+
+        self.assertEqual(str(context.exception), "run_not_found")
+        self.assertNotIn("password=supersecret", str(context.exception))
+
+    def test_artifact_database_failure_is_sanitized(self):
+        class FailingArtifactConnection:
+            def execute(self, _statement, _parameters):
+                raise psycopg.errors.SyntaxError("password=supersecret")
+
+        store = PostgresQueryRunStore(FailingArtifactConnection(), forbidden_values={"S1"})
+
+        with self.assertRaises(ArtifactPersistenceError) as context:
+            store.save_artifact(uuid4(), NewArtifact(payload={"status": "ok"}))
+
+        self.assertEqual(str(context.exception), "artifact_persistence_error")
+        self.assertNotIn("password=supersecret", str(context.exception))
+
+
+class RuntimeDatabaseFixture:
     def setUp(self):
         self.conn = psycopg.connect(os.environ["BI_TEST_ADMIN_DSN"])
         if not self.conn.info.dbname.endswith("_test"):
@@ -44,6 +147,9 @@ class RuntimeDatabaseTests(unittest.TestCase):
         )
         return chat_id, message_id
 
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class RuntimeDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
     def test_runtime_tables_have_constraints_and_cascade_from_chat(self):
         """A run and every child record disappear when its chat is deleted."""
         chat_id, message_id = self._seed_user_message()
@@ -185,3 +291,119 @@ class RuntimeDatabaseTests(unittest.TestCase):
             "query_artifacts_run_idx", "query_runs_chat_started_idx",
             "query_runs_message_attempt_idx",
         ])
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class RuntimeStoreDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
+    def test_store_creates_run_only_for_matching_user_message(self):
+        chat_id, message_id = self._seed_user_message(subject="u1")
+        store = PostgresQueryRunStore(self.conn, forbidden_values={"S1", "ERP-P-9"})
+        run_id = store.create_run(NewQueryRun(
+            chat_id=chat_id, user_message_id=message_id, subject_id="u1",
+            tool_call_id="call_1", attempt_no=1,
+            normalized_request={"shop_aliases": ["shop_1"]},
+            state={"node": "received"},
+        ))
+        row = self.conn.execute(
+            "SELECT subject_id, revision, status FROM bi.query_runs WHERE id=%s",
+            (run_id,),
+        ).fetchone()
+        self.assertEqual(row, ("u1", 0, "running"))
+        with self.assertRaises(RunContextNotFound):
+            store.create_run(NewQueryRun(
+                chat_id=chat_id, user_message_id=message_id, subject_id="u2",
+                tool_call_id="call_2", attempt_no=2,
+            ))
+
+    def test_store_transitions_once_and_rejects_stale_revision(self):
+        chat_id, message_id = self._seed_user_message()
+        store = PostgresQueryRunStore(self.conn, forbidden_values={"S1", "ERP-P-9"})
+        run_id = store.create_run(NewQueryRun(
+            chat_id=chat_id, user_message_id=message_id, subject_id="u1",
+            tool_call_id="call_1", attempt_no=1, state={"node": "received"},
+        ))
+        transition = RunTransition(
+            expected_revision=0,
+            node="resolve_parameters",
+            status=RunStatus.RUNNING,
+            state={"node": "resolve_parameters", "revision": 1},
+        )
+
+        store.transition(run_id, transition)
+
+        self.assertEqual(self.conn.execute(
+            "SELECT revision FROM bi.query_runs WHERE id=%s", (run_id,)
+        ).fetchone()[0], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT revision FROM bi.query_run_events WHERE run_id=%s", (run_id,)
+        ).fetchone()[0], 1)
+        with self.assertRaises(StaleRunRevision):
+            store.transition(run_id, transition)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.query_run_events WHERE run_id=%s", (run_id,)
+        ).fetchone()[0], 1)
+
+    def test_store_finishes_with_terminal_event(self):
+        chat_id, message_id = self._seed_user_message()
+        store = PostgresQueryRunStore(self.conn, forbidden_values={"S1", "ERP-P-9"})
+        run_id = store.create_run(NewQueryRun(
+            chat_id=chat_id, user_message_id=message_id, subject_id="u1",
+            tool_call_id="call_1", attempt_no=1, state={"node": "received"},
+        ))
+
+        store.finish(run_id, RunCompletion(
+            expected_revision=0,
+            node="finalize",
+            status=RunStatus.SUCCEEDED,
+            state={"node": "finalize", "status": "succeeded", "revision": 1},
+            payload={"result_count": 1},
+        ))
+
+        self.assertEqual(self.conn.execute(
+            "SELECT revision, status, completed_at IS NOT NULL FROM bi.query_runs WHERE id=%s",
+            (run_id,),
+        ).fetchone(), (1, "succeeded", True))
+        self.assertEqual(self.conn.execute(
+            "SELECT revision, event_type FROM bi.query_run_events WHERE run_id=%s",
+            (run_id,),
+        ).fetchone(), (1, "completed"))
+
+    def test_store_persists_only_public_artifact_projection(self):
+        chat_id, message_id = self._seed_user_message()
+        store = PostgresQueryRunStore(self.conn, forbidden_values={"S1", "ERP-P-9"})
+        run_id = store.create_run(NewQueryRun(
+            chat_id=chat_id, user_message_id=message_id, subject_id="u1",
+            tool_call_id="call_1", attempt_no=1, state={"node": "received"},
+        ))
+        payload = {
+            "status": "ok",
+            "data": [{"shop_id": "店铺1", "product_id": "商品A"}],
+        }
+
+        artifact = store.save_artifact(run_id, NewArtifact(payload=payload))
+
+        self.assertEqual(artifact.type, "metric_result")
+        self.assertEqual(self.conn.execute(
+            "SELECT payload FROM bi.query_artifacts WHERE id=%s", (artifact.id,)
+        ).fetchone()[0], payload)
+
+    def test_store_revalidates_constructed_commands_before_writing(self):
+        chat_id, message_id = self._seed_user_message()
+        store = PostgresQueryRunStore(self.conn, forbidden_values={"S1", "ERP-P-9"})
+        unsafe_record = NewQueryRun.model_construct(
+            chat_id=chat_id,
+            user_message_id=message_id,
+            subject_id="u1",
+            tool_call_id="call_1",
+            domain="business_query",
+            attempt_no=1,
+            normalized_request={},
+            state={"message": "请查询店铺 S1 的销售额"},
+        )
+
+        with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
+            store.create_run(unsafe_record)
+
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.query_runs WHERE user_message_id=%s", (message_id,)
+        ).fetchone()[0], 0)
