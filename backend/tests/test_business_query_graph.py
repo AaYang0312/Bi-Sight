@@ -23,9 +23,11 @@ from bi_agent.business_query.nodes import (
     resolve_parameters,
     validate_parameters,
 )
-from bi_agent.metrics import Coverage
+from bi_agent.metrics import Coverage, ToolResult
+from bi_agent.runtime.memory import MemoryQueryRunStore
 from bi_agent.runtime.models import (
     ArtifactRef,
+    ArtifactPersistenceError,
     DomainStatus,
     ErrorEnvelope,
     RecoveryAction,
@@ -408,3 +410,183 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
         self.assertEqual(runtime.request.shop_ids, ["S1"])  # type: ignore[union-attr]
         self.assertEqual(runtime.state.node, BusinessQueryNode.EXECUTE_FIXED_QUERY)
         self.assertEqual(runtime.state.status, RunStatus.RUNNING)
+
+
+class _ArtifactFailingStore(MemoryQueryRunStore):
+    def save_artifact(self, run_id, artifact):  # type: ignore[no-untyped-def]
+        raise ArtifactPersistenceError("database password=not-for-public-output")
+
+
+class BusinessQueryExecutionTests(unittest.TestCase):
+    START = date(2026, 9, 1)
+    END = date(2026, 9, 8)
+    NOW = datetime(2026, 9, 10, tzinfo=timezone.utc)
+
+    def _context(self, *, deadline: datetime | None = None) -> BusinessQueryContext:
+        return BusinessQueryContext(
+            chat_id=uuid4(),
+            user_message_id=uuid4(),
+            subject_id="user-1",
+            question="查询店铺的支付金额",
+            previous_filters={},
+            shop_aliases={"S1": "shop_1"},
+            allowed_shop_ids=frozenset({"S1"}),
+            now=self.NOW,
+            deadline=deadline or self.NOW + timedelta(seconds=30),
+            attempt_no=1,
+        )
+
+    def _tool_input(self) -> BusinessQueryInput:
+        return BusinessQueryInput(
+            tool_call_id="call_1",
+            arguments={
+                "shop_ids": ["shop_1"],
+                "start": self.START.isoformat(),
+                "end": self.END.isoformat(),
+                "metrics": ["paid_amount"],
+            },
+        )
+
+    def _result(
+        self,
+        *,
+        status: str = "ok",
+        data: list[dict[str, str | int | None]] | None = None,
+        coverage: Coverage | None = None,
+        filters: dict[str, object] | None = None,
+    ) -> ToolResult:
+        return ToolResult(
+            status=status,  # type: ignore[arg-type]
+            data=data if data is not None else [{"paid_amount": "1000"}],
+            coverage=coverage or Coverage(
+                status="complete", start=self.START, end=self.END
+            ),
+            filters=filters or {},
+        )
+
+    def _execute(self, store, result: ToolResult, *, context: BusinessQueryContext | None = None):  # type: ignore[no-untyped-def]
+        from bi_agent.business_query.graph import _execute_business_query_graph
+
+        with patch("bi_agent.metrics.query_business", return_value=result) as query_business:
+            execution = _execute_business_query_graph(
+                object(), store, self._tool_input(), context or self._context()
+            )
+        return execution, query_business
+
+    def test_success_executes_once_persists_artifact_and_records_fixed_nodes(self):
+        store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
+
+        execution, query_business = self._execute(store, self._result())
+
+        query_business.assert_called_once()
+        self.assertEqual(execution.domain_result.status, DomainStatus.SUCCESS)
+        run = store.runs[execution.domain_result.run_id]
+        self.assertEqual(run["status"], RunStatus.SUCCEEDED.value)
+        self.assertEqual(
+            [event["node"] for event in store.events[execution.domain_result.run_id]],
+            [
+                "resolve_parameters",
+                "validate_parameters",
+                "authorize_scope",
+                "execute_fixed_query",
+                "classify_result",
+                "persist_artifact",
+                "finalize",
+            ],
+        )
+        self.assertEqual(len(execution.domain_result.artifacts), 1)
+        self.assertEqual(len(store.artifacts), 1)
+
+    def test_classifies_zero_missing_and_unavailable_results_without_inventing_partial(self):
+        cases = (
+            (
+                self._result(data=[{"paid_amount": "0"}]),
+                DomainStatus.SUCCESS,
+            ),
+            (
+                self._result(
+                    status="missing_data",
+                    data=[],
+                    coverage=Coverage(status="missing", start=self.START, end=self.END),
+                ),
+                DomainStatus.MISSING_DATA,
+            ),
+            (
+                self._result(
+                    status="missing_data",
+                    data=[],
+                    coverage=Coverage(
+                        status="partial",
+                        start=self.START,
+                        end=self.END,
+                        gaps=["2026-09-05~2026-09-08"],
+                    ),
+                ),
+                DomainStatus.MISSING_DATA,
+            ),
+            (
+                self._result(
+                    status="unavailable",
+                    data=[],
+                    coverage=Coverage(status="missing", start=None, end=None),
+                ),
+                DomainStatus.FAILED,
+            ),
+        )
+        for result, expected_status in cases:
+            with self.subTest(tool_status=result.status, coverage=result.coverage.status):
+                execution, query_business = self._execute(
+                    MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"}), result
+                )
+
+                query_business.assert_called_once()
+                self.assertEqual(execution.domain_result.status, expected_status)
+
+    def test_artifact_persistence_failure_overrides_result_without_exposing_reason(self):
+        store = _ArtifactFailingStore(forbidden_values={"S1", "ERP-P-9"})
+
+        execution, query_business = self._execute(store, self._result())
+
+        query_business.assert_called_once()
+        self.assertEqual(execution.domain_result.status, DomainStatus.FAILED)
+        self.assertEqual(execution.domain_result.error.code, "artifact_persistence_failed")  # type: ignore[union-attr]
+        self.assertEqual(execution.domain_result.artifacts, [])
+        self.assertEqual(store.artifacts, {})
+        public_output = json.dumps(execution.domain_result.model_dump(mode="json"))
+        self.assertNotIn("database password=not-for-public-output", public_output)
+
+    def test_expired_deadline_fails_without_calling_metrics(self):
+        store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
+
+        execution, query_business = self._execute(
+            store, self._result(), context=self._context(deadline=self.NOW)
+        )
+
+        query_business.assert_not_called()
+        self.assertEqual(execution.domain_result.status, DomainStatus.FAILED)
+        self.assertEqual(execution.domain_result.error.code, "deadline_exceeded")  # type: ignore[union-attr]
+
+    def test_projections_and_persistence_never_expose_real_or_requested_identifiers(self):
+        store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
+        result = self._result(
+            data=[{"shop_id": "S1", "product_id": "ERP-P-9", "paid_amount": "1000"}],
+            filters={
+                "shop_ids": ["S1"],
+                "requested_shop_ids": ["S1"],
+            },
+        )
+
+        execution, query_business = self._execute(store, result)
+
+        query_business.assert_called_once()
+        safe_values = (
+            execution.domain_result.model_dump(mode="json"),
+            [artifact["payload"] for artifact in store.artifacts.values()],
+            store.runs[execution.domain_result.run_id]["state"],
+            store.events[execution.domain_result.run_id],
+        )
+        for value in safe_values:
+            serialized = json.dumps(value, ensure_ascii=False, default=str)
+            self.assertNotIn("S1", serialized)
+            self.assertNotIn("ERP-P-9", serialized)
+        self.assertNotIn("requested_shop_ids", execution.domain_result.model_payload["filters"])

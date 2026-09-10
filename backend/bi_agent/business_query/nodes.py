@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 from datetime import date
+from time import monotonic
 from typing import Literal
 
 from pydantic import ValidationError
 
-from bi_agent.metrics import METRIC_DEFINITIONS, QueryRequest, resolve_period
+from bi_agent import metrics
+from bi_agent.metrics import Coverage, METRIC_DEFINITIONS, QueryRequest, ToolResult, resolve_period
 from bi_agent.runtime.models import (
+    ArtifactPersistenceError,
     DomainStatus,
     ErrorEnvelope,
+    NewArtifact,
     RecoveryAction,
     RunStatus,
 )
 
 from .graph import transition_state
 from .state import BusinessQueryNode, BusinessQueryRuntime
+from .tool import to_public_artifact
 
 
 _GROUP_BY = frozenset({"total", "day", "shop", "product"})
@@ -139,7 +144,9 @@ def validate_parameters(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
     return runtime
 
 
-def authorize_scope(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
+def authorize_scope(
+    runtime: BusinessQueryRuntime, *, advance_to_execution: bool = True
+) -> BusinessQueryRuntime:
     """Reject non-authorized shops before the graph can reach query execution."""
     if runtime.state.status is not RunStatus.RUNNING:
         return runtime
@@ -168,10 +175,291 @@ def authorize_scope(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
         )
         return runtime
 
+    if advance_to_execution:
+        runtime.state = transition_state(
+            runtime.state, BusinessQueryNode.EXECUTE_FIXED_QUERY
+        )
+    return runtime
+
+
+_LIMITATION_CODES = {
+    "覆盖未完成，拒绝部分汇总；缺口见coverage.gaps": "coverage_incomplete",
+    "数据截止未知（回填未完成）": "data_as_of_unknown",
+    "店铺尚未同步，无法查询": "shop_not_synced",
+    "部分店铺已停用，仅返回剩余范围": "shops_inactive",
+    "所选店铺均已停用，无法查询": "shops_inactive",
+    "上期覆盖不足，无法比较，仅返回绝对值": "comparison_coverage_incomplete",
+    "本次查询时间预算已耗尽": "deadline_exceeded",
+    "查询超时": "query_timeout",
+    "店铺不在授权范围": "forbidden",
+    "同批支付额为0或无支付，同批退款率不可计算": "cohort_rate_not_computable",
+}
+
+
+def execute_fixed_query(runtime: BusinessQueryRuntime, conn: object) -> BusinessQueryRuntime:
+    """Execute the already authorized query exactly once, unless it is expired."""
+    if runtime.state.status is not RunStatus.RUNNING:
+        return runtime
     runtime.state = transition_state(
         runtime.state, BusinessQueryNode.EXECUTE_FIXED_QUERY
     )
+    request = runtime.request
+    if request is None:
+        _set_failure(
+            runtime,
+            code="result_contract_violation",
+            stage=BusinessQueryNode.EXECUTE_FIXED_QUERY,
+            public_message="查询结果异常。",
+        )
+        return runtime
+    if runtime.context.now >= runtime.context.deadline:
+        _set_failure(
+            runtime,
+            code="deadline_exceeded",
+            stage=BusinessQueryNode.EXECUTE_FIXED_QUERY,
+            public_message="查询已超时，请稍后重试。",
+        )
+        return runtime
+
+    remaining_seconds = (runtime.context.deadline - runtime.context.now).total_seconds()
+    deadline = monotonic() + max(remaining_seconds, 0.0)
+    try:
+        runtime.result = metrics.query_business(
+            conn,
+            request,
+            allowed_shop_ids=runtime.context.allowed_shop_ids,
+            now=runtime.context.now,
+            deadline=deadline,
+        )
+    except Exception:  # noqa: BLE001 - provider diagnostics must not leave this boundary
+        runtime.result = ToolResult(
+            status="unavailable",
+            coverage=Coverage(status="missing", start=None, end=None),
+            limitations=[],
+        )
     return runtime
+
+
+def classify_result(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
+    """Map a ToolResult onto one safe domain outcome without retaining raw text."""
+    if runtime.state.status is not RunStatus.RUNNING:
+        return runtime
+    runtime.state = transition_state(runtime.state, BusinessQueryNode.CLASSIFY_RESULT)
+    result = runtime.result
+    if result is None:
+        _set_failure(
+            runtime,
+            code="result_contract_violation",
+            stage=BusinessQueryNode.CLASSIFY_RESULT,
+            public_message="查询结果异常。",
+        )
+        return runtime
+
+    target_status, error = _classify(result)
+    runtime.state = runtime.state.model_copy(
+        update={
+            "tool_status": result.status,
+            "target_status": target_status,
+            "coverage": result.coverage,
+            "data_as_of": result.data_as_of,
+            "limitations": _limitation_codes(result.limitations),
+            "problems": list(error.problems) if error is not None else [],
+            "error": error,
+        }
+    )
+    return runtime
+
+
+def persist_artifact(runtime: BusinessQueryRuntime, store: object) -> BusinessQueryRuntime:
+    """Save only the strict public projection and convert persistence errors safely."""
+    if runtime.state.status is not RunStatus.RUNNING:
+        return runtime
+    runtime.state = transition_state(runtime.state, BusinessQueryNode.PERSIST_ARTIFACT)
+    result = runtime.result
+    if result is None:
+        _set_failure(
+            runtime,
+            code="result_contract_violation",
+            stage=BusinessQueryNode.PERSIST_ARTIFACT,
+            public_message="查询结果异常。",
+        )
+        return runtime
+    try:
+        public_payload = to_public_artifact(result, runtime.context.shop_aliases)
+        artifact = NewArtifact(
+            payload=public_payload,
+            data_as_of=result.data_as_of,
+            coverage=result.coverage.model_dump(mode="json"),
+        )
+    except (ValidationError, ValueError):
+        _set_failure(
+            runtime,
+            code="result_contract_violation",
+            stage=BusinessQueryNode.PERSIST_ARTIFACT,
+            public_message="查询结果异常。",
+        )
+        return runtime
+
+    try:
+        ref = store.save_artifact(runtime.state.run_id, artifact)  # type: ignore[attr-defined]
+    except ArtifactPersistenceError:
+        _set_failure(
+            runtime,
+            code="artifact_persistence_failed",
+            stage=BusinessQueryNode.PERSIST_ARTIFACT,
+            public_message="结果保存失败，请稍后重试。",
+        )
+        return runtime
+    runtime.state = runtime.state.model_copy(
+        update={"artifact_refs": [*runtime.state.artifact_refs, ref]}
+    )
+    return runtime
+
+
+def finalize_run(runtime: BusinessQueryRuntime, store: object) -> BusinessQueryRuntime:
+    """Finish the Run with the terminal status selected by classification."""
+    if runtime.state.node is not BusinessQueryNode.PERSIST_ARTIFACT:
+        return runtime
+    runtime.state = transition_state(runtime.state, BusinessQueryNode.FINALIZE)
+    target_status = runtime.state.target_status or DomainStatus.FAILED
+    status = _run_status(target_status)
+    runtime.state = runtime.state.model_copy(
+        update={"status": status, "revision": runtime.state.revision + 1}
+    )
+    from bi_agent.runtime.models import RunCompletion
+
+    store.finish(  # type: ignore[attr-defined]
+        runtime.state.run_id,
+        RunCompletion(
+            expected_revision=runtime.state.revision - 1,
+            node=runtime.state.node.value,
+            status=status,
+            state=runtime.state.model_dump(mode="json"),
+            payload=_event_payload(runtime),
+            error_code=runtime.state.error.code if runtime.state.error else None,
+        ),
+    )
+    return runtime
+
+
+def _classify(result: ToolResult) -> tuple[DomainStatus, ErrorEnvelope | None]:
+    if result.status == "ok" and result.coverage.status == "complete":
+        return DomainStatus.SUCCESS, None
+    if (
+        result.status == "ok"
+        and result.coverage.status == "partial"
+        and bool(result.data)
+    ):
+        return DomainStatus.PARTIAL, None
+    if result.status == "missing_data":
+        return DomainStatus.MISSING_DATA, None
+    if result.status == "invalid_parameters":
+        return DomainStatus.NEEDS_INPUT, ErrorEnvelope(
+            code="invalid_parameters",
+            stage="classify_result",
+            retryable=False,
+            recovery=RecoveryAction.CORRECT_PARAMETERS,
+            public_message="查询参数无效",
+            problems=["invalid_parameters"],
+        )
+    if result.status == "forbidden":
+        return DomainStatus.FAILED, ErrorEnvelope(
+            code="forbidden",
+            stage="classify_result",
+            retryable=False,
+            recovery=RecoveryAction.NONE,
+            public_message="查询范围无权限。",
+            problems=["forbidden"],
+        )
+    if result.status == "unavailable":
+        return DomainStatus.FAILED, ErrorEnvelope(
+            code="unavailable",
+            stage="classify_result",
+            retryable=True,
+            recovery=RecoveryAction.RETRY_LATER,
+            public_message="查询暂不可用，请稍后重试。",
+            problems=["unavailable"],
+        )
+    return DomainStatus.FAILED, ErrorEnvelope(
+        code="result_contract_violation",
+        stage="classify_result",
+        retryable=False,
+        recovery=RecoveryAction.NONE,
+        public_message="查询结果异常。",
+        problems=["result_contract_violation"],
+    )
+
+
+def _limitation_codes(limitations: list[str]) -> list[str]:
+    codes: list[str] = []
+    for limitation in limitations:
+        code = _LIMITATION_CODES.get(limitation)
+        if code is None and limitation.startswith("结果超过") and limitation.endswith("组，请缩小日期范围或店铺范围"):
+            code = "result_too_large"
+        if code is not None and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def _set_failure(
+    runtime: BusinessQueryRuntime,
+    *,
+    code: str,
+    stage: BusinessQueryNode,
+    public_message: str,
+) -> None:
+    recovery = (
+        RecoveryAction.RETRY_LATER
+        if code in {"deadline_exceeded", "artifact_persistence_failed"}
+        else RecoveryAction.NONE
+    )
+    runtime.state = runtime.state.model_copy(
+        update={
+            "status": RunStatus.FAILED,
+            "target_status": DomainStatus.FAILED,
+            "problems": [code],
+            "error": ErrorEnvelope(
+                code=code,  # type: ignore[arg-type]
+                stage=stage.value,
+                retryable=recovery is RecoveryAction.RETRY_LATER,
+                recovery=recovery,
+                public_message=public_message,  # type: ignore[arg-type]
+                problems=[code],  # type: ignore[list-item]
+            ),
+        }
+    )
+
+
+def _run_status(status: DomainStatus) -> RunStatus:
+    return {
+        DomainStatus.SUCCESS: RunStatus.SUCCEEDED,
+        DomainStatus.NEEDS_INPUT: RunStatus.NEEDS_INPUT,
+        DomainStatus.MISSING_DATA: RunStatus.MISSING_DATA,
+        DomainStatus.PARTIAL: RunStatus.PARTIAL,
+        DomainStatus.FAILED: RunStatus.FAILED,
+    }[status]
+
+
+def _event_payload(runtime: BusinessQueryRuntime) -> dict[str, object]:
+    state = runtime.state
+    payload: dict[str, object] = {}
+    if state.problems:
+        payload["problem_codes"] = list(state.problems)
+    if state.tool_status is not None:
+        payload["tool_status"] = state.tool_status
+    if state.target_status is not None:
+        payload["target_status"] = state.target_status.value
+    if state.coverage is not None:
+        payload["coverage_status"] = state.coverage.status
+    if state.data_as_of is not None:
+        payload["data_as_of"] = state.data_as_of.isoformat()
+    if state.limitations:
+        payload["limitation_codes"] = list(state.limitations)
+    if state.artifact_refs:
+        payload["artifact_refs"] = [ref.model_dump(mode="json") for ref in state.artifact_refs]
+    if runtime.result is not None:
+        payload["result_count"] = len(runtime.result.data)
+    return payload
 
 
 def _resolve_shops(

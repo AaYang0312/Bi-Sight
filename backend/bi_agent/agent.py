@@ -17,6 +17,10 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .business_query.tool import (
+    to_model_result as _to_model_result,
+    to_public_artifact as _to_public_artifact,
+)
 from .llm import ChatModel, Message, ModelError, ModelReply, ToolCall
 from .metrics import QueryRequest, ToolResult, resolve_period
 from .promotion import PromotionRequest, evaluate_promotion
@@ -189,68 +193,14 @@ def _trim_turns(turns: list[Message]) -> list[Message]:
     return turns
 
 
-_PUBLIC_RESULT_COLUMNS = {
-    "day", "shop_id", "product_id", "line_kind", "currency", "basis",
-    "paid_amount", "paid_orders", "erp_documents", "aov", "refund_amount",
-    "cash_difference", "cohort_refund_rate", "quantity", "product_paid_amount",
-    "spend_cap", "budget", "actual_spend", "remaining_budget", "over_budget",
-    "remaining_days", "daily_cap", "contribution_cap",
-}
-
-
-def _safe_result(result: ToolResult, state: SessionState, *, model_view: bool) -> dict[str, object]:
-    """只保留聚合字段，并替换所有可识别ERP标识。"""
-    payload = result.model_dump(mode="json")
-    aliases = state.shop_aliases
-    product_alias: dict[str, str] = {}
-
-    def map_shop(value: object) -> str:
-        alias = aliases.get(str(value))
-        if alias is None:
-            return "未授权店铺"
-        return alias if model_view else f"店铺{alias.removeprefix('shop_')}"
-
-    def map_product(value: object) -> object:
-        if not isinstance(value, str):
-            return value
-        if value not in product_alias:
-            product_alias[value] = f"商品{chr(ord('A') + len(product_alias) % 26)}"
-        return product_alias[value]
-
-    rows: list[dict[str, object]] = []
-    for row in payload.get("data") or []:
-        if isinstance(row, dict):
-            clean = {key: value for key, value in row.items() if key in _PUBLIC_RESULT_COLUMNS}
-            if "shop_id" in clean:
-                clean["shop_id"] = map_shop(clean["shop_id"])
-            if "product_id" in clean:
-                clean["product_id"] = map_product(clean["product_id"])
-            rows.append(clean)
-    filters = dict(payload.get("filters") or {})
-    if isinstance(filters.get("shop_ids"), list):
-        filters["shop_ids"] = [
-            map_shop(shop_id)
-            for shop_id in filters["shop_ids"]
-        ]
-    return {
-        "status": payload.get("status"),
-        "metric_definition": payload.get("metric_definition"),
-        "coverage": payload.get("coverage"),
-        "limitations": payload.get("limitations"),
-        "data_as_of": payload.get("data_as_of"),
-        "filters": filters,
-        "data": rows,
-    }
-
-
 def to_model_result(result: ToolResult, state: SessionState) -> dict[str, object]:
     """模型只看匿名店铺、匿名商品和必要聚合结果。"""
-    return _safe_result(result, state, model_view=True)
+    return _to_model_result(result, state.shop_aliases)
 
 
 def to_public_artifact(result: ToolResult, state: SessionState) -> dict[str, object]:
     """聊天附件同样不保存ERP ID，但使用适合经营者阅读的标签。"""
-    return _safe_result(result, state, model_view=False)
+    return _to_public_artifact(result, state.shop_aliases)
 
 
 def encode_sse(event: ChatEvent) -> bytes:
