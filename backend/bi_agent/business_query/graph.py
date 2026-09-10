@@ -159,6 +159,14 @@ def _persist_transition(
             node=persisted.node.value,
             status=persisted.status,
             state=persisted.model_dump(mode="json"),
+            normalized_request=(
+                persisted.normalized_request
+                if persisted.node in {
+                    BusinessQueryNode.RESOLVE_PARAMETERS,
+                    BusinessQueryNode.VALIDATE_PARAMETERS,
+                }
+                else None
+            ),
             payload=payload,
             error_code=persisted.error.code if persisted.error else None,
         ),

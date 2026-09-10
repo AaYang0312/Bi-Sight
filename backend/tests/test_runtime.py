@@ -241,6 +241,48 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
         with self.assertRaises(StaleRunRevision):
             self.store.transition(run_id, transition)
 
+    def test_transition_atomically_updates_only_the_validated_normalized_request(self):
+        run_id = self.store.create_run(self.record)
+        normalized_request = {
+            "shop_aliases": ["shop_1"],
+            "metrics": ["paid_amount"],
+            "start": "2026-09-01",
+            "end": "2026-09-08",
+            "group_by": "total",
+            "compare": "none",
+            "top_n": 100,
+            "currency": "CNY",
+        }
+        transition = RunTransition(
+            expected_revision=0,
+            node="validate_parameters",
+            status=RunStatus.RUNNING,
+            normalized_request=normalized_request,
+            state={
+                "node": "validate_parameters",
+                "revision": 1,
+                "normalized_request": normalized_request,
+            },
+        )
+
+        self.store.transition(run_id, transition)
+
+        self.assertEqual(self.store.runs[run_id]["normalized_request"], normalized_request)
+        self.assertEqual(
+            self.store.runs[run_id]["normalized_request"],
+            self.store.runs[run_id]["state"]["normalized_request"],
+        )
+
+    def test_transition_rejects_real_identifiers_in_the_normalized_request(self):
+        with self.assertRaisesRegex(ValidationError, "unsafe_persistence_payload"):
+            RunTransition(
+                expected_revision=0,
+                node="resolve_parameters",
+                status=RunStatus.RUNNING,
+                normalized_request={"shop_aliases": ["S1"]},
+                state={"node": "resolve_parameters", "revision": 1},
+            )
+
     def test_save_artifact_returns_reference_and_finish_is_terminal(self):
         run_id = self.store.create_run(self.record)
         ref = self.store.save_artifact(run_id, NewArtifact(

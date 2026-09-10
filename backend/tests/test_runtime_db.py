@@ -67,6 +67,21 @@ class RuntimeStoreValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
             self.store.transition(uuid4(), transition)
 
+    def test_transition_revalidates_constructed_normalized_request_before_database_access(self):
+        transition = RunTransition.model_construct(
+            expected_revision=0,
+            node="resolve_parameters",
+            event_type=RunEventType.TRANSITIONED,
+            status=RunStatus.RUNNING,
+            state={"node": "resolve_parameters", "revision": 1},
+            normalized_request={"shop_aliases": ["S1"]},
+            payload={},
+            error_code=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
+            self.store.transition(uuid4(), transition)
+
     def test_save_artifact_revalidates_constructed_command_before_database_access(self):
         artifact = NewArtifact.model_construct(
             artifact_type="metric_result",
@@ -331,11 +346,17 @@ class RuntimeStoreDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
             chat_id=chat_id, user_message_id=message_id, subject_id="u1",
             tool_call_id="call_1", attempt_no=1, state={"node": "received"},
         ))
+        normalized_request = {"shop_aliases": ["shop_1"]}
         transition = RunTransition(
             expected_revision=0,
             node="resolve_parameters",
             status=RunStatus.RUNNING,
-            state={"node": "resolve_parameters", "revision": 1},
+            normalized_request=normalized_request,
+            state={
+                "node": "resolve_parameters",
+                "revision": 1,
+                "normalized_request": normalized_request,
+            },
         )
 
         store.transition(run_id, transition)
@@ -346,6 +367,9 @@ class RuntimeStoreDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
         self.assertEqual(self.conn.execute(
             "SELECT revision FROM bi.query_run_events WHERE run_id=%s", (run_id,)
         ).fetchone()[0], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT normalized_request FROM bi.query_runs WHERE id=%s", (run_id,)
+        ).fetchone()[0], normalized_request)
         with self.assertRaises(StaleRunRevision):
             store.transition(run_id, transition)
         self.assertEqual(self.conn.execute(

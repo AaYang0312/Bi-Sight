@@ -515,6 +515,7 @@ class RunTransition(BaseModel):
     event_type: RunEventType = RunEventType.TRANSITIONED
     status: RunStatus
     state: PersistedState
+    normalized_request: NormalizedRequest | None = None
     payload: EventPayload = Field(default_factory=dict)
     error_code: ErrorCode | None = None
 

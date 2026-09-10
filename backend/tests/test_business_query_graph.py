@@ -4,6 +4,7 @@ import json
 import unittest
 from dataclasses import is_dataclass
 from datetime import date, datetime, timedelta, timezone
+from time import monotonic
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -155,7 +156,7 @@ class BusinessQueryStateContractTests(unittest.TestCase):
             shop_aliases={"shop_1": "S1"},
             allowed_shop_ids={"S1"},
             now=now,
-            deadline=now + timedelta(seconds=30),
+            deadline=monotonic() + 30,
             attempt_no=1,
         )
         runtime = BusinessQueryRuntime(
@@ -201,7 +202,7 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
                 shop_aliases={"S1": "shop_1"},
                 allowed_shop_ids=frozenset({"S1"}),
                 now=now,
-                deadline=now + timedelta(seconds=30),
+                deadline=monotonic() + 30,
                 attempt_no=1,
             ),
             resolved_args=arguments or {},
@@ -422,7 +423,7 @@ class BusinessQueryExecutionTests(unittest.TestCase):
     END = date(2026, 9, 8)
     NOW = datetime(2026, 9, 10, tzinfo=timezone.utc)
 
-    def _context(self, *, deadline: datetime | None = None) -> BusinessQueryContext:
+    def _context(self, *, deadline: float | None = None) -> BusinessQueryContext:
         return BusinessQueryContext(
             chat_id=uuid4(),
             user_message_id=uuid4(),
@@ -432,7 +433,7 @@ class BusinessQueryExecutionTests(unittest.TestCase):
             shop_aliases={"S1": "shop_1"},
             allowed_shop_ids=frozenset({"S1"}),
             now=self.NOW,
-            deadline=deadline or self.NOW + timedelta(seconds=30),
+            deadline=deadline if deadline is not None else monotonic() + 30,
             attempt_no=1,
         )
 
@@ -482,6 +483,22 @@ class BusinessQueryExecutionTests(unittest.TestCase):
         self.assertEqual(execution.domain_result.status, DomainStatus.SUCCESS)
         run = store.runs[execution.domain_result.run_id]
         self.assertEqual(run["status"], RunStatus.SUCCEEDED.value)
+        self.assertEqual(
+            run["normalized_request"],
+            {
+                "shop_aliases": ["shop_1"],
+                "metrics": ["paid_amount"],
+                "start": "2026-09-01",
+                "end": "2026-09-08",
+                "group_by": "total",
+                "compare": "none",
+                "top_n": 10,
+                "currency": "CNY",
+            },
+        )
+        self.assertEqual(
+            run["normalized_request"], run["state"]["normalized_request"]
+        )
         self.assertEqual(
             [event["node"] for event in store.events[execution.domain_result.run_id]],
             [
@@ -535,12 +552,18 @@ class BusinessQueryExecutionTests(unittest.TestCase):
         )
         for result, expected_status in cases:
             with self.subTest(tool_status=result.status, coverage=result.coverage.status):
+                store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
                 execution, query_business = self._execute(
-                    MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"}), result
+                    store, result
                 )
 
                 query_business.assert_called_once()
                 self.assertEqual(execution.domain_result.status, expected_status)
+                self.assertEqual(len(execution.domain_result.artifacts), 1)
+                self.assertIn(
+                    "persist_artifact",
+                    [event["node"] for event in store.events[execution.domain_result.run_id]],
+                )
 
     def test_artifact_persistence_failure_overrides_result_without_exposing_reason(self):
         store = _ArtifactFailingStore(forbidden_values={"S1", "ERP-P-9"})
@@ -558,13 +581,26 @@ class BusinessQueryExecutionTests(unittest.TestCase):
     def test_expired_deadline_fails_without_calling_metrics(self):
         store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
 
-        execution, query_business = self._execute(
-            store, self._result(), context=self._context(deadline=self.NOW)
-        )
+        with patch("bi_agent.business_query.nodes.monotonic", return_value=100.0):
+            execution, query_business = self._execute(
+                store, self._result(), context=self._context(deadline=100.0)
+            )
 
         query_business.assert_not_called()
         self.assertEqual(execution.domain_result.status, DomainStatus.FAILED)
         self.assertEqual(execution.domain_result.error.code, "deadline_exceeded")  # type: ignore[union-attr]
+
+    def test_query_receives_the_original_nearly_expired_monotonic_deadline(self):
+        store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
+
+        with patch("bi_agent.business_query.nodes.monotonic", return_value=99.9):
+            execution, query_business = self._execute(
+                store, self._result(), context=self._context(deadline=100.0)
+            )
+
+        self.assertEqual(execution.domain_result.status, DomainStatus.SUCCESS)
+        query_business.assert_called_once()
+        self.assertEqual(query_business.call_args.kwargs["deadline"], 100.0)
 
     def test_projections_and_persistence_never_expose_real_or_requested_identifiers(self):
         store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})

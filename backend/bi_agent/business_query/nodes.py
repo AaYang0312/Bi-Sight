@@ -212,7 +212,7 @@ def execute_fixed_query(runtime: BusinessQueryRuntime, conn: object) -> Business
             public_message="查询结果异常。",
         )
         return runtime
-    if runtime.context.now >= runtime.context.deadline:
+    if monotonic() >= runtime.context.deadline:
         _set_failure(
             runtime,
             code="deadline_exceeded",
@@ -221,15 +221,13 @@ def execute_fixed_query(runtime: BusinessQueryRuntime, conn: object) -> Business
         )
         return runtime
 
-    remaining_seconds = (runtime.context.deadline - runtime.context.now).total_seconds()
-    deadline = monotonic() + max(remaining_seconds, 0.0)
     try:
         runtime.result = metrics.query_business(
             conn,
             request,
             allowed_shop_ids=runtime.context.allowed_shop_ids,
             now=runtime.context.now,
-            deadline=deadline,
+            deadline=runtime.context.deadline,
         )
     except Exception:  # noqa: BLE001 - provider diagnostics must not leave this boundary
         runtime.result = ToolResult(

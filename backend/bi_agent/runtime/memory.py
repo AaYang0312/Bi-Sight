@@ -70,18 +70,23 @@ class MemoryQueryRunStore:
     def transition(self, run_id: UUID, transition: RunTransition) -> None:
         transition = self._revalidate_transition(transition)
         self._validate_state(transition.state)
+        if transition.normalized_request is not None:
+            self._validate_normalized_request(transition.normalized_request)
         self._validate_event(transition.payload)
         run = self._require_current_revision(run_id, transition.expected_revision)
         revision = transition.expected_revision + 1
         now = _now()
-        run.update({
+        update = {
             "status": transition.status.value,
             "current_node": transition.node,
             "revision": revision,
             "state": deepcopy(transition.state),
             "error_code": transition.error_code,
             "updated_at": now,
-        })
+        }
+        if transition.normalized_request is not None:
+            update["normalized_request"] = deepcopy(transition.normalized_request)
+        run.update(update)
         self.events[run_id].append(_event(
             run_id=run_id,
             revision=revision,

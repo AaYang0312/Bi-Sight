@@ -76,17 +76,22 @@ class PostgresQueryRunStore:
     def transition(self, run_id: UUID, transition: RunTransition) -> None:
         transition = self._revalidate_transition(transition)
         self._validate_state(transition.state)
+        if transition.normalized_request is not None:
+            self._validate_normalized_request(transition.normalized_request)
         self._validate_event(transition.payload)
         with self.conn.transaction():
             row = self.conn.execute(
                 """UPDATE bi.query_runs
                    SET status = %s, current_node = %s, revision = revision + 1,
-                       state = %s, error_code = %s, updated_at = now()
+                       normalized_request = COALESCE(%s, normalized_request), state = %s,
+                       error_code = %s, updated_at = now()
                    WHERE id = %s AND revision = %s
                    RETURNING revision""",
                 (
                     transition.status.value,
                     transition.node,
+                    (Jsonb(transition.normalized_request)
+                     if transition.normalized_request is not None else None),
                     Jsonb(transition.state),
                     transition.error_code,
                     run_id,

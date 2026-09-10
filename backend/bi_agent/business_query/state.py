@@ -107,7 +107,7 @@ class BusinessQueryContext:
     shop_aliases: dict[str, str]
     allowed_shop_ids: frozenset[str]
     now: datetime
-    deadline: datetime
+    deadline: float
     attempt_no: int
 
 
