@@ -29,6 +29,27 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .message.user .message-label { display: none; }
 .message.assistant { max-width: 100%; }
 .message-content { word-break: break-word; }
+/* 模型正文可能带 Markdown 或字符拼出的表格；解析后按块控制空白，段落内仍保留换行。 */
+.rich-content { white-space: normal; }
+.rich-content p, .rich-content li { white-space: pre-wrap; margin: 0 0 8px; }
+.rich-content > :last-child { margin-bottom: 0; }
+.rich-content h2, .rich-content h3, .rich-content h4 { margin: 16px 0 6px; line-height: 1.45; }
+.rich-content h2 { font-size: 17px; }
+.rich-content h3 { font-size: 16px; }
+.rich-content h4 { font-size: 15px; }
+.rich-content > h2:first-child, .rich-content > h3:first-child, .rich-content > h4:first-child { margin-top: 0; }
+.rich-content ul, .rich-content ol { margin: 0 0 8px; padding-left: 22px; }
+.rich-content li { margin: 2px 0; }
+.rich-content code, .rich-code code { font-family: "SFMono-Regular", Menlo, Consolas, "Courier New", monospace; }
+.rich-content code { background: #eff0f2; border-radius: 4px; padding: 1px 4px; font-size: .92em; }
+.rich-code { white-space: pre; overflow-x: auto; margin: 0 0 10px; padding: 10px; border: 1px solid #e6e7ea; border-radius: 8px; background: #f7f8f9; font-size: 13px; line-height: 1.5; }
+.rich-code.ascii-table { font-size: 12px; line-height: 1.35; }
+.rich-table { width: max-content; min-width: 100%; }
+.rich-table th, .rich-table td { white-space: normal; min-width: 52px; vertical-align: top; }
+.rich-table th { font-weight: 600; color: #3c3f45; }
+.rich-table tbody tr:last-child th, .rich-table tbody tr:last-child td { border-bottom: 0; }
+.rich-content hr { margin: 12px 0; border: 0; border-top: 1px solid #e3e4e7; }
+.rich-content a { color: #2f52d8; }
 .empty-state { margin: auto 0; text-align: center; color: #626670; }
 .empty-state h1 { color: #202124; font-size: clamp(28px, 5vw, 42px); margin-bottom: 8px; }
 .example-list { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 28px; text-align: left; }
