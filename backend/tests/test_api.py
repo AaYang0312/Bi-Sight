@@ -185,7 +185,9 @@ class ApiTests(unittest.TestCase):
             def create_run(self, _record):
                 raise RuntimeError(
                     "psycopg.OperationalError dsn=postgresql://secret "
-                    "SELECT * FROM bi.query_runs"
+                    "SELECT * FROM bi.query_runs\ntraceback\n"
+                    "STACK_MARKER_RUNTIME_FAILURE\n"
+                    'File "/srv/bi_agent/runtime/repository.py", line 42'
                 )
 
         conn = Mock()
@@ -215,6 +217,9 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("psycopg", browser_text)
         self.assertNotIn("SELECT", browser_text)
         self.assertNotIn("dsn=", browser_text)
+        self.assertNotIn("traceback", browser_text)
+        self.assertNotIn("STACK_MARKER_RUNTIME_FAILURE", browser_text)
+        self.assertNotIn("/srv/bi_agent/runtime/repository.py", browser_text)
 
     @unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
     def test_message_stream_audits_a_completed_business_query_without_sensitive_json(self):
@@ -308,9 +313,21 @@ class ApiTests(unittest.TestCase):
                     self.assertIsNotNone(run)
                     self.assertEqual(run[1:3], ("succeeded", "finalize"))
                     self.assertGreater(run[3], 0)
-                    self.assertGreater(admin_conn.execute(
-                        "SELECT count(*) FROM bi.query_run_events WHERE run_id=%s", (run[0],)
-                    ).fetchone()[0], 0)
+                    events = admin_conn.execute(
+                        "SELECT revision, node, event_type, status "
+                        "FROM bi.query_run_events WHERE run_id=%s ORDER BY revision",
+                        (run[0],),
+                    ).fetchall()
+                    self.assertEqual([event[0] for event in events], list(range(1, 8)))
+                    self.assertEqual(events, [
+                        (1, "resolve_parameters", "transitioned", "running"),
+                        (2, "validate_parameters", "transitioned", "running"),
+                        (3, "authorize_scope", "transitioned", "running"),
+                        (4, "execute_fixed_query", "transitioned", "running"),
+                        (5, "classify_result", "transitioned", "running"),
+                        (6, "persist_artifact", "transitioned", "running"),
+                        (7, "finalize", "completed", "succeeded"),
+                    ])
                     self.assertEqual(admin_conn.execute(
                         "SELECT count(*) FROM bi.query_artifacts WHERE run_id=%s", (run[0],)
                     ).fetchone()[0], 1)

@@ -304,6 +304,13 @@ class RuntimeDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
             (
                 "INSERT INTO bi.query_run_events "
                 "(run_id, revision, node, event_type, status) "
+                "VALUES (%s, 0, 'received', 'entered', 'running')",
+                (run_id,),
+                psycopg.errors.CheckViolation,
+            ),
+            (
+                "INSERT INTO bi.query_run_events "
+                "(run_id, revision, node, event_type, status) "
                 "VALUES (%s, 2, 'received', 'unknown', 'running')",
                 (run_id,),
                 psycopg.errors.CheckViolation,
