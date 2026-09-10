@@ -124,10 +124,10 @@ class PostgresQueryRunStore:
                     Jsonb(artifact.coverage),
                 ),
             )
-        except errors.ForeignKeyViolation as error:
-            raise RunNotFound() from error
-        except errors.Error as error:
-            raise ArtifactPersistenceError() from error
+        except errors.ForeignKeyViolation:
+            raise RunNotFound() from None
+        except errors.Error:
+            raise ArtifactPersistenceError() from None
         return ArtifactRef(id=artifact_id, type=artifact.artifact_type)
 
     def finish(self, run_id: UUID, completion: RunCompletion) -> None:

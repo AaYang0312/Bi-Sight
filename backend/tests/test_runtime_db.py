@@ -6,6 +6,7 @@ as ``test_db.py`` prevent this module from connecting to a production host.
 """
 
 import os
+import traceback
 import unittest
 from pathlib import Path
 from uuid import uuid4
@@ -95,9 +96,11 @@ class RuntimeStoreValidationTests(unittest.TestCase):
             PostgresQueryRunStore(None, forbidden_values=set())
 
     def test_artifact_foreign_key_failure_is_a_safe_missing_run_error(self):
+        marker = "repository-secret-marker"
+
         class MissingRunConnection:
             def execute(self, _statement, _parameters):
-                raise psycopg.errors.ForeignKeyViolation("password=supersecret")
+                raise psycopg.errors.ForeignKeyViolation(marker)
 
         store = PostgresQueryRunStore(MissingRunConnection(), forbidden_values={"S1"})
 
@@ -105,12 +108,16 @@ class RuntimeStoreValidationTests(unittest.TestCase):
             store.save_artifact(uuid4(), NewArtifact(payload={"status": "ok"}))
 
         self.assertEqual(str(context.exception), "run_not_found")
-        self.assertNotIn("password=supersecret", str(context.exception))
+        self.assertIsNone(context.exception.__cause__)
+        self.assertTrue(context.exception.__suppress_context__)
+        self.assertNotIn(marker, "".join(traceback.format_exception(context.exception)))
 
     def test_artifact_database_failure_is_sanitized(self):
+        marker = "repository-secret-marker"
+
         class FailingArtifactConnection:
             def execute(self, _statement, _parameters):
-                raise psycopg.errors.SyntaxError("password=supersecret")
+                raise psycopg.errors.SyntaxError(marker)
 
         store = PostgresQueryRunStore(FailingArtifactConnection(), forbidden_values={"S1"})
 
@@ -118,7 +125,9 @@ class RuntimeStoreValidationTests(unittest.TestCase):
             store.save_artifact(uuid4(), NewArtifact(payload={"status": "ok"}))
 
         self.assertEqual(str(context.exception), "artifact_persistence_error")
-        self.assertNotIn("password=supersecret", str(context.exception))
+        self.assertIsNone(context.exception.__cause__)
+        self.assertTrue(context.exception.__suppress_context__)
+        self.assertNotIn(marker, "".join(traceback.format_exception(context.exception)))
 
 
 class RuntimeDatabaseFixture:
