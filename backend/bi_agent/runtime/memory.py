@@ -207,10 +207,11 @@ class MemoryQueryRunStore:
 
     @staticmethod
     def _revalidate_transition(transition: RunTransition) -> RunTransition:
-        transition_normalized_request(transition)
         try:
             return RunTransition.model_validate(transition.model_dump(warnings=False))
         except ValidationError as error:
+            if "normalized_request_mismatch" in str(error):
+                raise ValueError("normalized_request_mismatch") from error
             raise ValueError("unsafe_persistence_payload") from error
 
     @staticmethod

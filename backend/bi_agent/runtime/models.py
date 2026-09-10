@@ -536,13 +536,18 @@ def transition_normalized_request(
     transition: RunTransition,
 ) -> dict[str, object] | None:
     """Return the state-owned normalized request or reject divergent copies."""
-    if transition.normalized_request is None:
-        return None
+    if not isinstance(transition.state, dict):
+        raise ValueError("unsafe_persistence_payload")
     state_normalized_request = transition.state.get("normalized_request")
-    if state_normalized_request != transition.normalized_request:
+    if (
+        transition.normalized_request is not None
+        and state_normalized_request != transition.normalized_request
+    ):
         raise ValueError("normalized_request_mismatch")
+    if state_normalized_request is None:
+        return None
     if not isinstance(state_normalized_request, dict):
-        raise ValueError("normalized_request_mismatch")
+        raise ValueError("unsafe_persistence_payload")
     return state_normalized_request
 
 

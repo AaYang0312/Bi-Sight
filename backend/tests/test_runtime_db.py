@@ -8,6 +8,7 @@ as ``test_db.py`` prevent this module from connecting to a production host.
 import os
 import traceback
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from uuid import uuid4
 
@@ -103,6 +104,58 @@ class RuntimeStoreValidationTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "^normalized_request_mismatch$"):
+            self.store.transition(uuid4(), transition)
+
+    def test_transition_derives_top_level_normalized_request_from_state_without_io(self):
+        normalized_request = {"shop_aliases": ["shop_2"]}
+        transition = RunTransition(
+            expected_revision=0,
+            node="resolve_parameters",
+            status=RunStatus.RUNNING,
+            state={
+                "node": "resolve_parameters",
+                "revision": 1,
+                "normalized_request": normalized_request,
+            },
+        )
+
+        class Cursor:
+            def fetchone(self):
+                return (1,)
+
+        class CapturingConnection:
+            def __init__(self):
+                self.calls = []
+
+            def transaction(self):
+                return nullcontext()
+
+            def execute(self, statement, parameters):
+                self.calls.append((statement, parameters))
+                return Cursor()
+
+        conn = CapturingConnection()
+        store = PostgresQueryRunStore(conn, forbidden_values={"S1", "ERP-P-9"})
+
+        store.transition(uuid4(), transition)
+
+        update_parameters = conn.calls[0][1]
+        self.assertEqual(update_parameters[2].obj, normalized_request)
+        self.assertEqual(update_parameters[3].obj["normalized_request"], normalized_request)
+
+    def test_transition_revalidates_malformed_constructed_state_before_database_access(self):
+        transition = RunTransition.model_construct(
+            expected_revision=0,
+            node="resolve_parameters",
+            event_type=RunEventType.TRANSITIONED,
+            status=RunStatus.RUNNING,
+            state=[],
+            normalized_request={},
+            payload={},
+            error_code=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
             self.store.transition(uuid4(), transition)
 
     def test_save_artifact_revalidates_constructed_command_before_database_access(self):

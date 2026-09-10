@@ -152,14 +152,6 @@ def _persist_transition(
     """Persist one completed node and mirror the Store revision in memory."""
     previous = runtime.state
     persisted = previous.model_copy(update={"revision": previous.revision + 1})
-    normalized_request = (
-        persisted.normalized_request
-        if persisted.node in {
-            BusinessQueryNode.RESOLVE_PARAMETERS,
-            BusinessQueryNode.VALIDATE_PARAMETERS,
-        }
-        else None
-    )
     store.transition(  # type: ignore[attr-defined]
         persisted.run_id,
         RunTransition(
@@ -167,7 +159,6 @@ def _persist_transition(
             node=persisted.node.value,
             status=persisted.status,
             state=persisted.model_dump(mode="json"),
-            normalized_request=normalized_request,
             payload=payload,
             error_code=persisted.error.code if persisted.error else None,
         ),

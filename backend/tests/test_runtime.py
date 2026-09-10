@@ -287,6 +287,28 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
             self.store.runs[run_id]["state"]["normalized_request"],
         )
 
+    def test_transition_derives_normalized_request_from_state_when_assertion_is_omitted(self):
+        run_id = self.store.create_run(self.record)
+        normalized_request = {"shop_aliases": ["shop_2"]}
+        transition = RunTransition(
+            expected_revision=0,
+            node="resolve_parameters",
+            status=RunStatus.RUNNING,
+            state={
+                "node": "resolve_parameters",
+                "revision": 1,
+                "normalized_request": normalized_request,
+            },
+        )
+
+        self.store.transition(run_id, transition)
+
+        self.assertEqual(self.store.runs[run_id]["normalized_request"], normalized_request)
+        self.assertEqual(
+            self.store.runs[run_id]["normalized_request"],
+            self.store.runs[run_id]["state"]["normalized_request"],
+        )
+
     def test_transition_rejects_real_identifiers_in_the_normalized_request(self):
         with self.assertRaisesRegex(ValidationError, "unsafe_persistence_payload"):
             RunTransition(
@@ -294,7 +316,11 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
                 node="resolve_parameters",
                 status=RunStatus.RUNNING,
                 normalized_request={"shop_aliases": ["S1"]},
-                state={"node": "resolve_parameters", "revision": 1},
+                state={
+                    "node": "resolve_parameters",
+                    "revision": 1,
+                    "normalized_request": {"shop_aliases": ["S1"]},
+                },
             )
 
     def test_transition_rejects_mismatched_normalized_request_without_mutation(self):
