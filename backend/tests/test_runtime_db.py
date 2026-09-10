@@ -281,9 +281,37 @@ class RuntimeDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
                 psycopg.errors.CheckViolation,
             ),
             (
+                "INSERT INTO bi.query_runs "
+                "(id, chat_id, user_message_id, subject_id, tool_call_id, domain, attempt_no) "
+                "VALUES (%s, %s, %s, 'u1', 'call_2', 'other_domain', 2)",
+                (uuid4(), chat_id, message_id),
+                psycopg.errors.CheckViolation,
+            ),
+            (
+                "INSERT INTO bi.query_runs "
+                "(id, chat_id, user_message_id, subject_id, tool_call_id, status, attempt_no) "
+                "VALUES (%s, %s, %s, 'u1', 'call_2', 'unknown', 2)",
+                (uuid4(), chat_id, message_id),
+                psycopg.errors.CheckViolation,
+            ),
+            (
+                "INSERT INTO bi.query_runs "
+                "(id, chat_id, user_message_id, subject_id, tool_call_id, revision, attempt_no) "
+                "VALUES (%s, %s, %s, 'u1', 'call_2', -1, 2)",
+                (uuid4(), chat_id, message_id),
+                psycopg.errors.CheckViolation,
+            ),
+            (
                 "INSERT INTO bi.query_run_events "
                 "(run_id, revision, node, event_type, status) "
                 "VALUES (%s, 2, 'received', 'unknown', 'running')",
+                (run_id,),
+                psycopg.errors.CheckViolation,
+            ),
+            (
+                "INSERT INTO bi.query_run_events "
+                "(run_id, revision, node, event_type, status) "
+                "VALUES (%s, 2, 'received', 'entered', 'unknown')",
                 (run_id,),
                 psycopg.errors.CheckViolation,
             ),
@@ -297,6 +325,15 @@ class RuntimeDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
             with self.subTest(statement=statement), self.assertRaises(error):
                 with self.conn.transaction():
                     self.conn.execute(statement, parameters)
+
+        with self.assertRaises(psycopg.errors.UniqueViolation):
+            with self.conn.transaction():
+                self.conn.execute(
+                    "INSERT INTO bi.query_runs "
+                    "(id, chat_id, user_message_id, subject_id, tool_call_id, attempt_no) "
+                    "VALUES (%s, %s, %s, 'u1', 'call_duplicate', 1)",
+                    (uuid4(), chat_id, message_id),
+                )
 
         self.conn.execute("DELETE FROM bi.app_chats WHERE id=%s", (chat_id,))
 

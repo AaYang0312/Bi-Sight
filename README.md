@@ -34,13 +34,16 @@ npm run dev -- --host 127.0.0.1
 
 访问 `http://127.0.0.1:5175`。Vite 会将 `/api` 转发到 `127.0.0.1:8001`，因此 `.env.app` 的 `APP_PUBLIC_ORIGIN` 必须为 `http://127.0.0.1:5175`。
 
-数据库管理员首次执行：
+数据库管理员必须在生产库和独立测试库中分别、按以下顺序执行迁移（测试库同样不能跳过运行追踪迁移）：
 
 ```powershell
 psql -d bi_agent -f backend/sql/001_init.sql
+psql -d bi_agent -f backend/sql/002_kuaimai_mapping_repair.sql
+psql -d bi_agent -f backend/sql/003_kuaimai_metric_semantics.sql
+psql -d bi_agent -f backend/sql/004_query_runtime.sql
 ```
 
-它创建 `bi_sync`、报表只读身份 `bi_reader` 与 API 身份 `bi_app`。API 使用 `bi_app`，只能读取 `reporting` 视图和读写聊天表。
+它创建 `bi_sync`、报表只读身份 `bi_reader` 与 API 身份 `bi_app`，并建立可审计的查询运行记录。API 使用 `bi_app`，只能读取 `reporting` 视图和读写聊天与查询运行表。
 
 ## 数据同步
 

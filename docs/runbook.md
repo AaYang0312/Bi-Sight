@@ -16,10 +16,13 @@
 
 ## 本地开发
 
-先由管理员初始化本地数据库：
+先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行 `001 → 002 → 003 → 004`，不可跳过运行追踪迁移：
 
 ```powershell
 psql -d bi_agent -f backend/sql/001_init.sql
+psql -d bi_agent -f backend/sql/002_kuaimai_mapping_repair.sql
+psql -d bi_agent -f backend/sql/003_kuaimai_metric_semantics.sql
+psql -d bi_agent -f backend/sql/004_query_runtime.sql
 ```
 
 分别启动后端和前端：
@@ -48,6 +51,7 @@ Vite 将 `/api` 代理到 `http://127.0.0.1:8001`。开发页必须通过 `http:
 Set-Location backend
 psql -d bi_agent -f sql/002_kuaimai_mapping_repair.sql
 psql -d bi_agent -f sql/003_kuaimai_metric_semantics.sql
+psql -d bi_agent -f sql/004_query_runtime.sql
 uv run --env-file ../.env.sync python -m bi_agent.sync shops
 uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity orders --start <保留历史起日> --end <截止日的下一日>
 uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity aftersales_occurrence --start <保留历史起日> --end <截止日的下一日>
@@ -99,6 +103,33 @@ npm run build
 ```
 
 模型、数据库或工具失败时，消息 SSE 返回 `error` 后再返回 `done`；它不会包含调用栈、DSN、请求体或 ERP 标识。会话仅保存用户可见文本和脱敏的聚合附件。
+
+运行记录创建或持久化失败会阻止该次经营查询完成并返回结果，浏览器同样只会收到安全的 `error`、`done` 终态。先恢复数据库的运行记录写入能力，再由用户重新发送原问题；不要从失败的 SSE 或日志内容中复制真实店铺、商品或 ERP 标识。
+
+### 查询运行只读诊断
+
+使用受控管理员只读连接排查运行追踪。以下查询只读取运行元数据、事件顺序和 Artifact 元数据；不得查询或导出 Artifact `payload`，示例也不记录真实店铺标识。
+
+```sql
+-- 某会话最近一次经营查询
+SELECT id, status, current_node, revision, started_at, completed_at
+FROM bi.query_runs
+WHERE chat_id = '<chat-uuid>'
+ORDER BY started_at DESC
+LIMIT 1;
+
+-- 某次查询的状态变化顺序
+SELECT revision, node, event_type, status, error_code, created_at
+FROM bi.query_run_events
+WHERE run_id = '<run-uuid>'
+ORDER BY revision;
+
+-- 某次查询产出的 Artifact 元数据（刻意不读取 payload）
+SELECT id, artifact_type, data_as_of, coverage, created_at
+FROM bi.query_artifacts
+WHERE run_id = '<run-uuid>'
+ORDER BY created_at;
+```
 
 备份使用受控的 PostgreSQL 服务名，并只恢复到预建的独立库：
 
