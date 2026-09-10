@@ -8,7 +8,14 @@ from enum import StrEnum
 from typing import Annotated, Literal, Protocol
 from uuid import UUID
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 
 from bi_agent.metrics import Coverage, METRIC_DEFINITIONS
 
@@ -518,6 +525,25 @@ class RunTransition(BaseModel):
     normalized_request: NormalizedRequest | None = None
     payload: EventPayload = Field(default_factory=dict)
     error_code: ErrorCode | None = None
+
+    @model_validator(mode="after")
+    def _normalized_request_must_match_state(self) -> "RunTransition":
+        transition_normalized_request(self)
+        return self
+
+
+def transition_normalized_request(
+    transition: RunTransition,
+) -> dict[str, object] | None:
+    """Return the state-owned normalized request or reject divergent copies."""
+    if transition.normalized_request is None:
+        return None
+    state_normalized_request = transition.state.get("normalized_request")
+    if state_normalized_request != transition.normalized_request:
+        raise ValueError("normalized_request_mismatch")
+    if not isinstance(state_normalized_request, dict):
+        raise ValueError("normalized_request_mismatch")
+    return state_normalized_request
 
 
 class NewArtifact(BaseModel):

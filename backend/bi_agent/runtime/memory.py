@@ -24,6 +24,7 @@ from .models import (
     validate_event_payload,
     validate_normalized_request,
     validate_persisted_state,
+    transition_normalized_request,
 )
 
 
@@ -70,8 +71,9 @@ class MemoryQueryRunStore:
     def transition(self, run_id: UUID, transition: RunTransition) -> None:
         transition = self._revalidate_transition(transition)
         self._validate_state(transition.state)
-        if transition.normalized_request is not None:
-            self._validate_normalized_request(transition.normalized_request)
+        normalized_request = transition_normalized_request(transition)
+        if normalized_request is not None:
+            self._validate_normalized_request(normalized_request)
         self._validate_event(transition.payload)
         run = self._require_current_revision(run_id, transition.expected_revision)
         revision = transition.expected_revision + 1
@@ -84,8 +86,8 @@ class MemoryQueryRunStore:
             "error_code": transition.error_code,
             "updated_at": now,
         }
-        if transition.normalized_request is not None:
-            update["normalized_request"] = deepcopy(transition.normalized_request)
+        if normalized_request is not None:
+            update["normalized_request"] = deepcopy(normalized_request)
         run.update(update)
         self.events[run_id].append(_event(
             run_id=run_id,
@@ -205,6 +207,7 @@ class MemoryQueryRunStore:
 
     @staticmethod
     def _revalidate_transition(transition: RunTransition) -> RunTransition:
+        transition_normalized_request(transition)
         try:
             return RunTransition.model_validate(transition.model_dump(warnings=False))
         except ValidationError as error:

@@ -27,6 +27,7 @@ from .models import (
     validate_event_payload,
     validate_normalized_request,
     validate_persisted_state,
+    transition_normalized_request,
 )
 
 
@@ -76,8 +77,9 @@ class PostgresQueryRunStore:
     def transition(self, run_id: UUID, transition: RunTransition) -> None:
         transition = self._revalidate_transition(transition)
         self._validate_state(transition.state)
-        if transition.normalized_request is not None:
-            self._validate_normalized_request(transition.normalized_request)
+        normalized_request = transition_normalized_request(transition)
+        if normalized_request is not None:
+            self._validate_normalized_request(normalized_request)
         self._validate_event(transition.payload)
         with self.conn.transaction():
             row = self.conn.execute(
@@ -90,8 +92,7 @@ class PostgresQueryRunStore:
                 (
                     transition.status.value,
                     transition.node,
-                    (Jsonb(transition.normalized_request)
-                     if transition.normalized_request is not None else None),
+                    Jsonb(normalized_request) if normalized_request is not None else None,
                     Jsonb(transition.state),
                     transition.error_code,
                     run_id,
@@ -226,6 +227,7 @@ class PostgresQueryRunStore:
 
     @staticmethod
     def _revalidate_transition(transition: RunTransition) -> RunTransition:
+        transition_normalized_request(transition)
         try:
             return RunTransition.model_validate(transition.model_dump(warnings=False))
         except ValidationError as error:

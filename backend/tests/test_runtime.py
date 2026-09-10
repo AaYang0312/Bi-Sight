@@ -140,6 +140,20 @@ class RuntimeModelTests(unittest.TestCase):
                 command()
             self.assertNotIn(unsafe_value, str(context.exception))
 
+    def test_transition_rejects_normalized_request_that_diverges_from_state(self):
+        with self.assertRaisesRegex(ValidationError, "normalized_request_mismatch"):
+            RunTransition(
+                expected_revision=0,
+                node="validate_parameters",
+                status=RunStatus.RUNNING,
+                normalized_request={"shop_aliases": ["shop_2"]},
+                state={
+                    "node": "validate_parameters",
+                    "revision": 1,
+                    "normalized_request": {"shop_aliases": ["shop_1"]},
+                },
+            )
+
     def test_allowlisted_future_state_event_and_artifact_shapes_are_valid(self):
         normalized_request = {
             "shop_aliases": ["shop_1"],
@@ -282,6 +296,29 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
                 normalized_request={"shop_aliases": ["S1"]},
                 state={"node": "resolve_parameters", "revision": 1},
             )
+
+    def test_transition_rejects_mismatched_normalized_request_without_mutation(self):
+        run_id = self.store.create_run(self.record)
+        transition = RunTransition.model_construct(
+            expected_revision=0,
+            node="validate_parameters",
+            event_type=RunTransition.model_fields["event_type"].default,
+            status=RunStatus.RUNNING,
+            normalized_request={"shop_aliases": ["shop_2"]},
+            state={
+                "node": "validate_parameters",
+                "revision": 1,
+                "normalized_request": {"shop_aliases": ["shop_1"]},
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "^normalized_request_mismatch$"):
+            self.store.transition(run_id, transition)
+
+        self.assertEqual(self.store.runs[run_id]["normalized_request"], {"shop_aliases": ["shop_1"]})
+        self.assertEqual(self.store.runs[run_id]["state"], {"node": "received"})
+        self.assertEqual(self.store.runs[run_id]["revision"], 0)
+        self.assertEqual(self.store.events[run_id], [])
 
     def test_save_artifact_returns_reference_and_finish_is_terminal(self):
         run_id = self.store.create_run(self.record)

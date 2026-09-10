@@ -73,13 +73,36 @@ class RuntimeStoreValidationTests(unittest.TestCase):
             node="resolve_parameters",
             event_type=RunEventType.TRANSITIONED,
             status=RunStatus.RUNNING,
-            state={"node": "resolve_parameters", "revision": 1},
+            state={
+                "node": "resolve_parameters",
+                "revision": 1,
+                "normalized_request": {"shop_aliases": ["S1"]},
+            },
             normalized_request={"shop_aliases": ["S1"]},
             payload={},
             error_code=None,
         )
 
         with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
+            self.store.transition(uuid4(), transition)
+
+    def test_transition_rejects_mismatched_normalized_request_before_database_access(self):
+        transition = RunTransition.model_construct(
+            expected_revision=0,
+            node="validate_parameters",
+            event_type=RunEventType.TRANSITIONED,
+            status=RunStatus.RUNNING,
+            state={
+                "node": "validate_parameters",
+                "revision": 1,
+                "normalized_request": {"shop_aliases": ["shop_1"]},
+            },
+            normalized_request={"shop_aliases": ["shop_2"]},
+            payload={},
+            error_code=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "^normalized_request_mismatch$"):
             self.store.transition(uuid4(), transition)
 
     def test_save_artifact_revalidates_constructed_command_before_database_access(self):
