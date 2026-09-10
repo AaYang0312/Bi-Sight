@@ -7,9 +7,15 @@ state graph and the legacy Agent can share one projection implementation.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 from bi_agent.metrics import ToolResult
-from bi_agent.runtime.models import validate_artifact_payload, validate_model_payload
+from bi_agent.runtime.models import DomainResult, validate_artifact_payload, validate_model_payload
+
+from .state import BusinessQueryContext, BusinessQueryExecution, BusinessQueryInput
+
+if TYPE_CHECKING:
+    from bi_agent.llm import ToolCall
 
 
 _PUBLIC_RESULT_COLUMNS = {
@@ -38,6 +44,59 @@ def to_public_artifact(
     """Return the validated public artifact payload, never ERP identifiers."""
     payload = _safe_result(result, shop_aliases, model_view=False)
     return validate_artifact_payload(payload)
+
+
+def run_business_query(
+    conn: object,
+    store: object,
+    tool_input: BusinessQueryInput,
+    context: BusinessQueryContext,
+) -> DomainResult:
+    """Execute one graph-backed query and expose only its public domain result."""
+    from .graph import _execute_business_query_graph
+
+    return _execute_business_query_graph(conn, store, tool_input, context).domain_result
+
+
+def execute_business_query_tool(
+    call: "ToolCall",
+    session_state: object,
+    context: BusinessQueryContext,
+    conn: object,
+    store: object,
+) -> BusinessQueryExecution:
+    """Adapt a legacy model tool call to the deterministic query graph.
+
+    Real identifiers stay in the request-local context and the returned
+    ``session_filters``; persisted graph state only receives safe aliases.
+    """
+    from .graph import _execute_business_query_graph
+
+    aliases = getattr(session_state, "shop_aliases", {})
+    if not isinstance(aliases, dict):
+        aliases = {}
+    graph_context = BusinessQueryContext(
+        chat_id=context.chat_id,
+        user_message_id=context.user_message_id,
+        subject_id=context.subject_id,
+        question=context.question,
+        previous_filters=dict(context.previous_filters),
+        shop_aliases=dict(aliases),
+        allowed_shop_ids=context.allowed_shop_ids,
+        now=context.now,
+        deadline=context.deadline,
+        attempt_no=context.attempt_no,
+    )
+    return _execute_business_query_graph(
+        conn,
+        store,
+        BusinessQueryInput(
+            tool_call_id=call.id,
+            arguments=dict(call.arguments) if call.arguments is not None else None,
+            arguments_error=call.arguments_error,
+        ),
+        graph_context,
+    )
 
 
 def _safe_result(

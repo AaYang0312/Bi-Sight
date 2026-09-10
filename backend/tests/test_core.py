@@ -750,6 +750,13 @@ class AgentTests(unittest.TestCase):
                        coverage=Coverage(status="complete", start=date(2026, 9, 1),
                                          end=date(2026, 9, 8)))
 
+    def setUp(self):
+        from bi_agent.runtime.memory import MemoryQueryRunStore
+
+        self.run_store = MemoryQueryRunStore(
+            forbidden_values={"S1", "ERP-P-9"},
+        )
+
     def _conn(self, shops=(("S1", "店铺A"),)):
         conn = Mock()
         conn.execute.return_value.fetchall.return_value = [tuple(s) for s in shops]
@@ -770,19 +777,29 @@ class AgentTests(unittest.TestCase):
         model.complete.side_effect = [
             _reply(calls=[self._call()]),
             _reply(text="最近7天支付金额1000元")]
-        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN) as query:
+        with patch("bi_agent.business_query.nodes.metrics.query_business",
+                   return_value=self.KNOWN) as query:
             turn = answer("最近7天店铺A的支付金额", SessionState(subject="u1"),
                           model=model, conn=self._conn(),
-                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW)
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
             self.assertEqual(query.call_args.args[1].shop_ids, ["S1"])
             self.assertEqual(query.call_args.args[1].start, date(2026, 9, 1))
             self.assertEqual(turn.results[0].data, self.KNOWN.data)
+        self.assertEqual(len(self.run_store.runs), 1)
+        self.assertEqual(len(self.run_store.artifacts), 1)
         first_model_messages = model.complete.call_args_list[0].args[0]
         model_question = [message.content for message in first_model_messages
                           if message.role == "user"][-1]
         self.assertIn("shop_1", model_question)
         self.assertNotIn("S1", model_question)
         self.assertEqual(turn.text, "最近7天支付金额1000元")
+
+    def test_agent_routes_business_queries_only_through_the_graph_adapter(self):
+        import bi_agent.agent as agent
+
+        self.assertFalse(hasattr(agent, "_handle_query_business"))
+        self.assertFalse(hasattr(agent, "_run_query_business"))
 
     def test_follow_up_keeps_filters_only_dates_change(self):
         from bi_agent.agent import SessionState, answer
@@ -791,19 +808,20 @@ class AgentTests(unittest.TestCase):
         model.complete.side_effect = [
             _reply(calls=[self._call()]),
             _reply(text="最近7天支付金额1000元")]
-        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN):
+        with patch("bi_agent.business_query.nodes.metrics.query_business", return_value=self.KNOWN):
             turn1 = answer("最近7天店铺A的支付金额", SessionState(subject="u1"),
                            model=model, conn=self._conn(),
-                           allowed_shop_ids=frozenset({"S1"}), now=self.NOW)
+                           allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                           run_store=self.run_store)
         model.complete.side_effect = [
             _reply(calls=[ToolCall(id="call_2", name="query_business",
                                    arguments={"start": "2026-08-01",
                                               "end": "2026-09-01"})]),
             _reply(text="上个月支付500元")]
-        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN) as query:
+        with patch("bi_agent.business_query.nodes.metrics.query_business", return_value=self.KNOWN) as query:
             turn2 = answer("那上个月呢", turn1.state, model=model,
                            conn=self._conn(), allowed_shop_ids=frozenset({"S1"}),
-                           now=self.NOW)
+                           now=self.NOW, run_store=self.run_store)
             request = query.call_args.args[1]
             self.assertEqual(request.shop_ids, ["S1"])
             self.assertEqual(request.metrics, ["paid_amount"])
@@ -816,7 +834,8 @@ class AgentTests(unittest.TestCase):
 
         model = Mock()
         turn = answer("我店里销售额怎么样？", SessionState(subject="u1"), model=model,
-                      conn=self._conn(), allowed_shop_ids=frozenset({"S1"}), now=self.NOW)
+                      conn=self._conn(), allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                      run_store=self.run_store)
         self.assertIsNotNone(turn.clarification)
         self.assertIn("口径", turn.clarification)
         self.assertEqual(turn.results, [])
@@ -828,7 +847,8 @@ class AgentTests(unittest.TestCase):
         model = Mock()
         turn = answer("店铺A上周业绩", SessionState(subject="u1"), model=model,
                       conn=self._conn(shops=(("S1", "店铺A"), ("S3", "店铺A"))),
-                      allowed_shop_ids=frozenset({"S1", "S3"}), now=self.NOW)
+                      allowed_shop_ids=frozenset({"S1", "S3"}), now=self.NOW,
+                      run_store=self.run_store)
         self.assertIsNotNone(turn.clarification)
         self.assertIn("同名", turn.clarification)
         model.complete.assert_not_called()
@@ -842,10 +862,10 @@ class AgentTests(unittest.TestCase):
             _reply(calls=[ToolCall(id="call_1", name="run_sql",
                                    arguments={"sql": "SELECT 1"})]),
             _reply(text="只能使用两个工具")]
-        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN) as query:
+        with patch("bi_agent.business_query.nodes.metrics.query_business", return_value=self.KNOWN) as query:
             turn = answer("查点什么", SessionState(subject="u1"), model=model,
                           conn=self._conn(), allowed_shop_ids=frozenset({"S1"}),
-                          now=self.NOW)
+                          now=self.NOW, run_store=self.run_store)
             query.assert_not_called()
         self.assertEqual(turn.results, [])
         tool_messages = [m for m in turn.state.turns if m.role == "tool"]
@@ -858,23 +878,24 @@ class AgentTests(unittest.TestCase):
         model.complete.side_effect = [
             _reply(calls=[self._call(shop_ids=["shop_2"])]),
             _reply(text="好的")]
-        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN) as query:
+        with patch("bi_agent.business_query.nodes.metrics.query_business", return_value=self.KNOWN) as query:
             answer("查询一下", SessionState(subject="u1"), model=model,
-                   conn=self._conn(), allowed_shop_ids=frozenset({"S1"}), now=self.NOW)
+                   conn=self._conn(), allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                   run_store=self.run_store)
             query.assert_not_called()
 
         model = Mock()
         model.complete.side_effect = [
             _reply(calls=[self._call(shop_ids=["S1; DROP TABLE bi.orders; --"])]),
             _reply(text="好的")]
-        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN) as query:
+        with patch("bi_agent.business_query.nodes.metrics.query_business", return_value=self.KNOWN) as query:
             turn = answer("查询一下", SessionState(subject="u1"), model=model,
                           conn=self._conn(), allowed_shop_ids=frozenset({"S1"}),
-                          now=self.NOW)
+                          now=self.NOW, run_store=self.run_store)
             query.assert_not_called()
         self.assertEqual(turn.results, [])
 
-    def test_invalid_arguments_correction_only_once(self):
+    def test_corrected_query_reuses_message_id_and_advances_attempt_number(self):
         from bi_agent.agent import SessionState, answer
         from bi_agent.llm import ToolCall
 
@@ -882,15 +903,30 @@ class AgentTests(unittest.TestCase):
         model.complete.side_effect = [
             _reply(calls=[ToolCall(id="call_1", name="query_business",
                                    arguments=None, arguments_error="invalid_json")]),
-            _reply(calls=[ToolCall(id="call_2", name="query_business",
-                                   arguments=None, arguments_error="invalid_json")])]
-        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN) as query:
+            _reply(calls=[ToolCall(
+                id="call_2",
+                name="query_business",
+                arguments={
+                    "start": "2026-09-01",
+                    "end": "2026-09-08",
+                    "shop_ids": ["shop_1"],
+                    "metrics": ["paid_amount"],
+                },
+            )]),
+            _reply(text="已修正并完成查询"),
+        ]
+        with patch("bi_agent.business_query.nodes.metrics.query_business", return_value=self.KNOWN) as query:
             turn = answer("最近7天店铺A的支付金额", SessionState(subject="u1"),
                           model=model, conn=self._conn(),
-                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW)
-            query.assert_not_called()
-        self.assertIn("参数两次非法", turn.text)
-        self.assertEqual(model.complete.call_count, 2)
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
+            query.assert_called_once()
+        runs = list(self.run_store.runs.values())
+        self.assertEqual(len(runs), 2)
+        self.assertEqual({run["attempt_no"] for run in runs}, {1, 2})
+        self.assertEqual(len({run["user_message_id"] for run in runs}), 1)
+        self.assertEqual(len(turn.results), 1)
+        self.assertEqual(model.complete.call_count, 3)
 
     def test_batch_of_five_executes_four(self):
         from bi_agent.agent import SessionState, answer
@@ -903,10 +939,10 @@ class AgentTests(unittest.TestCase):
                  for i in range(1, 6)]
         model = Mock()
         model.complete.side_effect = [_reply(calls=calls)]
-        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN) as query:
+        with patch("bi_agent.business_query.nodes.metrics.query_business", return_value=self.KNOWN) as query:
             turn = answer("多查询几个", SessionState(subject="u1"), model=model,
                           conn=self._conn(), allowed_shop_ids=frozenset({"S1"}),
-                          now=self.NOW)
+                          now=self.NOW, run_store=self.run_store)
             self.assertEqual(query.call_count, 4)
         self.assertEqual(len(turn.results), 4)
         tool_messages = [m for m in turn.state.turns if m.role == "tool"]
@@ -920,10 +956,11 @@ class AgentTests(unittest.TestCase):
         model = Mock()
         model.complete.side_effect = [_reply(calls=[self._call()]),
                                       ModelError("timeout")]
-        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN):
+        with patch("bi_agent.business_query.nodes.metrics.query_business", return_value=self.KNOWN):
             turn = answer("最近7天店铺A的支付金额", SessionState(subject="u1"),
                           model=model, conn=self._conn(),
-                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW)
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
         self.assertEqual(len(turn.results), 1)
         self.assertIn("固定查询入口仍可用", turn.text)
 
@@ -933,12 +970,14 @@ class AgentTests(unittest.TestCase):
         model = Mock()
         model.complete.side_effect = [_reply(calls=[self._call()]),
                                       _reply(text="应该不会到达")]
-        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN):
+        with patch("bi_agent.business_query.nodes.metrics.query_business", return_value=self.KNOWN):
             with patch("bi_agent.agent.time_module.monotonic",
-                       side_effect=[0.0, 0.0, 100.0]):
+                       side_effect=[0.0, 0.0, 100.0]), \
+                 patch("bi_agent.business_query.nodes.monotonic", return_value=0.0):
                 turn = answer("最近7天店铺A的支付金额", SessionState(subject="u1"),
                               model=model, conn=self._conn(),
-                              allowed_shop_ids=frozenset({"S1"}), now=self.NOW)
+                              allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                              run_store=self.run_store)
         self.assertEqual(len(turn.results), 1)
         self.assertEqual(model.complete.call_count, 1)
         self.assertIn("预算已耗尽", turn.text)
@@ -950,10 +989,11 @@ class AgentTests(unittest.TestCase):
         model.complete.side_effect = [
             _reply(calls=[self._call()], reasoning="synthetic-private-context"),
             _reply(text="完成")]
-        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN):
+        with patch("bi_agent.business_query.nodes.metrics.query_business", return_value=self.KNOWN):
             turn = answer("最近7天店铺A的支付金额", SessionState(subject="u1"),
                           model=model, conn=self._conn(),
-                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW)
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
         second_call_messages = model.complete.call_args_list[1][0][0]
         assistant = [m for m in second_call_messages if m.role == "assistant"][0]
         self.assertEqual(assistant.provider_context.get("reasoning_content"),
@@ -985,10 +1025,11 @@ class AgentTests(unittest.TestCase):
 
         model = Mock()
         model.complete.side_effect = [_reply(calls=[self._call()]), _reply(text="ok")]
-        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN):
+        with patch("bi_agent.business_query.nodes.metrics.query_business", return_value=self.KNOWN):
             turn_a = answer("最近7天店铺A的支付金额", SessionState(subject="A"),
                             model=model, conn=self._conn(),
-                            allowed_shop_ids=frozenset({"S1"}), now=self.NOW)
+                            allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                            run_store=self.run_store)
         state_b = SessionState(subject="B")
         self.assertEqual(state_b.filters, {})
         self.assertNotEqual(turn_a.state.filters, {})
@@ -1001,7 +1042,8 @@ class AgentTests(unittest.TestCase):
         phone_like_text = "138" + "1234" + "5678"
         turn = answer(f"订单{phone_like_text}退款到账了吗", SessionState(subject="u1"),
                       model=model, conn=self._conn(),
-                      allowed_shop_ids=frozenset({"S1"}), now=self.NOW)
+                      allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                      run_store=self.run_store)
         self.assertIsNotNone(turn.clarification)
         model.complete.assert_not_called()
 
@@ -1034,7 +1076,8 @@ class AgentTests(unittest.TestCase):
         with patch("bi_agent.agent.evaluate_promotion", return_value=promo_result) as promo:
             turn = answer("假设10月销售额10万元、推广费用率12%，最多花多少？",
                           SessionState(subject="u1"), model=model, conn=self._conn(),
-                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW)
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
             confirmed = promo.call_args.kwargs["confirmed_inputs"]
             self.assertEqual(confirmed["sales_estimate"], Decimal("100000"))
             self.assertEqual(confirmed["target_ratio"], Decimal("0.12"))
