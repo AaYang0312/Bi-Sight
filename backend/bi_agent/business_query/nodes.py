@@ -21,6 +21,11 @@ from .state import BusinessQueryNode, BusinessQueryRuntime
 
 _GROUP_BY = frozenset({"total", "day", "shop", "product"})
 _COMPARE = frozenset({"none", "previous_period"})
+_SHOP_IDS_SOURCE = "_shop_ids_source"
+_ALIASED_SHOPS = "aliases"
+_PREVIOUS_FILTER_SHOPS = "previous_filters"
+_UNRECOGNIZED_SHOPS = "unrecognized"
+_MISSING_SHOPS = "missing"
 _VALIDATION_PROBLEMS = {
     "start": "invalid_date_range",
     "end": "invalid_date_range",
@@ -55,7 +60,8 @@ def resolve_parameters(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
     alias_reverse = {
         alias: shop_id for shop_id, alias in runtime.context.shop_aliases.items()
     }
-    shop_aliases = _resolve_shops(args, runtime, alias_reverse)
+    shop_aliases, shop_source = _resolve_shops(args, runtime, alias_reverse)
+    args[_SHOP_IDS_SOURCE] = shop_source
 
     if "start" not in args or "end" not in args:
         period = resolve_period(runtime.context.question, now=runtime.context.now)
@@ -100,7 +106,9 @@ def validate_parameters(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
         runtime.state, BusinessQueryNode.VALIDATE_PARAMETERS
     )
     try:
-        request = QueryRequest.model_validate(runtime.resolved_args)
+        arguments = dict(runtime.resolved_args)
+        arguments.pop(_SHOP_IDS_SOURCE, None)
+        request = QueryRequest.model_validate(arguments)
     except ValidationError as error:
         _finish_needs_input(
             runtime,
@@ -137,7 +145,12 @@ def authorize_scope(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
         return runtime
     runtime.state = transition_state(runtime.state, BusinessQueryNode.AUTHORIZE_SCOPE)
     request = runtime.request
-    if request is None or not set(request.shop_ids) <= runtime.context.allowed_shop_ids:
+    shop_source = runtime.resolved_args.get(_SHOP_IDS_SOURCE)
+    if (
+        request is None
+        or shop_source not in {_ALIASED_SHOPS, _PREVIOUS_FILTER_SHOPS}
+        or not set(request.shop_ids) <= runtime.context.allowed_shop_ids
+    ):
         runtime.state = runtime.state.model_copy(
             update={
                 "status": RunStatus.FAILED,
@@ -165,28 +178,39 @@ def _resolve_shops(
     args: dict[str, object],
     runtime: BusinessQueryRuntime,
     alias_reverse: dict[str, str],
-) -> list[str] | None:
+) -> tuple[list[str] | None, str]:
     raw_shops = args.get("shop_ids")
     if isinstance(raw_shops, list) and raw_shops:
-        mapped: list[str] = []
+        mapped: list[object] = []
         aliases: list[str] = []
+        all_recognized_aliases = True
         for value in raw_shops:
-            raw_shop = str(value)
-            mapped.append(alias_reverse.get(raw_shop, raw_shop))
-            aliases.append(raw_shop if raw_shop in alias_reverse else "invalid_shop")
+            if isinstance(value, str) and value in alias_reverse:
+                mapped.append(alias_reverse[value])
+                aliases.append(value)
+                continue
+            mapped.append(value)
+            aliases.append("invalid_shop")
+            all_recognized_aliases = False
         args["shop_ids"] = mapped
-        return aliases
+        return (
+            aliases,
+            _ALIASED_SHOPS if all_recognized_aliases else _UNRECOGNIZED_SHOPS,
+        )
     if not raw_shops:
         previous_shops = runtime.context.previous_filters.get("shop_ids")
         if isinstance(previous_shops, list) and previous_shops:
             resolved = [str(shop_id) for shop_id in previous_shops]
             args["shop_ids"] = resolved
-            return [
-                runtime.context.shop_aliases.get(shop_id, "invalid_shop")
-                for shop_id in resolved
-            ]
-        return None
-    return ["invalid_shop"]
+            return (
+                [
+                    runtime.context.shop_aliases.get(shop_id, "invalid_shop")
+                    for shop_id in resolved
+                ],
+                _PREVIOUS_FILTER_SHOPS,
+            )
+        return None, _MISSING_SHOPS
+    return ["invalid_shop"], _UNRECOGNIZED_SHOPS
 
 
 def _normalized_request(

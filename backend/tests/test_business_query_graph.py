@@ -324,6 +324,74 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
                 self.assertNotIn(shop_id, json.dumps(runtime.state.model_dump(mode="json")))
                 query_business.assert_not_called()
 
+    def test_model_supplied_real_shop_id_is_forbidden_without_querying(self):
+        runtime = self._runtime(
+            question="查询店铺",
+            arguments={
+                "shop_ids": ["S1"],
+                "start": "2026-09-01",
+                "end": "2026-09-02",
+                "metrics": ["paid_amount"],
+            },
+        )
+
+        with patch("bi_agent.metrics.query_business") as query_business:
+            self._run_to_authorization(runtime)
+
+        self.assertEqual(runtime.state.status, RunStatus.FAILED)
+        self.assertEqual(runtime.state.target_status, DomainStatus.FAILED)
+        self.assertEqual(runtime.state.error.code, "forbidden")  # type: ignore[union-attr]
+        self.assertEqual(runtime.state.problems, ["forbidden"])
+        self.assertEqual(
+            runtime.state.normalized_request["shop_aliases"], ["invalid_shop"]
+        )
+        self.assertNotIn("S1", json.dumps(runtime.state.model_dump(mode="json")))
+        query_business.assert_not_called()
+
+    def test_omitted_shop_ids_inherit_trusted_previous_scope(self):
+        runtime = self._runtime(
+            question="查询店铺",
+            previous_filters={
+                "shop_ids": ["S1"],
+                "start": "2026-09-01",
+                "end": "2026-09-02",
+                "metrics": ["paid_amount"],
+            },
+        )
+
+        self._run_to_authorization(runtime)
+
+        self.assertEqual(runtime.request.shop_ids, ["S1"])  # type: ignore[union-attr]
+        self.assertEqual(runtime.state.node, BusinessQueryNode.EXECUTE_FIXED_QUERY)
+        self.assertEqual(runtime.state.status, RunStatus.RUNNING)
+
+    def test_non_string_shop_members_are_invalid_parameters_without_querying(self):
+        for shop_id in (None, 7):
+            with self.subTest(shop_id=shop_id):
+                runtime = self._runtime(
+                    question="查询店铺",
+                    arguments={
+                        "shop_ids": [shop_id],
+                        "start": "2026-09-01",
+                        "end": "2026-09-02",
+                        "metrics": ["paid_amount"],
+                    },
+                )
+
+                with patch("bi_agent.metrics.query_business") as query_business:
+                    resolve_parameters(runtime)
+                    validate_parameters(runtime)
+
+                self.assertEqual(runtime.state.status, RunStatus.NEEDS_INPUT)
+                self.assertEqual(runtime.state.target_status, DomainStatus.NEEDS_INPUT)
+                self.assertEqual(runtime.state.error.code, "invalid_parameters")  # type: ignore[union-attr]
+                self.assertEqual(runtime.state.problems, ["invalid_shop"])
+                self.assertEqual(
+                    runtime.state.normalized_request["shop_aliases"], ["invalid_shop"]
+                )
+                self.assertNotIn("shop_ids", runtime.state.normalized_request)
+                query_business.assert_not_called()
+
     def test_only_authorized_runtime_reaches_execute_node(self):
         runtime = self._runtime(
             question="查询店铺",
