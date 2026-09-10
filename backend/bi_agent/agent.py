@@ -416,6 +416,35 @@ def _tool_schemas() -> list[dict[str, object]]:
     ]
 
 
+# 工具预算或模型回合上限用尽时的兜底文案：不把内部占位语当成回答。
+NO_TEXT_WITH_RESULTS = ("本轮已取得确定性查询结果（见下方数据），但没能组织成文字总结，"
+                       "请重试或换个问法。")
+NO_TEXT_WITHOUT_RESULTS = "本轮没能给出回答，请重试或换个问法。"
+
+
+def _final_text_answer(model: ChatModel, messages: list[Message],
+                       deadline: float) -> str | None:
+    """补一次不挂工具的文本回合，让模型用已拿到的确定性结果作答。
+
+    工具预算或回合上限用尽时，历史里已经附齐了工具结果：此时不再提工具，
+    只允许模型输出正文。补答失败不影响已取得的确定性结果。
+    """
+    remaining = deadline - time_module.monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        reply = model.complete(messages, [], timeout_s=remaining)
+    except Exception:  # noqa: BLE001 - 补答失败不能吞掉已取得的确定性结果
+        return None
+    text = (reply.text or "").strip()
+    if not text:
+        return None
+    if not reply.tool_calls:
+        # 只有本回合没再要求工具调用时才能入历史，否则下一回合会拿到孤立 tool_calls。
+        messages.append(reply.as_message())
+    return text
+
+
 def answer(question: str, state: SessionState, *, model: ChatModel, conn,
            allowed_shop_ids: frozenset[str], now: datetime) -> TurnResult:
     deadline = time_module.monotonic() + TOTAL_BUDGET_SECONDS
@@ -459,9 +488,9 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
     calls_used = 0
     correction_used = False
     text_answer: str | None = None
+    fallback_text: str | None = None
     last_error: str | None = None
     error_code: str | None = None
-    pending_call_ids: list[str] = []
 
     for _ in range(MAX_MODEL_TURNS):
         remaining = deadline - time_module.monotonic()
@@ -475,8 +504,11 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
             error_code = exc.code
             break
         messages.append(reply.as_message())
+        if reply.text and reply.text.strip():
+            # 正文与工具调用混发时先留下正文，兼作后续失败的兜底。
+            fallback_text = reply.text.strip()
         if not reply.tool_calls:
-            text_answer = reply.text or "（模型未返回内容）"
+            text_answer = fallback_text
             break
         stop_after_batch = False
         for call in reply.tool_calls:
@@ -542,7 +574,10 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
         if stop_after_batch:
             break
     if text_answer is None and last_error is None:
-        last_error = "未取得模型回答；已保留确定性结果"
+        # 已拿到工具结果但模型还没输出正文：补一次纯文本回合，而不是直接放弃。
+        text_answer = (_final_text_answer(model, messages, deadline)
+                       or fallback_text
+                       or (NO_TEXT_WITH_RESULTS if results else NO_TEXT_WITHOUT_RESULTS))
 
     new_state = state.model_copy(update={
         "filters": filters,

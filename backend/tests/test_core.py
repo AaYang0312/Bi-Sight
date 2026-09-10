@@ -913,6 +913,93 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(any("budget_exhausted" in (m.content or "")
                             for m in tool_messages))
 
+    def _query_call(self, call_id: str):
+        from bi_agent.llm import ToolCall
+
+        return ToolCall(id=call_id, name="query_business",
+                        arguments={"start": "2026-09-01", "end": "2026-09-08",
+                                   "shop_ids": ["shop_1"], "metrics": ["paid_amount"]})
+
+    def test_tool_budget_exhaustion_asks_model_for_final_answer(self):
+        """工具预算耗尽后必须补一次纯文本回合，不能把内部占位文案给用户。"""
+        from bi_agent.agent import SessionState, answer
+
+        calls = [self._query_call(f"call_{index}") for index in range(1, 6)]
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=calls),
+            _reply(text="四个窗口的支付金额见下方数据。"),
+        ]
+        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN):
+            turn = answer("多查询几个", SessionState(subject="u1"), model=model,
+                          conn=self._conn(), allowed_shop_ids=frozenset({"S1"}),
+                          now=self.NOW)
+        self.assertEqual(len(turn.results), 4)
+        self.assertEqual(turn.text, "四个窗口的支付金额见下方数据。")
+        self.assertIsNone(turn.error_code)
+        # 补答不得再带工具，否则模型会继续要求调用
+        self.assertEqual(model.complete.call_args_list[-1].args[1], [])
+
+    def test_model_turn_cap_asks_model_for_final_answer(self):
+        """模型回合用尽同样要补一次纯文本回合。"""
+        from bi_agent.agent import MAX_MODEL_TURNS, SessionState, answer
+        from bi_agent.llm import ToolCall
+
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[ToolCall(id=f"call_{index}", name="run_sql", arguments={})])
+            for index in range(MAX_MODEL_TURNS)
+        ] + [_reply(text="只允许两个工具，已按现有结果作答。")]
+        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN):
+            turn = answer("随便查", SessionState(subject="u1"), model=model,
+                          conn=self._conn(), allowed_shop_ids=frozenset({"S1"}),
+                          now=self.NOW)
+        self.assertEqual(model.complete.call_count, MAX_MODEL_TURNS + 1)
+        self.assertEqual(turn.text, "只允许两个工具，已按现有结果作答。")
+
+    def test_final_answer_failure_keeps_results_without_placeholder(self):
+        """补答再次失败时保留确定性结果，且不泄露内部占位文案。"""
+        from bi_agent.agent import SessionState, answer
+
+        calls = [self._query_call(f"call_{index}") for index in range(1, 6)]
+        model = Mock()
+        model.complete.side_effect = [_reply(calls=calls), _reply(text="")]
+        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN):
+            turn = answer("多查询几个", SessionState(subject="u1"), model=model,
+                          conn=self._conn(), allowed_shop_ids=frozenset({"S1"}),
+                          now=self.NOW)
+        self.assertEqual(len(turn.results), 4)
+        self.assertIsNone(turn.error_code)
+        self.assertNotIn("未取得模型回答", turn.text)
+        self.assertTrue(turn.text.strip())
+
+    def test_final_answer_call_failure_is_not_fatal(self):
+        """补答调用自身抛错也不能毁掉已取得的确定性结果。"""
+        from bi_agent.agent import SessionState, answer
+
+        calls = [self._query_call(f"call_{index}") for index in range(1, 6)]
+        model = Mock()
+        model.complete.side_effect = [_reply(calls=calls), RuntimeError("boom")]
+        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN):
+            turn = answer("多查询几个", SessionState(subject="u1"), model=model,
+                          conn=self._conn(), allowed_shop_ids=frozenset({"S1"}),
+                          now=self.NOW)
+        self.assertEqual(len(turn.results), 4)
+        self.assertNotIn("未取得模型回答", turn.text)
+
+    def test_mixed_text_and_tool_calls_text_used_as_fallback(self):
+        """模型同时给出正文和工具调用时，正文要留作兜底。"""
+        from bi_agent.agent import SessionState, answer
+
+        calls = [self._query_call(f"call_{index}") for index in range(1, 6)]
+        model = Mock()
+        model.complete.side_effect = [_reply(text="已查完四个窗口。", calls=calls)]
+        with patch("bi_agent.metrics.query_business", return_value=self.KNOWN):
+            turn = answer("多查询几个", SessionState(subject="u1"), model=model,
+                          conn=self._conn(), allowed_shop_ids=frozenset({"S1"}),
+                          now=self.NOW)
+        self.assertEqual(turn.text, "已查完四个窗口。")
+
     def test_model_error_keeps_results(self):
         from bi_agent.agent import SessionState, answer
         from bi_agent.llm import ModelError
