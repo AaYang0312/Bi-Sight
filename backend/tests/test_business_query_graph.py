@@ -2,7 +2,7 @@
 
 import unittest
 from dataclasses import is_dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -15,6 +15,13 @@ from bi_agent.business_query import (
     BusinessQueryState,
     InvalidBusinessQueryTransition,
     transition_state,
+)
+from bi_agent.metrics import Coverage
+from bi_agent.runtime.models import (
+    ArtifactRef,
+    DomainStatus,
+    ErrorEnvelope,
+    RecoveryAction,
 )
 
 
@@ -44,14 +51,88 @@ class BusinessQueryStateContractTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             BusinessQueryState(run_id=uuid4(), question="查询店铺 S1 的销售额")
 
-    def test_state_dump_revalidates_persisted_allowlist(self):
-        state = BusinessQueryState(
+    def test_constructor_rejects_raw_question_diagnostic_and_real_id(self):
+        cases = (
+            {"normalized_request": {"question": "查询店铺 S1 的销售额"}},
+            {"limitations": ["psycopg.errors.SyntaxError: relation missing"]},
+            {"normalized_request": {"shop_aliases": ["S1"]}},
+        )
+
+        for values in cases:
+            with self.subTest(values=values), self.assertRaisesRegex(
+                ValidationError, "unsafe_persistence_payload"
+            ):
+                BusinessQueryState(run_id=uuid4(), **values)
+
+    def test_assignment_rejects_unsafe_persisted_values(self):
+        state = BusinessQueryState(run_id=uuid4())
+
+        with self.assertRaisesRegex(ValidationError, "unsafe_persistence_payload"):
+            state.limitations = ["psycopg.errors.SyntaxError: relation missing"]
+
+        self.assertEqual(state.limitations, [])
+
+    def test_all_dump_paths_reject_constructed_unsafe_state(self):
+        state = BusinessQueryState.model_construct(
             run_id=uuid4(),
             normalized_request={"question": "查询店铺 S1 的销售额"},
         )
+        dump_paths = (
+            state.model_dump,
+            lambda: state.model_dump(mode="json"),
+            state.model_dump_json,
+        )
 
-        with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
-            state.model_dump(mode="json")
+        for dump in dump_paths:
+            with self.subTest(dump=dump), self.assertRaisesRegex(
+                ValueError, "^unsafe_persistence_payload$"
+            ):
+                dump()
+
+    def test_model_copy_revalidates_unsafe_update(self):
+        state = BusinessQueryState(run_id=uuid4())
+
+        with self.assertRaisesRegex(ValidationError, "unsafe_persistence_payload"):
+            state.model_copy(update={"normalized_request": {"shop_aliases": ["S1"]}})
+
+    def test_safe_future_state_shape_remains_serializable(self):
+        now = datetime.now(timezone.utc)
+        state = BusinessQueryState(
+            run_id=uuid4(),
+            node=BusinessQueryNode.CLASSIFY_RESULT,
+            normalized_request={
+                "shop_aliases": ["shop_1"],
+                "metrics": ["paid_amount"],
+                "start": "2026-09-01",
+                "end": "2026-09-08",
+                "group_by": "total",
+                "compare": "none",
+                "top_n": 10,
+                "currency": "CNY",
+            },
+            problems=["invalid_metric"],
+            tool_status="ok",
+            target_status=DomainStatus.SUCCESS,
+            coverage=Coverage(
+                status="complete",
+                start=date(2026, 9, 1),
+                end=date(2026, 9, 8),
+            ),
+            data_as_of=now,
+            limitations=["coverage_incomplete"],
+            artifact_refs=[ArtifactRef(id=uuid4(), type="metric_result")],
+            error=ErrorEnvelope(
+                code="invalid_parameters",
+                stage="validate_parameters",
+                retryable=False,
+                recovery=RecoveryAction.CORRECT_PARAMETERS,
+                public_message="查询参数无效",
+                problems=["invalid_metric"],
+            ),
+        )
+
+        self.assertEqual(state.model_dump(mode="json")["node"], "classify_result")
+        self.assertIn("classify_result", state.model_dump_json())
 
     def test_ephemeral_runtime_data_is_not_in_persisted_state(self):
         now = datetime.now(timezone.utc)

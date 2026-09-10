@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from typing import Any, Mapping
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from bi_agent.metrics import Coverage, QueryRequest, ToolResult
 from bi_agent.runtime.models import (
@@ -45,7 +46,9 @@ class BusinessQueryInput(BaseModel):
 class BusinessQueryState(BaseModel):
     """The complete allowlisted snapshot permitted to cross the Store boundary."""
 
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    model_config = ConfigDict(
+        extra="forbid", hide_input_in_errors=True, validate_assignment=True
+    )
 
     run_id: UUID
     node: BusinessQueryNode = BusinessQueryNode.RECEIVED
@@ -61,12 +64,35 @@ class BusinessQueryState(BaseModel):
     artifact_refs: list[ArtifactRef] = Field(default_factory=list)
     error: ErrorEnvelope | None = None
 
-    def model_dump(self, *args: object, **kwargs: object) -> dict[str, object]:
-        """Validate JSON snapshots with the shared persisted-state allowlist."""
-        dumped = super().model_dump(*args, **kwargs)
-        if kwargs.get("mode") == "json":
-            return validate_persisted_state(dumped)
-        return dumped
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_persisted_input(cls, value: object) -> object:
+        if isinstance(value, dict):
+            candidate = cls.model_construct(**value)
+            validate_persisted_state(BaseModel.model_dump(candidate, mode="json"))
+        return value
+
+    @model_validator(mode="after")
+    def _validate_persisted_contract(self) -> "BusinessQueryState":
+        self._validate_persisted_snapshot()
+        return self
+
+    def _validate_persisted_snapshot(self) -> dict[str, object]:
+        return validate_persisted_state(super().model_dump(mode="json"))
+
+    def model_copy(
+        self, *, update: Mapping[str, object] | None = None, deep: bool = False
+    ) -> "BusinessQueryState":
+        copied = super().model_copy(update=update, deep=deep)
+        return type(self).model_validate(copied.__dict__)
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self._validate_persisted_snapshot()
+        return super().model_dump(*args, **kwargs)
+
+    def model_dump_json(self, *args: Any, **kwargs: Any) -> str:
+        self._validate_persisted_snapshot()
+        return super().model_dump_json(*args, **kwargs)
 
 
 @dataclass
