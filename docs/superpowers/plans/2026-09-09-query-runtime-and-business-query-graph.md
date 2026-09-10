@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - 开始执行每个任务前先运行 `git status --short` 和 `git log -3 --oneline`；不得覆盖其他 Agent 或用户的未提交修改。
-- 当前基线包含 `002_kuaimai_mapping_repair.sql`；本项目新增迁移必须命名为 `backend/sql/003_query_runtime.sql`。
+- 当前基线包含 `002_kuaimai_mapping_repair.sql`；本项目新增迁移必须命名为 `backend/sql/004_query_runtime.sql`。
 - 不修改 `backend/bi_agent/sync.py`、`backend/sql/001_init.sql`、`backend/sql/002_kuaimai_mapping_repair.sql`，也不改变 `backend/bi_agent/metrics.py` 的 SQL、指标口径或覆盖语义。
 - 阶段 1 完成前不得切换生产查询路径；阶段 1 和阶段 2 分别执行完整回归并形成独立提交检查点。
 - 不引入 LangGraph、自由 SQL、Schema 检索、向量库、Redis、队列或新服务。
@@ -33,7 +33,7 @@
 | `backend/bi_agent/runtime/models.py` | 新建 | DomainResult、错误、Artifact、Store 命令模型与协议 |
 | `backend/bi_agent/runtime/memory.py` | 新建 | 单元测试使用的确定性内存 Store |
 | `backend/bi_agent/runtime/repository.py` | 新建 | PostgreSQL Store 与持久化异常 |
-| `backend/sql/003_query_runtime.sql` | 新建 | 三张运行表、约束、索引和 `bi_app` 最小权限 |
+| `backend/sql/004_query_runtime.sql` | 新建 | 三张运行表、约束、索引和 `bi_app` 最小权限 |
 | `backend/bi_agent/business_query/__init__.py` | 新建 | 导出经营查询 Tool 入口 |
 | `backend/bi_agent/business_query/state.py` | 新建 | 查询节点、持久化状态与仅内存 Context/Runtime |
 | `backend/bi_agent/business_query/graph.py` | 新建 | 合法状态转移和固定调度 |
@@ -218,7 +218,7 @@ Expected: PASS。
 ```python
 class MemoryQueryRunStoreTests(unittest.TestCase):
     def setUp(self):
-        self.store = MemoryQueryRunStore()
+        self.store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
         self.record = NewQueryRun(
             chat_id=uuid4(), user_message_id=uuid4(), subject_id="u1",
             tool_call_id="call_1", attempt_no=1,
@@ -278,7 +278,7 @@ git commit -m "feat: add query runtime contracts"
 ### Task 2: 查询运行数据库迁移
 
 **Files:**
-- Create: `backend/sql/003_query_runtime.sql`
+- Create: `backend/sql/004_query_runtime.sql`
 - Create: `backend/tests/test_runtime_db.py`
 
 **Interfaces:**
@@ -330,16 +330,16 @@ def test_app_role_can_manage_runtime_but_not_business_facts(self):
             self.conn.execute("INSERT INTO bi.shops(shop_id) VALUES ('forbidden')")
 ```
 
-另加一个测试读取 `003_query_runtime.sql` 并在管理员事务中执行两次，确认无 duplicate object 错误。
+另加一个测试读取 `004_query_runtime.sql` 并在管理员事务中执行两次，确认无 duplicate object 错误。
 
 - [ ] **Step 2: 运行数据库测试并确认因运行表不存在而失败。**
 
 Run from `backend/`: `uv run --env-file ../.env.test python -m unittest tests.test_runtime_db -v`
-Expected: FAIL with `UndefinedTable` when `003_query_runtime.sql` 尚未应用。
+Expected: FAIL with `UndefinedTable` when `004_query_runtime.sql` 尚未应用。
 
 - [ ] **Step 3: 创建幂等迁移。**
 
-`003_query_runtime.sql` 必须使用 `CREATE TABLE IF NOT EXISTS` 和 `CREATE INDEX IF NOT EXISTS`，并包含以下约束：
+`004_query_runtime.sql` 必须使用 `CREATE TABLE IF NOT EXISTS` 和 `CREATE INDEX IF NOT EXISTS`，并包含以下约束：
 
 ```sql
 CREATE TABLE IF NOT EXISTS bi.query_runs (
@@ -403,7 +403,7 @@ GRANT SELECT, INSERT ON bi.query_run_events, bi.query_artifacts TO bi_app;
 Run from repository root:
 
 ```bash
-psql "$BI_TEST_ADMIN_DSN" -v ON_ERROR_STOP=1 -f backend/sql/003_query_runtime.sql
+psql "$BI_TEST_ADMIN_DSN" -v ON_ERROR_STOP=1 -f backend/sql/004_query_runtime.sql
 ```
 
 Run from `backend/`: `uv run --env-file ../.env.test python -m unittest tests.test_runtime_db -v`
@@ -412,7 +412,7 @@ Expected: PASS；无 DSN 时明确 SKIP。
 - [ ] **Step 5: 提交迁移切片。**
 
 ```bash
-git add backend/sql/003_query_runtime.sql backend/tests/test_runtime_db.py
+git add backend/sql/004_query_runtime.sql backend/tests/test_runtime_db.py
 git commit -m "feat: add query runtime persistence schema"
 ```
 
@@ -425,14 +425,14 @@ git commit -m "feat: add query runtime persistence schema"
 
 **Interfaces:**
 - Consumes: Task 1 的 `QueryRunStore` 命令模型与 `RunContextNotFound`、`RunNotFound`、`StaleRunRevision`、`ArtifactPersistenceError` 脱敏异常。
-- Produces: `PostgresQueryRunStore(conn)`。
+- Produces: `PostgresQueryRunStore(conn, *, forbidden_values: Collection[str])`；`forbidden_values` 必须非空。
 
 - [ ] **Step 1: 写 Store 创建运行时的归属验证测试。**
 
 ```python
 def test_store_creates_run_only_for_matching_user_message(self):
     chat_id, message_id = self._seed_user_message(subject="u1")
-    store = PostgresQueryRunStore(self.conn)
+    store = PostgresQueryRunStore(self.conn, forbidden_values={"S1", "ERP-P-9"})
     run_id = store.create_run(NewQueryRun(
         chat_id=chat_id, user_message_id=message_id, subject_id="u1",
         tool_call_id="call_1", attempt_no=1,
@@ -564,7 +564,7 @@ class BusinessQueryState(BaseModel):
     status: RunStatus = RunStatus.RUNNING
     revision: int = Field(default=0, ge=0)
     normalized_request: dict[str, object] = Field(default_factory=dict)
-    problems: list[str] = Field(default_factory=list)
+    problems: list[ProblemCode] = Field(default_factory=list)
     tool_status: str | None = None
     target_status: DomainStatus | None = None
     coverage: Coverage | None = None
@@ -628,7 +628,7 @@ self.assertNotIn("S1", json.dumps(runtime.state.model_dump(mode="json")))
 
 - [ ] **Step 2: 写缺店铺、Pydantic 失败和未授权测试。**
 
-分别断言：缺店铺产生 `missing_parameters/NEEDS_INPUT`；非法日期产生 `invalid_parameters/NEEDS_INPUT`；`shop_2` 或注入字符串产生 `forbidden/FAILED`。给 `metrics.query_business` 设置 Mock，并断言这三类路径都没有调用它。
+分别断言：缺店铺产生 `missing_parameters/NEEDS_INPUT`；非法日期产生 `invalid_parameters/NEEDS_INPUT`；`shop_2` 或注入字符串产生 `forbidden/FAILED`。`problems` 只保存 Task 1 允许的 `ProblemCode`，不得保存 Pydantic 原始错误文本。给 `metrics.query_business` 设置 Mock，并断言这三类路径都没有调用它。
 
 - [ ] **Step 3: 运行节点测试并确认失败。**
 
@@ -641,7 +641,7 @@ Expected: FAIL because node functions are missing。
 
 - [ ] **Step 5: 实现参数校验。**
 
-用 `QueryRequest.model_validate(runtime.resolved_args)`；成功写入 `runtime.request`。失败只保留 Pydantic 第一行的稳定问题摘要，生成：
+用 `QueryRequest.model_validate(runtime.resolved_args)`；成功写入 `runtime.request`。失败将 Pydantic 的 `loc/type` 确定性映射为 Task 1 的安全问题码：`start/end -> invalid_date_range`、`metrics -> invalid_metric`、`group_by -> invalid_group_by`、`compare -> invalid_compare`、`top_n -> invalid_top_n`、`shop_ids -> invalid_shop`，其余为 `invalid_parameters`。不得持久化 Pydantic 原始错误文本。生成：
 
 ```python
 ErrorEnvelope(
@@ -650,7 +650,7 @@ ErrorEnvelope(
     retryable=False,
     recovery=RecoveryAction.CORRECT_PARAMETERS,
     public_message="查询参数无效，请调整后重试。",
-    problems=[problem],
+    problems=[problem_code],
 )
 ```
 
@@ -684,7 +684,7 @@ git commit -m "feat: validate and authorize business queries"
 
 - [ ] **Step 1: 写完整成功节点顺序测试。**
 
-使用 `MemoryQueryRunStore` 和已知 `ToolResult(status="ok", data=[{"paid_amount":"1000"}], coverage=complete)`；patch `bi_agent.metrics.query_business`。断言调用一次、事件 node 顺序与设计一致、运行终态为 `succeeded`、Artifact 数为 1。
+使用 `MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})` 和已知 `ToolResult(status="ok", data=[{"paid_amount":"1000"}], coverage=complete)`；patch `bi_agent.metrics.query_business`。断言调用一次、事件 node 顺序与设计一致、运行终态为 `succeeded`、Artifact 数为 1。
 
 - [ ] **Step 2: 写 `missing_data`、真实零、partial 和查询失败分类测试。**
 
@@ -721,7 +721,7 @@ Expected: FAIL because execution and graph runner are incomplete。
 
 - [ ] **Step 5: 实现执行与分类节点。**
 
-`execute_fixed_query` 在 deadline 已耗尽时不调用指标函数，构造 `deadline_exceeded`。否则调用现有指标函数一次。`classify_result` 使用固定映射：`ok+complete -> SUCCESS`、`missing_data -> MISSING_DATA`、`invalid_parameters -> NEEDS_INPUT`、`forbidden/unavailable -> FAILED`；保留 coverage、data_as_of 和 limitations。
+`execute_fixed_query` 在 deadline 已耗尽时不调用指标函数，构造 `deadline_exceeded`。否则调用现有指标函数一次。`classify_result` 使用固定映射：`ok+complete -> SUCCESS`、`missing_data -> MISSING_DATA`、`invalid_parameters -> NEEDS_INPUT`、`forbidden/unavailable -> FAILED`；保留 coverage 和 data_as_of。原始 `ToolResult.limitations` 只进入 Task 1 验证过的公共 Artifact；持久化 State 只保存确定性映射后的 limitation codes，未知文本不得写入 State/Event。
 
 - [ ] **Step 6: 实现安全投影、Artifact 和终结节点。**
 
@@ -759,7 +759,7 @@ git commit -m "feat: execute fixed queries through state graph"
 
 - [ ] **Step 1: 把现有 Agent 查询回归改为注入内存 Store。**
 
-在 `AgentTests.setUp()` 创建 `MemoryQueryRunStore`，现有 `answer()` 调用传入 `run_store=self.run_store`。新增断言：一次成功查询产生一条 run 和一个 Artifact；非法参数修正产生两条相同 `user_message_id`、attempt_no 为 1/2 的运行。
+在 `AgentTests.setUp()` 创建 `MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})`，现有 `answer()` 调用传入 `run_store=self.run_store`。新增断言：一次成功查询产生一条 run 和一个 Artifact；非法参数修正产生两条相同 `user_message_id`、attempt_no 为 1/2 的运行。
 
 - [ ] **Step 2: 新增 Agent 不直接执行指标查询的边界测试。**
 
@@ -778,7 +778,7 @@ Expected: 新增运行审计断言 FAIL。
 
 删除 `_handle_query_business()`、`_run_query_business()` 和 `_resolved_shops()`。先按工具名分支：`query_business` 即使 `arguments_error` 非空也必须调用 Adapter 并产生运行记录；推广测算继续使用现有通用参数错误路径。经营查询的 `NEEDS_INPUT` 生成现有 correction tool message；有合法 `tool_result` 时继续追加到 `TurnResult.results`；工具消息内容直接使用 `domain_result.model_payload`；筛选只从 `session_filters` 更新。
 
-直接调用 `answer()` 且未提供 Store 时，建立一个 `MemoryQueryRunStore` 和本轮固定的 synthetic `chat_id/user_message_id`，保证单元测试和离线验收仍经过状态图，但不要求数据库会话记录。生产 `run_chat_turn()` 必须显式提供 PostgreSQL Store，不允许走此 fallback。
+直接调用 `answer()` 且未提供 Store 时，以 `allowed_shop_ids` 作为 deny set 建立一个 `MemoryQueryRunStore(forbidden_values=allowed_shop_ids)` 和本轮固定的 synthetic `chat_id/user_message_id`，保证单元测试和离线验收仍经过状态图，但不要求数据库会话记录。生产 `run_chat_turn()` 必须显式提供 PostgreSQL Store，不允许走此 fallback。
 
 - [ ] **Step 6: 让生产聊天路径传递真实用户消息 ID。**
 
@@ -793,7 +793,7 @@ turn = answer(
     conn=conn,
     allowed_shop_ids=allowed_shop_ids,
     now=now,
-    run_store=PostgresQueryRunStore(conn),
+    run_store=PostgresQueryRunStore(conn, forbidden_values=allowed_shop_ids),
     turn_context=TurnContext(
         chat_id=chat_id,
         user_message_id=saved_user.id,
@@ -804,7 +804,7 @@ turn = answer(
 
 - [ ] **Step 7: 修改离线验收注入。**
 
-`tests/acceptance.py::_run_turn()` 为每个用户 turn 创建一个固定 `TurnContext` 和共享 `MemoryQueryRunStore`；Spy 改为 patch 新节点的指标调用点。验收仍从 `TurnResult.results` 检查原始 `ToolResult`，不改 20 道题的期望值。
+`tests/acceptance.py::_run_turn()` 为每个用户 turn 创建一个固定 `TurnContext` 和 `MemoryQueryRunStore(forbidden_values=allowed)`；Spy 改为 patch 新节点的指标调用点。验收仍从 `TurnResult.results` 检查原始 `ToolResult`，不改 20 道题的期望值。
 
 - [ ] **Step 8: 运行核心和离线验收测试。**
 
@@ -901,7 +901,7 @@ Run from repository root:
 ```bash
 git diff --check
 git diff --name-only HEAD
-rg -n "reasoning_content|BI_TEST_ADMIN_DSN|S1|ERP-P-9" backend/bi_agent/runtime backend/bi_agent/business_query backend/sql/003_query_runtime.sql
+rg -n "reasoning_content|BI_TEST_ADMIN_DSN|S1|ERP-P-9" backend/bi_agent/runtime backend/bi_agent/business_query backend/sql/004_query_runtime.sql
 ```
 
 Expected: `git diff --check` 无输出；修改文件均属于本计划；源代码没有硬编码凭证，测试 fixture 出现 `S1/ERP-P-9` 仅限测试文件且不会进入持久化状态。
