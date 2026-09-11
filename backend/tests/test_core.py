@@ -5,7 +5,7 @@ import hmac
 import json
 import logging
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
@@ -77,9 +77,10 @@ class KuaimaiTests(unittest.TestCase):
         expected = hmac.new(b"test-secret", b"a1b2", hashlib.sha256).hexdigest().upper()
         self.assertEqual(sign({"b": "2", "a": "1", "sign": "old"}, "test-secret"), expected)
         self.assertTrue(parse_page({"success": True, "total": 0}).verified_empty)
+        # C-6：省略 list 的接口只能读出“未核验的空”，不能当已覆盖。
         live_empty = parse_page({"success": True}, allow_omitted_list=True)
         self.assertEqual(live_empty.rows, [])
-        self.assertTrue(live_empty.verified_empty)
+        self.assertFalse(live_empty.verified_empty)
         for body in ({"success": True}, {"success": True, "total": 2},
                      {"success": False, "code": "25"}):
             with self.assertRaises(KuaimaiError):
@@ -356,6 +357,313 @@ class SyncSchemaTests(unittest.TestCase):
             assert_sync_schema(Connection([("orders", "unified_status")]))
 
 
+class SyncBackfillTests(unittest.TestCase):
+    """C-2：回填必须重新取结束时刻，否则扫描段恒空、水位建不起来。"""
+
+    T0 = datetime(2026, 9, 8, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    def _backfill(self, *, backfill_seconds: int):
+        from bi_agent import sync
+
+        class Transaction:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        class Connection:
+            def __init__(self):
+                self.statements: list[tuple[str, object]] = []
+
+            def transaction(self):
+                return Transaction()
+
+            def execute(self, sql, parameters=None):
+                self.statements.append((sql, parameters))
+
+        conn = Connection()
+        windows: list[tuple[str, str, object]] = []
+
+        def run_window(_conn, _client, **kwargs):
+            windows.append((kwargs["mode"], kwargs["entity"], kwargs["window"]))
+            return 0
+
+        t1 = self.T0 + timedelta(seconds=backfill_seconds)
+        with patch.object(sync, "_run_window", side_effect=run_window), patch.object(
+            sync, "check_cohort_window", return_value=0
+        ):
+            stats = sync._backfill_shop(conn, Mock(), shop_id="S1", days=2,
+                                        t0=self.T0, now=lambda: t1)
+        return conn, windows, stats, t1
+
+    def test_scan_segment_covers_the_whole_backfill_period(self):
+        conn, windows, stats, t1 = self._backfill(backfill_seconds=36 * 3600)
+
+        # 回填本体照旧按业务时间跑，水位扫描段覆盖 [t0, 回填结束时刻)。
+        self.assertEqual({mode for mode, _entity, _w in windows}, {"backfill", "scan"})
+        for entity in ("orders", "aftersales_occurrence"):
+            scanned = [window for mode, item, window in windows
+                       if mode == "scan" and item == entity]
+            self.assertTrue(scanned)  # 旧行为：t1==t0 使这里恒空
+            self.assertEqual(scanned[0].start, self.T0)
+            self.assertEqual(scanned[-1].end, t1)
+            for previous, following in zip(scanned, scanned[1:]):
+                self.assertEqual(previous.end, following.start)
+        backfilled = [window for mode, entity, window in windows
+                      if mode == "backfill" and entity == "orders"]
+        self.assertEqual(backfilled[0].start, self.T0 - timedelta(days=2))
+        self.assertEqual(backfilled[-1].end, self.T0)
+        # data_as_of 公布的是回填结束时刻，不是开工瞬间。
+        published = [parameters[0] for sql, parameters in conn.statements
+                     if "SET data_as_of" in sql]
+        self.assertEqual(published, [t1] * 3)
+        self.assertGreater(t1, self.T0)
+        self.assertEqual(stats["cohort_windows"], 2)
+
+    def test_frozen_clock_still_advances_a_scan_window(self):
+        """时钟不动或回拨时，也要留下能建立水位的扫描窗口。"""
+        from bi_agent.sync import SYNC_OVERLAP
+
+        _conn, windows, _stats, _t1 = self._backfill(backfill_seconds=0)
+
+        scanned = [window for mode, _entity, window in windows if mode == "scan"]
+        self.assertTrue(scanned)
+        self.assertEqual(scanned[-1].end, self.T0 + SYNC_OVERLAP)
+
+    def test_backfill_entrypoint_no_longer_pins_t1_to_t0(self):
+        """main() 不能再把 t1 当参数传进去（C-2 的错源）。"""
+        import inspect
+
+        from bi_agent.sync import _backfill_shop
+
+        parameters = inspect.signature(_backfill_shop).parameters
+        self.assertNotIn("t1", parameters)
+        self.assertIn("now", parameters)
+
+
+class PageCompletionEvidenceTests(unittest.TestCase):
+    """C-6：“没拿到 list”不等于“确定没有记录”；covered 只能由正向完成证据支撑。"""
+
+    TZ = ZoneInfo("Asia/Shanghai")
+
+    def test_missing_list_without_evidence_is_untrusted_even_when_allowed(self):
+        from bi_agent.kuaimai import parse_page
+
+        page = parse_page({"success": True}, allow_omitted_list=True)
+
+        self.assertEqual(page.rows, [])
+        self.assertFalse(page.verified_empty)
+
+    def test_missing_list_without_the_allowance_is_unknown_empty(self):
+        from bi_agent.kuaimai import KuaimaiError, parse_page
+
+        for body in ({"success": True}, {"success": True, "cursor": "c1"}):
+            with self.subTest(body=body):
+                with self.assertRaises(KuaimaiError) as ctx:
+                    parse_page(body)
+                self.assertEqual(ctx.exception.code, "unknown_empty")
+
+    def test_gateway_error_envelope_is_not_an_empty_page(self):
+        """网关错误页（无 success、无 list）必须报错，而不是发布成空窗口。"""
+        from bi_agent.kuaimai import KuaimaiError, parse_page
+
+        with self.assertRaises(KuaimaiError) as ctx:
+            parse_page({"error_code": "15", "error_msg": "Remote service error",
+                        "request_id": "abc"})
+        self.assertEqual(ctx.exception.code, "unknown_empty")
+
+    def test_nonzero_total_without_list_is_invalid(self):
+        from bi_agent.kuaimai import KuaimaiError, parse_page
+
+        with self.assertRaises(KuaimaiError) as ctx:
+            parse_page({"success": True, "total": 3})
+        self.assertEqual(ctx.exception.code, "invalid_response")
+
+    def test_positive_evidence_makes_the_empty_page_verified(self):
+        from bi_agent.kuaimai import parse_page
+
+        for body in ({"success": True, "total": 0},
+                     {"success": True, "total": 0, "list": []},
+                     {"success": True, "hasNext": False},
+                     {"success": True, "hasNext": False, "list": []}):
+            with self.subTest(body=body):
+                self.assertTrue(parse_page(body).verified_empty)
+
+    def test_string_total_zero_is_not_completion_evidence(self):
+        from bi_agent.kuaimai import KuaimaiError, parse_page
+
+        with self.assertRaises(KuaimaiError):
+            parse_page({"success": True, "total": "0"})
+
+    def test_no_sync_call_site_opens_the_allowance(self):
+        """同步链在用的三个接口都实测返回 list → 不得再传 allow_omitted_list=True。"""
+        import inspect
+
+        from bi_agent import sync
+
+        source = inspect.getsource(sync)
+
+        self.assertIn("C-6", source)
+        self.assertNotIn("allow_omitted_list=True", source)
+
+    class _Connection:
+        def __init__(self):
+            self.statements: list[str] = []
+
+        def transaction(self):
+            return _NullTransaction()
+
+        def execute(self, sql, parameters=None):
+            self.statements.append(" ".join(sql.split()))
+            return _FakeResult([])
+
+    def _sync_window(self, conn, payload: dict) -> int:
+        from bi_agent import sync
+
+        class Client:
+            def call(self, method, params):
+                return dict(payload)
+
+        window = sync.Window(datetime(2026, 9, 5, tzinfo=self.TZ),
+                             datetime(2026, 9, 6, tzinfo=self.TZ))
+        return sync.sync_window(conn, Client(), entity="orders", shop_id="S1",
+                                window=window, mode="backfill")
+
+    @staticmethod
+    def _covered(conn) -> bool:
+        return any("covered = covered +" in sql for sql in conn.statements)
+
+    def test_window_without_list_and_without_evidence_is_not_covered(self):
+        from bi_agent.kuaimai import KuaimaiError
+
+        conn = self._Connection()
+        with self.assertRaises(KuaimaiError) as ctx:
+            self._sync_window(conn, {"success": True})
+
+        self.assertEqual(ctx.exception.code, "unknown_empty")
+        self.assertFalse(self._covered(conn))
+
+    def test_total_zero_window_is_covered(self):
+        conn = self._Connection()
+        accepted = self._sync_window(conn, {"success": True, "total": 0})
+
+        self.assertEqual(accepted, 0)
+        self.assertTrue(self._covered(conn))
+
+    def test_has_next_false_window_is_covered(self):
+        conn = self._Connection()
+        self._sync_window(conn, {"success": True, "list": [], "hasNext": False})
+
+        self.assertTrue(self._covered(conn))
+
+
+class PaymentStubConnection:
+    """rebuild_payments / _determine_payment 的最小连接替身。
+
+    故意把拆合单的行级交叉核对造干“行缺失/行额为负”，验证降级守卫。
+    """
+
+    def __init__(self, *, orders, items_by_commercial=None, upsert_applies=True):
+        self.orders = [tuple(row) for row in orders]
+        self.items_by_commercial = items_by_commercial or {}
+        self.upsert_applies = upsert_applies
+        self.statements: list[tuple[str, tuple]] = []
+
+    def execute(self, sql, parameters=()):
+        text = " ".join(sql.split())
+        params = tuple(parameters)
+        self.statements.append((text, params))
+        if "INSERT INTO bi.order_payments" in text:
+            return _FakeResult([("C1",)] if self.upsert_applies else [])
+        if "FROM bi.order_items i" in text:
+            return _FakeResult(self.items_by_commercial.get(params[1], []))
+        if "FROM bi.orders" in text:
+            return _FakeResult(self.orders)
+        return _FakeResult([])
+
+
+class PaymentDowngradeGuardTests(unittest.TestCase):
+    """C-5：undetermined 重放不得把已核验支付清零。"""
+
+    TZ = ZoneInfo("Asia/Shanghai")
+    PAID_AT = datetime(2026, 9, 2, 10, 0, tzinfo=TZ)
+    UPDATED_AT = datetime(2026, 9, 2, 11, 0, tzinfo=TZ)
+    # 单ERP单跳两商业单：跳过单头捷径，走行级交叉核对
+    ORDERS = [("E1", ["C1", "C2"], PAID_AT, Decimal("100.00"), UPDATED_AT)]
+
+    def setUp(self):
+        from bi_agent.sync import GUARD_STATS
+
+        GUARD_STATS.payment_downgrade_blocked = 0
+
+    def tearDown(self):
+        from bi_agent.sync import GUARD_STATS
+
+        GUARD_STATS.payment_downgrade_blocked = 0
+
+    def test_undetermined_replay_is_blocked_and_keeps_the_verified_row(self):
+        from bi_agent import sync
+
+        # upsert_applies=False == DO UPDATE 的 WHERE 谓词为假（整条语句影响 0 行）
+        conn = PaymentStubConnection(orders=self.ORDERS, upsert_applies=False)
+        with self.assertLogs("bi_agent.sync", level="WARNING") as logs:
+            blocked = sync.rebuild_payments(conn, "S1", {"C1"})
+            self.assertTrue(any("payment downgrade blocked" in line
+                                for line in logs.output), logs.output)
+            # 告警不带订单号明文
+            self.assertFalse(any(" C1" in line for line in logs.output), logs.output)
+
+        self.assertEqual(blocked, 1)
+        self.assertEqual(sync.GUARD_STATS.payment_downgrade_blocked, 1)
+        upserts = [sql for sql, _ in conn.statements
+                   if "INSERT INTO bi.order_payments" in sql]
+        self.assertEqual(len(upserts), 1)
+        # 被拦下时不能再抹掉行级核验证据（否则下一轮重建也没依据）
+        self.assertFalse([sql for sql, _ in conn.statements
+                          if "allocation_verified = false" in sql])
+
+    def test_guard_predicate_is_part_of_the_upsert(self):
+        from bi_agent.sync import GUARD_STATS, _PAYMENT_UPSERT_SQL
+
+        guard = " ".join(_PAYMENT_UPSERT_SQL.split())
+        self.assertIn("ON CONFLICT (shop_id, commercial_id) DO UPDATE SET", guard)
+        self.assertIn("WHERE EXCLUDED.verified", guard)
+        self.assertIn("NOT bi.order_payments.verified", guard)
+        self.assertIn("EXCLUDED.source_updated_at IS NULL", guard)   # orphan 允许撤销
+        self.assertIn("EXCLUDED.source_updated_at > bi.order_payments.source_updated_at",
+                      guard)
+        self.assertIn("RETURNING", guard)
+        self.assertEqual(GUARD_STATS.payment_downgrade_blocked, 0)
+
+    def test_upsert_that_applies_still_writes_the_unverified_row(self):
+        """旧行本就未核验时不拦截：正常降级仍要写下去。"""
+        from bi_agent import sync
+
+        conn = PaymentStubConnection(orders=self.ORDERS, upsert_applies=True)
+        blocked = sync.rebuild_payments(conn, "S1", {"C1"})
+
+        self.assertEqual(blocked, 0)
+        self.assertTrue([sql for sql, _ in conn.statements
+                         if "allocation_verified = false" in sql])
+
+    def test_negative_item_allocation_never_gets_a_verified_stamp(self):
+        """行级路径缺的正是单头路径那个 >= 0 守卫。"""
+        from bi_agent.sync import _determine_payment
+
+        conn = PaymentStubConnection(
+            orders=self.ORDERS,
+            items_by_commercial={"C1": [(Decimal("-5.00"), self.PAID_AT)],
+                                 "C2": [(Decimal("105.00"), self.PAID_AT)]})
+        amount, paid_at, basis, verified, _updated = _determine_payment(
+            conn, "S1", "C1", self.ORDERS)
+
+        self.assertEqual(amount, Decimal("-5.00"))
+        self.assertIsNotNone(paid_at)
+        self.assertFalse(verified)
+        self.assertEqual(basis, "items")
+
+
 class MetricInputTests(unittest.TestCase):
     def test_date_defaults_and_bounds(self):
         from bi_agent.metrics import QueryRequest, resolve_period
@@ -421,6 +729,336 @@ def _model_settings(provider: str):
         "LLM_PROVIDER": provider, "LLM_MODEL": "demo-model",
         key: f"fake-{provider}-key",
     })
+
+
+class _FakeResult:
+    def __init__(self, rows):
+        self.rows = [tuple(row) for row in rows]
+
+    def fetchall(self):
+        return list(self.rows)
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+
+class _NullTransaction:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+
+_COVERED = ("covered",)   # 只要非空即“已覆盖”；缺口由下面的减法查询判为空
+
+
+class FakeWarehouse:
+    """reporting 视图的内存替身：按真实 SQL 的过滤/聚合/排序/LIMIT 语义回放。
+
+    只服务离线用例（验证“截断后给什么状态”这类控制流）；真实 SQL 行为在
+    tests.test_db 的一次性库里跑。
+    """
+
+    def __init__(self, *, daily_rows=(), product_rows=(), shops=(), data_as_of=None,
+                 cohort=(None, None), unmatched=0):
+        self.daily_rows = [tuple(row) for row in daily_rows]
+        self.product_rows = [tuple(row) for row in product_rows]
+        self.shops = [tuple(row) for row in shops]
+        self.data_as_of = data_as_of
+        self.cohort = tuple(cohort)
+        self.unmatched = unmatched
+        self.statements: list[tuple[str, tuple]] = []
+
+    @property
+    def info(self):
+        import psycopg
+
+        class _Info:
+            transaction_status = psycopg.pq.TransactionStatus.IDLE
+
+        return _Info()
+
+    def transaction(self):
+        return _NullTransaction()
+
+    def fetches(self, view: str) -> list[tuple[str, tuple]]:
+        return [(sql, params) for sql, params in self.statements if view in sql]
+
+    def execute(self, sql, parameters=()):
+        text = " ".join(sql.split())
+        params = tuple(parameters)
+        self.statements.append((text, params))
+        if "set_config(" in text or text.startswith("SET TRANSACTION"):
+            return _FakeResult([])
+        if "FROM reporting.v_shops" in text:
+            return _FakeResult([row for row in self.shops if row[0] in params[0]])
+        if "FROM reporting.v_coverage" in text:
+            if self.data_as_of is None:
+                return _FakeResult([])
+            return _FakeResult([(_COVERED, self.data_as_of)])
+        if "'[)')) - " in text:            # 请求范围 - 已覆盖 = 缺口；空列表即 complete
+            return _FakeResult([([],)])
+        if text.startswith("SELECT %s && tstzmultirange"):
+            return _FakeResult([True])
+        if text.startswith("SELECT count(*) FROM reporting.v_refunds"):
+            return _FakeResult([(self.unmatched,)])
+        if text.startswith("WITH cohort"):
+            return _FakeResult([self.cohort])
+        if "FROM reporting.v_product_daily" in text:
+            rows = self._select(self.product_rows, params)
+            return _FakeResult(rows[:params[-1]])
+        if "FROM reporting.v_shop_daily" in text:
+            rows = self._select(self.daily_rows, params)
+            if "SELECT DISTINCT shop_id, day" in text:
+                return _FakeResult([(len({(row[0], row[1]) for row in rows}),)])
+            if "GROUP BY shop_id" in text:      # _AGG_SQL：日行在SQL端聚合掉
+                aggregated: dict[str, list] = {}
+                for row in rows:
+                    entry = aggregated.setdefault(
+                        row[0], [Decimal(0), 0, 0, Decimal(0), Decimal(0)])
+                    entry[0] += row[2]
+                    entry[1] += row[3]
+                    entry[2] += row[4]
+                    entry[3] += row[5]
+                    entry[4] += row[6]
+                rows = [(shop_id, *values)
+                        for shop_id, values in sorted(aggregated.items())]
+            else:
+                rows = sorted(rows, key=lambda row: (row[1], row[0]))  # ORDER BY day
+            return _FakeResult(rows[:params[-1]])
+        raise AssertionError(f"未预期的SQL：{text}")
+
+    @staticmethod
+    def _select(rows, params):
+        shop_ids, start, end = params[0], params[1], params[2]
+        return [row for row in rows
+                if row[0] in shop_ids and start <= row[1] < end]
+
+
+class StepClock:
+    """每次读表推进1秒：把“第几次预算检查”变成可直接指定的整数。"""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        self.now += 1.0
+        return self.now
+
+
+class MetricBudgetTests(unittest.TestCase):
+    """C-4：时间预算耗尽不能冒充“确定没有数据”。"""
+
+    TZ = ZoneInfo("Asia/Shanghai")
+    START = date(2026, 9, 1)
+    END = date(2026, 9, 8)
+    DATA_AS_OF = datetime(2026, 9, 8, 0, 0, tzinfo=TZ)
+
+    def _warehouse(self):
+        return FakeWarehouse(
+            daily_rows=[("S1", self.START + timedelta(days=day), Decimal("100"), 1, 1,
+                         Decimal("0"), Decimal("100")) for day in range(7)],
+            product_rows=[("S1", self.START, "P1", Decimal("2"), Decimal("0"),
+                           Decimal("200"), True, "sale") for _ in range(3)],
+            shops=[("S1", True, "CNY")],
+            data_as_of=self.DATA_AS_OF,
+            cohort=(Decimal("700"), Decimal("70")),
+        )
+
+    def _query(self, *, failing_check: int | None = None, group_by: str = "total",
+               metrics=("paid_amount", "aov"), warehouse=None):
+        """预算在第 failing_check+1 次检查处耗尽（None=预算充足）。
+
+        StepClock 每次读表推 1 秒，deadline=failing_check+0.5 就恰好卡在
+        第 failing_check 次检查之后；检查顺序：1入口 → 2覆盖 → 3取行 → 4同批退款率。
+        """
+        import time as time_module
+
+        from bi_agent import metrics as metrics_module
+
+        request = metrics_module.QueryRequest(
+            start=self.START, end=self.END, shop_ids=["S1"],
+            metrics=list(metrics), group_by=group_by)
+        warehouse = self._warehouse() if warehouse is None else warehouse
+        if failing_check is None:
+            return metrics_module.query_business(
+                warehouse, request, allowed_shop_ids=frozenset({"S1"}),
+                now=self.DATA_AS_OF, deadline=time_module.monotonic() + 30)
+        with patch.object(metrics_module, "time", StepClock()):
+            return metrics_module.query_business(
+                warehouse, request, allowed_shop_ids=frozenset({"S1"}),
+                now=self.DATA_AS_OF, deadline=float(failing_check) + 0.5)
+
+    def test_generous_budget_still_returns_the_rows(self):
+        """正向控制：同一桩数据在预算充足时仍应 return ok。"""
+        result = self._query()
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(Decimal(result.data[0]["paid_amount"]), Decimal("700"))
+
+    def test_budget_exhausted_at_period_fetch_is_unavailable(self):
+        # 共 4 次检查：入口→覆盖→行数预检→取行；旧代码在第 4 次 return [] 并照发 ok
+        result = self._query(failing_check=3)
+
+        self.assertEqual(result.status, "unavailable")
+        self.assertNotEqual(result.status, "ok")
+        self.assertIn("本次查询时间预算已耗尽", result.limitations)
+        self.assertEqual(result.data, [])
+
+    def test_budget_exhausted_at_product_fetch_is_unavailable(self):
+        result = self._query(failing_check=3, group_by="product",
+                             metrics=("product_paid_amount", "quantity"))
+
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.data, [])
+        self.assertIn("本次查询时间预算已耗尽", result.limitations)
+
+    def test_budget_exhausted_at_cohort_query_is_unavailable(self):
+        # 带同批退款率时多一次检查（第 5 次），旧代码同样 return []
+        result = self._query(failing_check=4,
+                             metrics=("paid_amount", "cohort_refund_rate"))
+
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.data, [])
+
+    def test_no_budget_left_at_any_stage_never_reports_ok(self):
+        """任意一个预算检查点耗尽，都只能得到 unavailable。"""
+        for group_by, metrics in (("total", ("paid_amount", "aov")),
+                                  ("shop", ("paid_amount",)),
+                                  ("day", ("paid_amount",)),
+                                  ("total", ("paid_amount", "cohort_refund_rate")),
+                                  ("product", ("quantity",))):
+            warehouse = self._warehouse()
+            control = self._query(group_by=group_by, metrics=metrics,
+                                  warehouse=warehouse)
+            self.assertEqual(control.status, "ok", control.limitations)
+            checks = sum(1 for sql, _ in warehouse.statements
+                         if "statement_timeout" in sql)
+            self.assertGreaterEqual(checks, 3)   # 至少：入口、覆盖、取行
+            for failing_check in range(checks):
+                with self.subTest(group_by=group_by, metrics=metrics,
+                                  failing_check=failing_check):
+                    result = self._query(failing_check=failing_check,
+                                         group_by=group_by, metrics=metrics)
+                    self.assertNotEqual(result.status, "ok")
+                    self.assertEqual(result.status, "unavailable", result.limitations)
+                    self.assertEqual(result.data, [])
+                    self.assertIn("本次查询时间预算已耗尽", result.limitations)
+
+
+class MetricRowCapTests(unittest.TestCase):
+    """C-3：MAX_ROWS 截断不得压低汇总额后冒充 ok。"""
+
+    TZ = ZoneInfo("Asia/Shanghai")
+    SHOPS = ("S1", "S2", "S3")
+    START = date(2025, 9, 1)
+    DAYS = 366
+    DATA_AS_OF = datetime(2026, 9, 8, 0, 0, tzinfo=TZ)
+
+    def _warehouse(self, *, shops=SHOPS, days=DAYS, products=("P1", "P2")):
+        from datetime import date as _date
+
+        daily_rows = []
+        for offset in range(days):
+            day = _date.fromordinal(self.START.toordinal() + offset)
+            for shop_id in shops:
+                # (shop, day, paid_amount, paid_orders, erp_documents, refund, cash_diff)
+                daily_rows.append((shop_id, day, Decimal("100"), 1, 1, Decimal("0"),
+                                   Decimal("100")))
+        product_rows = []
+        for offset in range(days):
+            day = _date.fromordinal(self.START.toordinal() + offset)
+            for product_id in products:
+                product_rows.append((shops[0], day, product_id, Decimal("1"),
+                                     Decimal("0"), Decimal("100"), True, "sale"))
+        return FakeWarehouse(daily_rows=daily_rows, product_rows=product_rows,
+                            shops=[(shop_id, True, "CNY") for shop_id in shops],
+                            data_as_of=self.DATA_AS_OF)
+
+    def _query(self, warehouse, *, group_by: str, metrics, shop_ids=None):
+        import time as time_module
+
+        from bi_agent import metrics as metrics_module
+
+        if shop_ids is None:
+            shop_ids = sorted({row[0] for row in warehouse.daily_rows})
+        request = metrics_module.QueryRequest(
+            start=self.START, end=self.START + timedelta(days=self.DAYS),
+            shop_ids=list(shop_ids), metrics=list(metrics), group_by=group_by)
+        return metrics_module.query_business(
+            warehouse, request, allowed_shop_ids=frozenset(shop_ids),
+            now=self.DATA_AS_OF, deadline=time_module.monotonic() + 30)
+
+    def test_total_grouping_aggregates_in_sql_and_keeps_the_full_sum(self):
+        from bi_agent.metrics import MAX_ROWS
+
+        warehouse = self._warehouse()
+        result = self._query(warehouse, group_by="total",
+                             metrics=["paid_amount", "paid_orders", "aov"])
+
+        # 1098 个（店，日）组：旧代码只拿得到 ORDER BY day 的前 500 行，
+        # 会报出 50000 并标 status=ok；现在必须是完整的 109800。
+        self.assertEqual(result.status, "ok", result.limitations)
+        row = result.data[0]
+        self.assertEqual(Decimal(row["paid_amount"]),
+                         Decimal(100) * len(self.SHOPS) * self.DAYS)
+        self.assertNotEqual(Decimal(row["paid_amount"]), Decimal(100) * MAX_ROWS)
+        self.assertEqual(row["paid_orders"], len(self.SHOPS) * self.DAYS)
+        self.assertEqual(Decimal(row["aov"]), Decimal("100"))
+        fetches = [sql for sql, _ in warehouse.fetches("v_shop_daily")]
+        self.assertTrue(any("GROUP BY shop_id" in sql for sql in fetches))
+        self.assertFalse(any("ORDER BY day, shop_id" in sql for sql in fetches))
+
+    def test_shop_grouping_reports_every_shop_day(self):
+        warehouse = self._warehouse()
+        result = self._query(warehouse, group_by="shop", metrics=["paid_amount"])
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual([row["shop_id"] for row in result.data], list(self.SHOPS))
+        for row in result.data:
+            self.assertEqual(Decimal(row["paid_amount"]), Decimal(100) * self.DAYS)
+
+    def test_day_grouping_is_refused_before_any_truncation(self):
+        warehouse = self._warehouse()
+        result = self._query(warehouse, group_by="day", metrics=["paid_amount"])
+
+        self.assertEqual(result.status, "invalid_parameters")
+        self.assertEqual(result.data, [])
+
+    def test_truncated_product_rows_are_unavailable_not_a_fake_top_n(self):
+        """商品分组没有预检：732 行日行只能靠 LIMIT 探测拒输出数。"""
+        from datetime import date as _date
+
+        warehouse = self._warehouse(shops=("S1",), products=("P1", "P2"))
+        self.assertGreater(len(warehouse.product_rows), 500)
+        result = self._query(warehouse, group_by="product",
+                             metrics=["product_paid_amount", "quantity"])
+
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.data, [])
+        self.assertTrue(any("上限" in item for item in result.limitations),
+                        result.limitations)
+
+    def test_more_shops_than_the_cap_is_unavailable_not_a_partial_sum(self):
+        shop_ids = tuple(f"S{index}" for index in range(501))
+        warehouse = self._warehouse(shops=shop_ids, days=1)
+        result = self._query(warehouse, group_by="total", metrics=["paid_amount"],
+                            shop_ids=list(shop_ids))
+
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.data, [])
+
+    def test_fetch_probe_asks_for_one_row_beyond_the_cap(self):
+        from bi_agent.metrics import MAX_ROWS
+
+        warehouse = self._warehouse(shops=("S1",), days=3)
+        result = self._query(warehouse, group_by="total", metrics=["paid_amount"])
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        limits = [params[-1] for sql, params in warehouse.fetches("v_shop_daily")
+                  if "GROUP BY shop_id" in sql]
+        self.assertEqual(limits, [MAX_ROWS + 1])
 
 
 class ModelTests(unittest.TestCase):

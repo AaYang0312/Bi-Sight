@@ -67,6 +67,11 @@ uv run --env-file ../.env.sync python -m bi_agent.sync reconcile --days 7
 
 同步在完整分页、校验和事务提交后才推进水位。分页、权限或上游错误不会成为零业务数据；每日重核最近七天以处理晚到退款。
 
+空返回与支付核验的额外约束：
+
+- 「成功却没有结果列表」且没有 `total=0` / `hasNext=false` 正向完成证据时按**不可信空**处理：报 `unknown_empty`，整窗口不写 covered。只有实测会省略列表的接口（见 `docs/superpowers/research/2026-09-06-kuaimai-data-recheck.json`：`erp.item.history.cost.price.query`、`erp.item.sku.list.get`、`stock.api.status.query`、`erp.item.warehouse.list.get`、`erp.wave.logistics.order.query`、`erp.aftersale.refund.warehouse.query`、`purchase.order.query`）才容许把缺列表解析为「未核验的空」；同步链在用的 `erp.trade.list.query` / `erp.aftersale.list.query` / `erp.shop.list.query` 均实测返回列表，一处也不放开。
+- 已核验的支付事实不会被更旧或尚未齐平的证据静默清零。`rebuild_payments` 的降级守卫保留原事实（也不再抹掉 `order_items.allocation_verified`），拦截数记在各同步命令输出的 `payment_downgrade_blocked` 字段，日志字段 `error_code=payment_downgrade_blocked`（只带店铺与订单号摘要，不带订单号明文）。该计数持续上升说明有拆合单兄弟行未到齐，需对相应窗口执行 `replay`。
+
 部署时可注册每小时同步任务，工作目录固定为 `backend`：
 
 ```powershell

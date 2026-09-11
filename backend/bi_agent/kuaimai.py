@@ -54,30 +54,47 @@ def sign(params: Mapping[str, str], secret: str) -> str:
 
 
 def parse_page(payload: dict[str, object], *, allow_omitted_list: bool = False) -> Page:
-    """校验分页响应形状；省略列表仅能由已实测接口显式解释为空页。"""
+    """校验分页响应形状；省略列表只是接口差异，永远不构成完成证据。
+
+    verified_empty 只认正向完成证据（total=0 或 hasNext=false）。“没有 list 也没有
+    任何完成证据”是**不可信空**：网关HTML页、错误信封、字段改名都可能长成这个样子，
+    把它们当“确定没记录”发布，整窗口会被标成 covered（C-6）。
+
+    allow_omitted_list 仅给实测确实会省略 list 的接口预留（见
+    docs/superpowers/research/2026-09-06-kuaimai-data-recheck.json 中
+    erp.item.history.cost.price.query / erp.item.sku.list.get /
+    stock.api.status.query / erp.item.warehouse.list.get /
+    erp.wave.logistics.order.query / erp.aftersale.refund.warehouse.query /
+    purchase.order.query 的 unexpected_list_shape → success_no_records）；
+    它只能把空页解析成“未核验的空”，不能判为已覆盖。
+    """
     if payload.get("success") is False:
         raise KuaimaiError("upstream")
     rows = payload.get("list")
     total = payload.get("total")
+    # total 只有是整数时才可参与“总数为0”判断（字符串 "0" 不算，bool 不算 int）
+    total_count = (total if isinstance(total, int) and not isinstance(total, bool)
+                   else None)
     has_next_raw = payload.get("hasNext")
     has_next = has_next_raw if isinstance(has_next_raw, bool) else None
-    list_omitted = rows is None
+    # 正向完成证据：上游明说“总数为0”或“没有下一页了”。
+    completion_evidence = total_count == 0 or has_next is False
     if rows is None:
-        if total == 0 or (total is None and (has_next is False or allow_omitted_list)):
+        if completion_evidence:
             rows = []
+        elif allow_omitted_list:
+            rows = []          # 已实测省略 list 的接口：当作空页解析，但不算完成证据
         else:
-            raise KuaimaiError("unknown_empty" if total is None else "invalid_response")
+            raise KuaimaiError("unknown_empty" if total_count is None
+                               else "invalid_response")
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
         raise KuaimaiError("invalid_response")
     cursor_raw = payload.get("cursor")
     cursor = cursor_raw if isinstance(cursor_raw, str) else None
-    verified_empty = len(rows) == 0 and (
-        total == 0 or has_next is False
-        or (allow_omitted_list and list_omitted and total is None)
-    )
+    verified_empty = len(rows) == 0 and completion_evidence
     return Page(
         rows=rows,  # type: ignore[arg-type]
-        total=total if isinstance(total, int) else None,
+        total=total_count,
         has_next=has_next,
         cursor=cursor,
         verified_empty=verified_empty,

@@ -797,6 +797,152 @@ class DatabaseTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertFalse(beyond)
 
+    def test_backfill_establishes_watermark_so_incremental_can_start(self):
+        """C-2：backfill 结束必须留下非 epoch 水位，否则后续增量永远 SystemExit。"""
+        from bi_agent.sync import _backfill_shop, _incremental_shop
+
+        self._seed_shop()
+        t0 = datetime(2026, 9, 5, 0, 0, tzinfo=BEIJING)
+        t1 = datetime(2026, 9, 5, 6, 0, tzinfo=BEIJING)
+        client = self._client()
+
+        # 拉取本身不是本用例要验的：空页让 sync_window 只跑状态写入。
+        with patch("bi_agent.sync.fetch_window",
+                   side_effect=lambda *args, **kwargs: iter(())):
+            _backfill_shop(self.conn, client, shop_id="S1", days=1, t0=t0,
+                           now=lambda: t1)
+
+        for entity in ("orders", "aftersales_occurrence"):
+            watermark, _covered, data_as_of, error_code = self._state_row(entity)
+            self.assertGreater(watermark, datetime(1970, 1, 2, tzinfo=BEIJING))
+            self.assertEqual(watermark, t1)
+            # data_as_of 必须是回填结束时刻，不是开工瞬间。
+            self.assertEqual(data_as_of, t1)
+            self.assertIsNone(error_code)
+
+        # 关键回归：旧行为下水位停在 epoch，这里会直接 SystemExit。
+        # 必须在两个实体的断言都跑完之后再推增量：_incremental_shop 会把两条水位
+        # 一起推到 run_end，放进循环里会让第二个实体的 assertEqual(watermark, t1) 失真。
+        stats = _incremental_shop(self.conn, client, shop_id="S1",
+                                  run_end=t1 + timedelta(hours=1))
+        self.assertEqual(stats["orders"], 0)
+        self.assertEqual(self._state_row("orders")[0], t1 + timedelta(hours=1))
+
+    def test_row_cap_does_not_silently_truncate_totals(self):
+        """C-3：日行数远超 MAX_ROWS 时，真实SQL下 total/shop 仍必须是完整汇总。"""
+        import time as time_module
+        from datetime import date
+
+        from bi_agent.metrics import MAX_ROWS, QueryRequest, query_business
+
+        start = date(2025, 9, 1)
+        end = start + timedelta(days=366)          # MAX_SPAN_DAYS 上限
+        shops = ("S1", "S2", "S3")
+        start_ts = datetime(start.year, start.month, start.day, tzinfo=BEIJING)
+        end_ts = datetime(end.year, end.month, end.day, tzinfo=BEIJING)
+        groups = 366 * len(shops)
+        self.assertGreater(groups, MAX_ROWS)
+
+        for shop_id in shops:
+            self.conn.execute(
+                "INSERT INTO bi.shops(shop_id, platform, display_name) "
+                "VALUES (%s, 'fxg', %s) ON CONFLICT (shop_id) DO NOTHING",
+                (shop_id, shop_id))
+            self.conn.execute(
+                "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered, "
+                "data_as_of) VALUES ('erp.trade.list.query', 'orders', %s, %s, "
+                "tstzmultirange(tstzrange(%s, %s, '[)')), %s) "
+                "ON CONFLICT (source, entity, shop_id) DO UPDATE SET "
+                "covered = EXCLUDED.covered, data_as_of = EXCLUDED.data_as_of",
+                (shop_id, end_ts, start_ts, end_ts, end_ts))
+        self.conn.execute(
+            """
+            INSERT INTO bi.order_payments(shop_id, commercial_id, paid_at, amount,
+                                          currency, basis, verified)
+            SELECT s.shop_id,
+                   'C-' || s.shop_id || '-' || d.n,
+                   %s::timestamptz + d.n * interval '1 day' + interval '12 hours',
+                   100.00, 'CNY', 'head', true
+            FROM (VALUES ('S1'), ('S2'), ('S3')) AS s(shop_id),
+                 generate_series(0, 365) AS d(n)
+            """,
+            (start_ts,))
+
+        def run(group_by, metrics):
+            request = QueryRequest(start=start, end=end, shop_ids=list(shops),
+                                   metrics=list(metrics), group_by=group_by)
+            return query_business(self.conn, request, allowed_shop_ids=frozenset(shops),
+                                  now=end_ts, deadline=time_module.monotonic() + 30)
+
+        total = run("total", ["paid_amount", "paid_orders", "aov"])
+        self.assertEqual(total.status, "ok", total.limitations)
+        # 只拿得到前 500 个日行时会被读成 50000（且标 status=ok）。
+        self.assertEqual(Decimal(total.data[0]["paid_amount"]), Decimal(100) * groups)
+        self.assertEqual(total.data[0]["paid_orders"], groups)
+        self.assertEqual(Decimal(total.data[0]["aov"]), Decimal("100"))
+
+        by_shop = run("shop", ["paid_amount"])
+        self.assertEqual(by_shop.status, "ok", by_shop.limitations)
+        self.assertEqual([row["shop_id"] for row in by_shop.data], list(shops))
+        for row in by_shop.data:
+            self.assertEqual(Decimal(row["paid_amount"]), Decimal(100) * 366)
+
+        # 逐日分组确实超上限：宁可拒绝参数，也不给一个偏低的数。
+        day = run("day", ["paid_amount"])
+        self.assertEqual(day.status, "invalid_parameters")
+        self.assertEqual(day.data, [])
+
+    def _split_pair(self, *, sibling_upd: datetime):
+        """已核验的单头支付 + 一条行明细未到齐的兄弟拆单（undetermined 来源）。
+
+        返回 (支付时刻, 本次守卫拦截数)；计数是进程级全局量，用差值断言才不被其它用例干扰。
+        """
+        from bi_agent.sync import GUARD_STATS, apply_trade
+
+        self._seed_shop()
+        pay_time = datetime(2026, 9, 2, 10, 0, tzinfo=BEIJING)
+        first = self._trade("E3", ["C3"], "40.00", pay_time,
+                            datetime(2026, 9, 2, 11, 0, tzinfo=BEIJING), [
+                                {"oid": "E3-1", "tid": "C3", "itemSysId": "P_A",
+                                 "num": "1", "payAmount": "40.00"}])
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(self.conn, first, batch_id="guard-a"))
+        before = GUARD_STATS.payment_downgrade_blocked
+        sibling = self._trade("E4", ["C3"], "60.00", pay_time, sibling_upd, [])
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(self.conn, sibling, batch_id="guard-b"))
+        return pay_time, GUARD_STATS.payment_downgrade_blocked - before
+
+    def _payment_row(self):
+        return self.conn.execute(
+            "SELECT amount, verified, basis FROM bi.order_payments "
+            "WHERE shop_id='S1' AND commercial_id='C3'").fetchone()
+
+    def test_incomplete_sibling_cannot_wipe_a_verified_payment(self):
+        """C-5：兄弟拆单未到齐产生的 undetermined 不得清零已核验收入。"""
+        pay_time, blocked = self._split_pair(
+            sibling_upd=datetime(2026, 9, 2, 10, 30, tzinfo=BEIJING))
+
+        self.assertEqual(self._payment_row(), (Decimal("40.00"), True, "head"))
+        self.assertEqual(blocked, 1)
+        # 行级核验证据也必须保留（被拦下时不再抹掉）
+        self.assertTrue(self.conn.execute(
+            "SELECT allocation_verified FROM bi.order_items "
+            "WHERE shop_id='S1' AND erp_id='E3'").fetchone()[0])
+        # 全域收入（v_shop_daily 带 WHERE verified）没有无声消失
+        self.assertEqual(self.conn.execute(
+            "SELECT paid_amount FROM reporting.v_shop_daily "
+            "WHERE shop_id='S1' AND day = %s", (pay_time.date(),)).fetchone()[0],
+            Decimal("40.00"))
+
+    def test_strictly_fresher_undetermined_evidence_still_downgrades(self):
+        """守卫只拦“旧证据覆盖新事实”；更新的真证据仍应能推翻核验。"""
+        _pay_time, blocked = self._split_pair(
+            sibling_upd=datetime(2026, 9, 2, 12, 0, tzinfo=BEIJING))
+
+        self.assertEqual(self._payment_row(), (None, False, "undetermined"))
+        self.assertEqual(blocked, 0)
+
     def test_fetch_window_cursor_pagination_contract(self):
         """4.2：首请求不传cursor；后续传上一页cursor；hasNext=true无游标报错。"""
         from bi_agent.kuaimai import KuaimaiError

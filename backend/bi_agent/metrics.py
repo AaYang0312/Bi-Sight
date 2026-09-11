@@ -267,6 +267,23 @@ ORDER BY day, shop_id
 LIMIT %s
 """
 
+# total/shop 分组按店在SQL端聚合：一行一家店，Python 不再累加被 LIMIT 截断的日行。
+# 计数列 cast 成 bigint，保证驱动返回 int（sum(bigint) 在PG里是 numeric，
+# 而 _compute_aov 只接受 int 分母）。
+_AGG_SQL = """
+SELECT shop_id,
+       coalesce(sum(paid_amount), 0),
+       coalesce(sum(paid_orders), 0)::bigint,
+       coalesce(sum(erp_documents), 0)::bigint,
+       coalesce(sum(refund_amount), 0),
+       coalesce(sum(cash_difference), 0)
+FROM reporting.v_shop_daily
+WHERE shop_id = ANY(%s) AND day >= %s AND day < %s
+GROUP BY shop_id
+ORDER BY shop_id
+LIMIT %s
+"""
+
 _PRODUCT_SQL = """
 SELECT shop_id, day, product_id, quantity, gift_quantity, product_paid_amount,
        allocation_verified, line_kind
@@ -319,6 +336,26 @@ def _set_query_budget(conn, deadline: float) -> bool:
     conn.execute("SELECT set_config('statement_timeout', %s, true)",
                  (f"{min(5000, remaining_ms)}ms",))
     return True
+
+
+class _BudgetExhausted(Exception):
+    """取行阶段时间预算耗尽。
+
+    必须与“查询真的返回零行”区分：返回 [] 会被上层当成 status="ok" 的空结果，
+    模型就会把 0 当确定答案播报（C-4）。抛到这里，统一降级为 unavailable。
+    """
+
+
+class _RowsTruncated(Exception):
+    """命中 MAX_ROWS 上限：截断后的汇总额偏低，禁止冒充 ok（C-3）。"""
+
+
+def _fetch_capped(conn, sql: str, params: tuple) -> list[tuple]:
+    """按 MAX_ROWS+1 取行：多出来的那一行就是截断证据，而不是默默少算。"""
+    rows = conn.execute(sql, (*params, MAX_ROWS + 1)).fetchall()
+    if len(rows) > MAX_ROWS:
+        raise _RowsTruncated
+    return rows
 
 
 def _group_rows(values: dict[str, Decimal | int | None],
@@ -441,7 +478,7 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
                               metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
                               filters=filters, data_as_of=data_as_of, limitations=limitations)
 
-    # 行数预检
+    # 行数预检：只对逐日分组有意义（total/shop 在SQL端按店聚合，日行不进 Python）
     if request.group_by == "day":
         groups = conn.execute(_GROUP_COUNT_SQL,
                               (request.shop_ids, request.start, request.end)).fetchone()[0]
@@ -475,23 +512,37 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
                           filters=filters, data_as_of=data_as_of,
                           limitations=limitations + ["本次查询时间预算已耗尽"])
 
-    if request.group_by in ("total", "shop", "day"):
-        rows = _period_rows(conn, request, start_ts=start_ts, end_ts=end_ts,
-                            deadline=deadline, data_as_of=data_as_of,
-                            limitations=limitations)
-    else:
-        rows = _product_rows(conn, request, start_ts=start_ts, end_ts=end_ts, deadline=deadline)
-
-    if compare:
-        if request.group_by in ("total", "shop"):
-            prev_request = request.model_copy(update={
-                "start": prev_start, "end": prev_end, "compare": "none"})
-            prev_rows = _period_rows(conn, prev_request, start_ts=prev_ts[0],
-                                     end_ts=prev_ts[1], deadline=deadline,
-                                     data_as_of=data_as_of, limitations=[])
-            _attach_compare(rows, prev_rows, request)
+    try:
+        if request.group_by in ("total", "shop", "day"):
+            rows = _period_rows(conn, request, start_ts=start_ts, end_ts=end_ts,
+                                deadline=deadline, data_as_of=data_as_of,
+                                limitations=limitations)
         else:
-            limitations.append("比较仅支持total/shop分组")
+            rows = _product_rows(conn, request, start_ts=start_ts, end_ts=end_ts,
+                                 deadline=deadline)
+
+        if compare:
+            if request.group_by in ("total", "shop"):
+                prev_request = request.model_copy(update={
+                    "start": prev_start, "end": prev_end, "compare": "none"})
+                prev_rows = _period_rows(conn, prev_request, start_ts=prev_ts[0],
+                                         end_ts=prev_ts[1], deadline=deadline,
+                                         data_as_of=data_as_of, limitations=[])
+                _attach_compare(rows, prev_rows, request)
+            else:
+                limitations.append("比较仅支持total/shop分组")
+    except _BudgetExhausted:
+        return ToolResult(status="unavailable", coverage=coverage,
+                          metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
+                          filters=filters, data_as_of=data_as_of,
+                          limitations=limitations + ["本次查询时间预算已耗尽"])
+    except _RowsTruncated:
+        return ToolResult(status="unavailable", coverage=coverage,
+                          metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
+                          filters=filters, data_as_of=data_as_of,
+                          limitations=limitations + [
+                              f"结果行数达到{MAX_ROWS}上限，已拒绝出数以避免静默截断；"
+                              "请缩小日期范围或店铺范围"])
 
     return ToolResult(
         status="ok", data=rows,
@@ -503,16 +554,24 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
 def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: datetime,
                  deadline: float, data_as_of: datetime,
                  limitations: list[str]) -> list[dict[str, str | int | None]]:
-    """total/shop/day三种分组的指标行；退款率单独查询。"""
+    """total/shop/day三种分组的指标行；退款率单独查询。
+
+    total/shop 取 _AGG_SQL（每店一行的SQL端聚合），day 取 _DAILY_SQL（日行）。
+    预算耗尽/行数截断一律抛私有异常，由 _query_in_transaction 降级为 unavailable。
+    """
     if not _set_query_budget(conn, deadline):
-        return []
-    raw = conn.execute(_DAILY_SQL, (request.shop_ids, start_ts.date(), end_ts.date(),
-                                    MAX_ROWS)).fetchall()
+        raise _BudgetExhausted
+    if request.group_by in ("total", "shop"):
+        raw = _fetch_capped(conn, _AGG_SQL,
+                            (request.shop_ids, start_ts.date(), end_ts.date()))
+    else:
+        raw = _fetch_capped(conn, _DAILY_SQL,
+                            (request.shop_ids, start_ts.date(), end_ts.date()))
     need_cohort = "cohort_refund_rate" in request.metrics
     cohort_rate = None
     if need_cohort:
         if not _set_query_budget(conn, deadline):
-            return []
+            raise _BudgetExhausted
         cohort_paid, cohort_refunded = conn.execute(
             _COHORT_SQL, (request.shop_ids, start_ts, end_ts, data_as_of)).fetchone()
         if cohort_paid is not None and cohort_paid > 0:
@@ -526,27 +585,27 @@ def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: dat
         totals: dict[str, Decimal | int | None] = {
             "paid_amount": Decimal(0), "paid_orders": 0, "erp_documents": 0,
             "refund_amount": Decimal(0), "cash_difference": Decimal(0)}
-        for row in raw:
-            totals["paid_amount"] += row[2]
-            totals["paid_orders"] += row[3]
-            totals["erp_documents"] += row[4]
-            totals["refund_amount"] += row[5]
-            totals["cash_difference"] += row[6]
+        for row in raw:  # 每店一行（日行已在SQL端聚合掉）
+            totals["paid_amount"] += row[1]
+            totals["paid_orders"] += row[2]
+            totals["erp_documents"] += row[3]
+            totals["refund_amount"] += row[4]
+            totals["cash_difference"] += row[5]
         totals["aov"] = _compute_aov(totals)
         if need_cohort:
             totals["cohort_refund_rate"] = cohort_rate
         return [_group_rows(totals, metrics)]
     if request.group_by == "shop":
         by_shop: dict[str, dict[str, Decimal | int | None]] = {}
-        for row in raw:
+        for row in raw:  # 每店一行
             entry = by_shop.setdefault(row[0], {
                 "paid_amount": Decimal(0), "paid_orders": 0, "erp_documents": 0,
                 "refund_amount": Decimal(0), "cash_difference": Decimal(0)})
-            entry["paid_amount"] += row[2]
-            entry["paid_orders"] += row[3]
-            entry["erp_documents"] += row[4]
-            entry["refund_amount"] += row[5]
-            entry["cash_difference"] += row[6]
+            entry["paid_amount"] += row[1]
+            entry["paid_orders"] += row[2]
+            entry["erp_documents"] += row[3]
+            entry["refund_amount"] += row[4]
+            entry["cash_difference"] += row[5]
         for entry in by_shop.values():
             entry["aov"] = _compute_aov(entry)
             if need_cohort:
@@ -577,9 +636,9 @@ def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: dat
 def _product_rows(conn, request: QueryRequest, *, start_ts: datetime,
                   end_ts: datetime, deadline: float) -> list[dict[str, str | int | None]]:
     if not _set_query_budget(conn, deadline):
-        return []
-    raw = conn.execute(_PRODUCT_SQL, (request.shop_ids, start_ts.date(), end_ts.date(),
-                                      MAX_ROWS)).fetchall()
+        raise _BudgetExhausted
+    raw = _fetch_capped(conn, _PRODUCT_SQL,
+                        (request.shop_ids, start_ts.date(), end_ts.date()))
     rank_metric = ("product_paid_amount" if "product_paid_amount" in request.metrics
                    else "quantity")
     by_product: dict[tuple[str, str, str], dict[str, Decimal | int | bool | None]] = {}

@@ -6,12 +6,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import sys
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -320,32 +321,79 @@ def _determine_payment(conn, shop_id: str, commercial_id: str,
     amount = sum((row[0] for row in target), Decimal(0))
     pay_times = {row[1] for row in target if row[1] is not None}
     paid_at = pay_times.pop() if len(pay_times) == 1 else None
-    verified = paid_at is not None
+    # 行级路径与单头路径同口径：负数分摊不能拿核验章（单头路径有 head >= 0 守卫）。
+    verified = paid_at is not None and amount is not None and amount >= 0
     return amount, paid_at, "items", verified, source_updated_at
 
 
-def rebuild_payments(conn, shop_id: str, commercial_ids: set[str]) -> None:
-    """重建受影响商业订单的支付事实；不确定金额或时间留NULL并令verified=false。"""
+# 支付事实降级守卫：已核验的行只能被“不更弱”的证据覆盖。
+# 拆合单/兄弟行尚未同步齐时 _determine_payment 会返回 undetermined(None/false)，
+# 无条件覆盖会把已核验的100元清成 NULL；reporting.v_shop_daily 带 WHERE verified，
+# 这部分收入就在全域报表里无声消失（C-5）。允许覆盖的方向：
+#   1) 新证据本身已核验（升级或同级修正）；
+#   2) 旧行本就未核验；
+#   3) 已无任何订单支撑该商业单（orphan：source_updated_at 只能为 NULL，
+#      因 bi.orders.source_updated_at 是 NOT NULL）；
+#   4) 降级方向仅当新证据的 source_updated_at 严格更新才放行。
+_PAYMENT_UPSERT_SQL = """
+INSERT INTO bi.order_payments
+    (shop_id, commercial_id, paid_at, amount, currency, basis, verified, source_updated_at)
+VALUES (%s, %s, %s, %s, 'CNY', %s, %s, %s)
+ON CONFLICT (shop_id, commercial_id) DO UPDATE SET
+    paid_at = EXCLUDED.paid_at,
+    amount = EXCLUDED.amount,
+    currency = 'CNY',
+    basis = EXCLUDED.basis,
+    verified = EXCLUDED.verified,
+    source_updated_at = EXCLUDED.source_updated_at
+WHERE EXCLUDED.verified
+   OR NOT bi.order_payments.verified
+   OR EXCLUDED.source_updated_at IS NULL
+   OR EXCLUDED.source_updated_at > bi.order_payments.source_updated_at
+RETURNING commercial_id
+"""
+
+
+@dataclass
+class GuardStats:
+    """运行期守卫计数；单进程CLI（入口有advisory锁）下足够。"""
+
+    payment_downgrade_blocked: int = 0
+
+
+GUARD_STATS = GuardStats()
+
+
+def _commercial_ref(commercial_id: str) -> str:
+    """日志不落订单号明文（与 _probe “不输出订单号”一致），只留可反查的短摘要。"""
+    return hashlib.sha256(commercial_id.encode()).hexdigest()[:12]
+
+
+def rebuild_payments(conn, shop_id: str, commercial_ids: set[str]) -> int:
+    """重建受影响商业订单的支付事实；不确定金额或时间留NULL并令verified=false。
+
+    返回被降级守卫拦下的次数：DO UPDATE 的 WHERE 谓词为假时整条语句影响0行，
+    原已核验事实保留，order_items 的 allocation_verified 也不再被抹掉。
+    """
     cids = {cid for cid in commercial_ids if cid}
+    blocked = 0
     for commercial_id in sorted(cids):
         orders = _load_orders(conn, shop_id, commercial_id)
         amount, paid_at, basis, verified, source_updated_at = _determine_payment(
             conn, shop_id, commercial_id, orders)
-        conn.execute(
-            """
-            INSERT INTO bi.order_payments
-                (shop_id, commercial_id, paid_at, amount, currency, basis, verified, source_updated_at)
-            VALUES (%s, %s, %s, %s, 'CNY', %s, %s, %s)
-            ON CONFLICT (shop_id, commercial_id) DO UPDATE SET
-                paid_at = EXCLUDED.paid_at,
-                amount = EXCLUDED.amount,
-                currency = 'CNY',
-                basis = EXCLUDED.basis,
-                verified = EXCLUDED.verified,
-                source_updated_at = EXCLUDED.source_updated_at
-            """,
+        applied = conn.execute(
+            _PAYMENT_UPSERT_SQL,
             (shop_id, commercial_id, paid_at, amount, basis, verified, source_updated_at),
-        )
+        ).fetchone()
+        if applied is None:
+            blocked += 1
+            logger.warning(
+                "payment downgrade blocked: kept verified payment shop=%s basis=%s",
+                shop_id, basis,
+                extra={"shop_id": shop_id, "basis": basis,
+                       "commercial_ref": _commercial_ref(commercial_id),
+                       "error_code": "payment_downgrade_blocked"})
+            continue
         if verified:
             conn.execute(
                 "UPDATE bi.order_items SET allocation_verified = true "
@@ -358,6 +406,8 @@ def rebuild_payments(conn, shop_id: str, commercial_ids: set[str]) -> None:
                 "WHERE shop_id=%s AND commercial_id=%s",
                 (shop_id, commercial_id),
             )
+    GUARD_STATS.payment_downgrade_blocked += blocked
+    return blocked
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +683,15 @@ def mark_refund_canonical(conn, shop_id: str, platform_refund_ids: set[str]) -> 
 # ---------------------------------------------------------------------------
 
 
+# 实测会“成功却省略 list”的接口清单（docs/superpowers/research/
+# 2026-09-06-kuaimai-data-recheck.json）：erp.item.history.cost.price.query、
+# erp.item.sku.list.get、stock.api.status.query、erp.item.warehouse.list.get、
+# erp.wave.logistics.order.query、erp.aftersale.refund.warehouse.query、
+# purchase.order.query（初查 status=unexpected_list_shape，复查 success_no_records）。
+# 同步链在用的 erp.trade.list.query / erp.aftersale.list.query / erp.shop.list.query
+# 全部实测返回 list（空集时带 total=0），所以一处也不传 allow_omitted_list（C-6）。
+
+
 @dataclass(frozen=True)
 class Window:
     """业务或修改时间窗口，内部归属一律 [start, end)。"""
@@ -671,8 +730,7 @@ def _fetch_orders_cursor(client: KuaimaiClient, *, shop_id: str, window: Window,
         }
         if cursor is not None:
             params["cursor"] = cursor
-        page = parse_page(
-            client.call(ORDER_SOURCE, params), allow_omitted_list=True)
+        page = parse_page(client.call(ORDER_SOURCE, params))
         if not page.rows:
             return
         yield from page.rows
@@ -705,8 +763,7 @@ def _fetch_orders_paged(client: KuaimaiClient, *, shop_id: str, window: Window,
         }
         if time_type:
             params["timeType"] = time_type
-        page = parse_page(
-            client.call(ORDER_SOURCE, params), allow_omitted_list=True)
+        page = parse_page(client.call(ORDER_SOURCE, params))
         if page.verified_empty:
             return
         if total is None and page.total is not None:
@@ -746,8 +803,7 @@ def _fetch_aftersales_paged(client: KuaimaiClient, *, shop_id: str, window: Wind
         }
         if extra_params:
             params.update(extra_params)
-        page = parse_page(
-            client.call(AFTERSALE_SOURCE, params), allow_omitted_list=True)
+        page = parse_page(client.call(AFTERSALE_SOURCE, params))
         if page.verified_empty:
             return
         if page.total is None:
@@ -950,8 +1006,7 @@ def check_cohort_window(conn, client: KuaimaiClient, *, shop_id: str,
                     "asVersion": "2",
                     "tids": ",".join(chunk),
                 }
-                page = parse_page(
-                    client.call(AFTERSALE_SOURCE, params), allow_omitted_list=True)
+                page = parse_page(client.call(AFTERSALE_SOURCE, params))
                 if page.verified_empty:
                     break
                 if page.total is None:
@@ -1011,8 +1066,7 @@ def refetch_orders_for_commercials(conn, client: KuaimaiClient, *, shop_id: str,
             }
             if cursor is not None:
                 params["cursor"] = cursor
-            page = parse_page(
-                client.call(ORDER_SOURCE, params), allow_omitted_list=True)
+            page = parse_page(client.call(ORDER_SOURCE, params))
             batch_id = uuid.uuid4().hex
             with conn.transaction():
                 for raw in page.rows:
@@ -1054,11 +1108,8 @@ def sync_shops(conn, client: KuaimaiClient) -> int:
     collected = 0
     with conn.transaction():
         while True:
-            page = parse_page(
-                client.call("erp.shop.list.query", {
-                    "pageNo": str(page_no), "pageSize": str(PAGE_SIZE)}),
-                allow_omitted_list=True,
-            )
+            page = parse_page(client.call("erp.shop.list.query", {
+                "pageNo": str(page_no), "pageSize": str(PAGE_SIZE)}))
             if not page.rows:
                 break
             for raw in page.rows:
@@ -1113,9 +1164,20 @@ def _run_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
         raise
 
 
+def _beijing_now() -> datetime:
+    """北京时间当前时刻；回填结束时刻单独取，不能沿用开工瞬间。"""
+    return datetime.now(BEIJING)
+
+
 def _backfill_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
-                   t0: datetime, t1: datetime) -> dict[str, int]:
-    """回填最近N天并补拉[T0,T1)；补齐成功后才发布data_as_of。"""
+                   t0: datetime,
+                   now: Callable[[], datetime] = _beijing_now) -> dict[str, int]:
+    """回填最近N天并补拉[t0,t1)；t1 是回填完成瞬间，补齐后才发布data_as_of。
+
+    t1 必须等回填循环全部跑完再重新取：回填本身可能跑几小时，沿用开工瞬间（旧代码
+    的 t1=t0）会让 day_windows(t0, t1) 恒空，scan 一段也不执行，水位就建不起来，
+    后续增量永远 SystemExit；data_as_of 也会宣布一个回填期间变更未入库的覆盖。
+    """
     if days > MAX_QUERY_DAYS:
         raise SystemExit(f"回填跨度最多{MAX_QUERY_DAYS}天")
     start = t0 - timedelta(days=days)
@@ -1130,6 +1192,10 @@ def _backfill_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
         check_cohort_window(conn, client, shop_id=shop_id, window=window)
         stats["cohort_windows"] += 1
     # 补拉回填期间的变化：修改时间扫描推进水位
+    t1 = now()
+    if t1 <= t0:
+        # 时钟不动或回拨时至少推进一步重叠量，保证首次回填能把水位建立起来。
+        t1 = t0 + SYNC_OVERLAP
     for window in day_windows(t0, t1):
         _run_window(conn, client, entity="orders", shop_id=shop_id,
                     window=window, mode="scan")
@@ -1301,7 +1367,8 @@ def _setup_logging(log_dir: str = "logs") -> None:
 
     class JsonFormatter(logging.Formatter):
         _ALLOWED = ("request_id", "tool", "entity", "shop_id", "window",
-                    "rows", "duration_ms", "data_as_of", "error_code", "attempt")
+                    "rows", "duration_ms", "data_as_of", "error_code", "attempt",
+                    "basis", "commercial_ref")
 
         def format(self, record: logging.LogRecord) -> str:
             payload = {"ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
@@ -1368,23 +1435,31 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(summary, ensure_ascii=False))
             elif args.command == "backfill":
                 t0 = datetime.now(BEIJING)
-                t1 = t0
                 for shop_id in sorted(settings.shop_ids):
+                    before = GUARD_STATS.payment_downgrade_blocked
                     stats = _backfill_shop(conn, client, shop_id=shop_id,
-                                           days=args.days, t0=t0, t1=t1)
+                                           days=args.days, t0=t0)
+                    stats["payment_downgrade_blocked"] = (
+                        GUARD_STATS.payment_downgrade_blocked - before)
                     print(json.dumps({"action": "backfill", "shop_id": shop_id,
                                       "stats": stats}))
             elif args.command == "incremental":
                 run_end = datetime.now(BEIJING)
                 for shop_id in sorted(settings.shop_ids):
+                    before = GUARD_STATS.payment_downgrade_blocked
                     stats = _incremental_shop(conn, client, shop_id=shop_id, run_end=run_end)
+                    stats["payment_downgrade_blocked"] = (
+                        GUARD_STATS.payment_downgrade_blocked - before)
                     print(json.dumps({"action": "incremental", "shop_id": shop_id,
                                       "stats": stats}))
             elif args.command == "reconcile":
                 run_end = datetime.now(BEIJING)
                 for shop_id in sorted(settings.shop_ids):
+                    before = GUARD_STATS.payment_downgrade_blocked
                     stats = _reconcile_shop(conn, client, shop_id=shop_id,
                                             days=args.days, run_end=run_end)
+                    stats["payment_downgrade_blocked"] = (
+                        GUARD_STATS.payment_downgrade_blocked - before)
                     print(json.dumps({"action": "reconcile", "shop_id": shop_id,
                                       "stats": stats}))
             elif args.command == "replay":
@@ -1393,10 +1468,13 @@ def main(argv: list[str] | None = None) -> int:
                 if (end - start).days > MAX_QUERY_DAYS:
                     raise SystemExit(f"replay跨度最多{MAX_QUERY_DAYS}天")
                 for shop_id in sorted(settings.shop_ids):
+                    before = GUARD_STATS.payment_downgrade_blocked
                     count = _replay_entity(conn, client, shop_id=shop_id,
                                            entity=args.entity, start=start, end=end)
                     print(json.dumps({"action": "replay", "shop_id": shop_id,
-                                      "entity": args.entity, "accepted": count}))
+                                      "entity": args.entity, "accepted": count,
+                                      "payment_downgrade_blocked":
+                                          GUARD_STATS.payment_downgrade_blocked - before}))
             elif args.command == "refresh-session":
                 _refresh_session(conn, client)
         finally:
