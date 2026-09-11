@@ -418,6 +418,19 @@ class _ArtifactFailingStore(MemoryQueryRunStore):
         raise ArtifactPersistenceError("database password=not-for-public-output")
 
 
+class _StoreFailingAtNode(MemoryQueryRunStore):
+    """Fails one mid-graph transition the way a lost database connection would."""
+
+    def __init__(self, *, forbidden_values, fail_at_node):  # type: ignore[no-untyped-def]
+        super().__init__(forbidden_values=forbidden_values)
+        self.fail_at_node = fail_at_node
+
+    def transition(self, run_id, transition):  # type: ignore[no-untyped-def]
+        if transition.node == self.fail_at_node:
+            raise RuntimeError("psycopg.OperationalError connection reset")
+        return super().transition(run_id, transition)
+
+
 class BusinessQueryExecutionTests(unittest.TestCase):
     START = date(2026, 9, 1)
     END = date(2026, 9, 8)
@@ -600,6 +613,67 @@ class BusinessQueryExecutionTests(unittest.TestCase):
         self.assertIsNone(execution.tool_result)
         self.assertEqual(execution.session_filters, {})
         self.assertEqual(execution.domain_result.artifacts, [])
+
+    def test_unexpected_store_failure_still_finishes_the_run(self):
+        """C-7：图半途抛错不得把 run 留在 running，必须先兜底写入 FAILED 再原样上抛。"""
+        from bi_agent.business_query.graph import _execute_business_query_graph
+
+        store = _StoreFailingAtNode(forbidden_values={"S1", "ERP-P-9"},
+                                    fail_at_node="execute_fixed_query")
+        with patch("bi_agent.metrics.query_business", return_value=self._result()):
+            with self.assertRaisesRegex(RuntimeError, "connection reset"):
+                _execute_business_query_graph(
+                    object(), store, self._tool_input(), self._context()
+                )
+
+        self.assertEqual(len(store.runs), 1)
+        run = next(iter(store.runs.values()))
+        self.assertEqual(run["status"], RunStatus.FAILED.value)
+        self.assertEqual(run["error_code"], "unavailable")
+        self.assertIsNotNone(run["completed_at"])
+        state = run["state"]
+        self.assertEqual(state["status"], RunStatus.FAILED.value)
+        self.assertEqual(state["target_status"], DomainStatus.FAILED.value)
+        self.assertEqual(state["error"]["code"], "unavailable")
+        self.assertEqual(state["error"]["stage"], "execute_fixed_query")
+        self.assertEqual(state["error"]["public_message"], "查询暂不可用，请稍后重试。")
+        self.assertEqual(
+            [event["node"] for event in store.events[run["id"]]],
+            ["resolve_parameters", "validate_parameters", "authorize_scope",
+             "execute_fixed_query"],
+        )
+        last_event = store.events[run["id"]][-1]
+        self.assertEqual(last_event["event_type"], "failed")
+        self.assertEqual(last_event["status"], RunStatus.FAILED.value)
+        # 兜底写入不得把驱动细节带进审计行。
+        self.assertNotIn("connection reset",
+                         json.dumps(run, ensure_ascii=False, default=str))
+
+    def test_projection_failure_gates_result_filters_and_artifacts(self):
+        """C-8：_execution_result 里投影被拒时，三个出口必须同时关。"""
+        from bi_agent.business_query.graph import _execute_business_query_graph
+
+        store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
+        with patch("bi_agent.metrics.query_business", return_value=self._result()), patch(
+            "bi_agent.business_query.tool.to_public_artifact",
+            side_effect=ValueError("unsafe_persistence_payload"),
+        ) as project:
+            execution = _execute_business_query_graph(
+                object(), store, self._tool_input(), self._context()
+            )
+
+        project.assert_called_once()
+        self.assertEqual(execution.domain_result.status, DomainStatus.FAILED)
+        self.assertEqual(execution.domain_result.model_payload, {"status": "failed"})
+        self.assertEqual(execution.domain_result.artifacts, [])
+        self.assertIsNone(execution.tool_result)
+        self.assertEqual(execution.session_filters, {})
+        serialized = json.dumps(
+            execution.domain_result.model_dump(mode="json"),
+            ensure_ascii=False, default=str,
+        ) + json.dumps([execution.session_filters, execution.tool_result],
+                       ensure_ascii=False, default=str)
+        self.assertNotIn("1000", serialized)
 
     def test_expired_deadline_fails_without_calling_metrics(self):
         store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})

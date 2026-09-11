@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 from bi_agent.runtime.models import (
     DomainArtifact,
     DomainResult,
@@ -59,18 +61,12 @@ def _execute_business_query_graph(
 
     This internal runner intentionally has no public adapter yet; Task 7 owns
     routing it into the Agent and chat persistence boundary.
-    """
-    from .nodes import (
-        _event_payload,
-        authorize_scope,
-        classify_result,
-        execute_fixed_query,
-        finalize_run,
-        persist_artifact,
-        resolve_parameters,
-        validate_parameters,
-    )
 
+    Any unexpected failure is terminated best-effort before it is re-raised:
+    a half-dead run must never stay ``running`` forever, because the unique
+    ``(user_message_id, domain, attempt_no)`` context blocks a same-attempt
+    replay and the session has no reaper.
+    """
     run_id = store.create_run(  # type: ignore[attr-defined]
         NewQueryRun(
             chat_id=context.chat_id,
@@ -90,6 +86,30 @@ def _execute_business_query_graph(
         state=BusinessQueryState(run_id=run_id),
         context=context,
         resolved_args=dict(tool_input.arguments or {}),
+    )
+    try:
+        return _run_graph_nodes(runtime, store, conn, tool_input)
+    except Exception:  # noqa: BLE001 - 收尾后原样上抛，由外层做脱敏
+        _finish_run_as_failed(runtime, store)
+        raise
+
+
+def _run_graph_nodes(
+    runtime: BusinessQueryRuntime,
+    store: object,
+    conn: object,
+    tool_input: BusinessQueryInput,
+) -> BusinessQueryExecution:
+    """Advance the fixed node sequence for an already-created run."""
+    from .nodes import (
+        _event_payload,
+        authorize_scope,
+        classify_result,
+        execute_fixed_query,
+        finalize_run,
+        persist_artifact,
+        resolve_parameters,
+        validate_parameters,
     )
 
     if tool_input.arguments_error is not None:
@@ -144,6 +164,42 @@ def _execute_business_query_graph(
     _persist_transition(runtime, store, _event_payload(runtime))
     finalize_run(runtime, store)
     return _execution_result(runtime)
+
+
+def _finish_run_as_failed(
+    runtime: BusinessQueryRuntime, store: object
+) -> None:
+    """Best-effort FAILED completion for a graph that died mid-flight.
+
+    The in-memory revision mirror only advances after a store write succeeds, so
+    it normally still matches the store; if it does not, the rejected write is
+    suppressed rather than replacing the exception that is already in flight.
+    """
+    state = runtime.state
+    error = state.error or ErrorEnvelope(
+        code="unavailable",
+        stage=state.node.value,
+        retryable=True,
+        recovery=RecoveryAction.RETRY_LATER,
+        public_message="查询暂不可用，请稍后重试。",
+    )
+    with contextlib.suppress(Exception):
+        store.finish(  # type: ignore[attr-defined]
+            state.run_id,
+            RunCompletion(
+                expected_revision=state.revision,
+                node=state.node.value,
+                status=RunStatus.FAILED,
+                state={
+                    **state.model_dump(mode="json"),
+                    "status": RunStatus.FAILED.value,
+                    "target_status": DomainStatus.FAILED.value,
+                    "error": error.model_dump(mode="json"),
+                },
+                payload={},
+                error_code="unavailable",
+            ),
+        )
 
 
 def _persist_transition(
@@ -206,9 +262,11 @@ def _execution_result(runtime: BusinessQueryRuntime) -> BusinessQueryExecution:
                 for ref in state.artifact_refs
             ]
         except ValueError:
+            # 投影失败说明结果不符合安全契约：三个出口一律关闭，被拒数字不得回流。
             status = DomainStatus.FAILED
             model_payload = {"status": "failed"}
             artifacts = []
+            output_is_safe = False
     else:
         model_payload = {
             "status": (
