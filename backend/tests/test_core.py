@@ -731,6 +731,104 @@ class PromotionTests(unittest.TestCase):
             PromotionRequest(mode="sales_cap", start="2025-01-01", end="2026-09-08",
                              sales_estimate="1", target_ratio="0.1")
 
+    # --- C-1 回归：投影契约以生产方为单一真源 --------------------------------
+    @staticmethod
+    def promotion_cases():
+        """四种模式 × ok / 缺明确确认 / 确认不一致 / 周期已结束。"""
+        return (
+            ({"mode": "sales_cap", "start": "2026-10-01", "end": "2026-11-01",
+              "sales_estimate": "100000", "target_ratio": "0.12"},
+             {"sales_estimate": Decimal("100000"), "target_ratio": Decimal("0.12")}),
+            ({"mode": "sales_cap", "start": "2026-10-01", "end": "2026-11-01",
+              "sales_estimate": "100000", "target_ratio": "0.12"}, {}),
+            ({"mode": "budget_scenario", "start": "2026-09-01", "end": "2026-09-08",
+              "budget": "100", "assumed_spend": "120", "spent_through": "2026-09-06"},
+             {"budget": Decimal("100"), "assumed_spend": Decimal("120")}),
+            ({"mode": "budget_scenario", "start": "2026-09-01", "end": "2026-09-08",
+              "budget": "100", "assumed_spend": "60", "spent_through": "2026-09-08"},
+             {"budget": Decimal("100"), "assumed_spend": Decimal("60")}),
+            ({"mode": "budget_scenario", "start": "2026-09-01", "end": "2026-09-08",
+              "budget": "100", "assumed_spend": "60", "spent_through": "2026-09-06"},
+             {"budget": Decimal("100"), "assumed_spend": Decimal("999")}),
+            ({"mode": "actual_budget", "start": "2026-09-01", "end": "2026-10-01"}, {}),
+            ({"mode": "contribution_cap", "start": "2026-09-01", "end": "2026-10-01"}, {}),
+        )
+
+    def test_projection_accepts_every_promotion_shape(self):
+        """model 投影与 public artifact 投影对四种模式都不能拒绝自己的生产结果。"""
+        from bi_agent.business_query.tool import to_model_result, to_public_artifact
+        from bi_agent.promotion import PromotionRequest, evaluate_promotion
+
+        for args, confirmed in self.promotion_cases():
+            result = evaluate_promotion(PromotionRequest.model_validate(args),
+                                        confirmed_inputs=confirmed, now=self.NOW)
+            with self.subTest(mode=args["mode"], status=result.status):
+                model_payload = to_model_result(result, {"S1": "shop_1"})
+                public_payload = to_public_artifact(result, {"S1": "shop_1"})
+                self.assertEqual(model_payload["status"], result.status)
+                self.assertEqual(public_payload["status"], result.status)
+                self.assertEqual(public_payload["filters"]["mode"], args["mode"])
+                self.assertEqual(public_payload["metric_definition"],
+                                 dict(result.metric_definition))
+                self.assertEqual(public_payload["limitations"], result.limitations)
+                if result.status == "ok":
+                    self.assertTrue(public_payload["data"])
+                rendered = json.dumps(public_payload, ensure_ascii=False)
+                self.assertNotIn("S1", rendered)
+
+    def test_promotion_rows_equal_declared_contract(self):
+        """实际行键 == 声明列集；白名单既不漏列也不残留手抄的幻影列。"""
+        from bi_agent.promotion import (
+            BUDGET_SCENARIO_COLUMNS,
+            PROMOTION_METRIC_DEFINITIONS,
+            PROMOTION_RESULT_COLUMNS,
+            SPEND_CAP_COLUMNS,
+            PromotionRequest,
+            evaluate_promotion,
+        )
+        from bi_agent.runtime.models import (
+            ARTIFACT_FILTER_COLUMNS,
+            ARTIFACT_RESULT_COLUMNS,
+        )
+
+        declared = {"sales_cap": SPEND_CAP_COLUMNS,
+                    "budget_scenario": BUDGET_SCENARIO_COLUMNS}
+        for args, confirmed in self.promotion_cases():
+            result = evaluate_promotion(PromotionRequest.model_validate(args),
+                                        confirmed_inputs=confirmed, now=self.NOW)
+            with self.subTest(mode=args["mode"], status=result.status):
+                for row in result.data:
+                    self.assertEqual(set(row), set(declared[args["mode"]]))
+                self.assertLessEqual(set(result.metric_definition),
+                                     set(PROMOTION_METRIC_DEFINITIONS))
+        self.assertEqual(PROMOTION_RESULT_COLUMNS & ARTIFACT_RESULT_COLUMNS,
+                         PROMOTION_RESULT_COLUMNS)
+        self.assertIn("mode", ARTIFACT_FILTER_COLUMNS)
+        for phantom in ("actual_spend", "over_budget", "daily_cap", "contribution_cap"):
+            self.assertNotIn(phantom, ARTIFACT_RESULT_COLUMNS)
+
+    def test_column_drift_fails_at_the_producer(self):
+        """新增列忘改契约时先在 promotion 一侧失败，而不是漂到投影处。"""
+        from bi_agent.promotion import SPEND_CAP_COLUMNS, _project
+
+        row = {key: "1" for key in SPEND_CAP_COLUMNS}
+        self.assertEqual(set(_project(SPEND_CAP_COLUMNS, row)), set(SPEND_CAP_COLUMNS))
+        with self.assertRaises(ValueError):
+            _project(SPEND_CAP_COLUMNS, {**row, "new_column": "2"})
+        with self.assertRaises(ValueError):
+            _project(SPEND_CAP_COLUMNS, {k: v for k, v in row.items() if k != "basis"})
+        with self.assertRaises(ValueError):
+            _project(SPEND_CAP_COLUMNS + ("erp_shop_id",), {**row, "erp_shop_id": "S1"})
+
+    def test_whitelist_columns_all_have_validation_rules(self):
+        """白名单里不允许出现无校验规则的列（否则新列会绕过类型校验）。"""
+        from bi_agent.runtime import models
+
+        covered = (models._NUMERIC_RESULT_COLUMNS | models._DATE_RESULT_COLUMNS
+                   | frozenset(models._LABEL_RESULT_VALUES)
+                   | models._ALIAS_RESULT_COLUMNS)
+        self.assertEqual(covered, models.ARTIFACT_RESULT_COLUMNS)
+
 
 def _reply(text=None, calls=None, reasoning=None):
     from bi_agent.llm import Message, ModelReply, ToolCall
@@ -1209,6 +1307,35 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(confirmed["sales_estimate"], Decimal("100000"))
             self.assertEqual(confirmed["target_ratio"], Decimal("0.12"))
         self.assertEqual(turn.results[0].data[0]["spend_cap"], "12000")
+
+    def test_promotion_turn_projects_through_the_real_producer(self):
+        """C-1 全链路回归：不桩化 evaluate_promotion，真实结果走完 answer() 两侧投影。
+
+        旧用例只把一手工造 ToolResult 塞进 answer()，恰好避开白名单漂移；
+        本用例同时走 to_model_result()（answer 内部）与 to_public_artifact()。
+        """
+        from bi_agent.agent import SessionState, answer, to_public_artifact
+        from bi_agent.llm import ToolCall
+
+        call = ToolCall(id="call_1", name="evaluate_promotion", arguments={
+            "mode": "sales_cap", "start": "2026-10-01", "end": "2026-11-01",
+            "sales_estimate": "100000", "target_ratio": "0.12"})
+        model = Mock()
+        model.complete.side_effect = [_reply(calls=[call]), _reply(text="上限1.2万元")]
+        turn = answer("假设10月销售额10万元、推广费用率12%，最多花多少？",
+                      SessionState(subject="u1"), model=model, conn=self._conn(),
+                      allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                      run_store=self.run_store)
+        self.assertIsNone(turn.error_code)
+        self.assertEqual(turn.text, "上限1.2万元")
+        self.assertEqual(turn.results[0].status, "ok")
+        tool_messages = [message for message in turn.state.turns if message.role == "tool"]
+        model_payload = json.loads(tool_messages[0].content)
+        self.assertEqual(model_payload["data"][0]["spend_cap"], "12000.00")
+        self.assertEqual(model_payload["filters"]["mode"], "sales_cap")
+        public_payload = to_public_artifact(turn.results[0], turn.state)
+        self.assertEqual(public_payload["data"][0]["basis"], "用户输入假设")
+        self.assertNotIn("S1", json.dumps(public_payload, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -10,24 +10,23 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from bi_agent.metrics import ToolResult
-from bi_agent.runtime.models import DomainResult, validate_artifact_payload, validate_model_payload
+from bi_agent.runtime.models import (
+    ARTIFACT_FILTER_COLUMNS,
+    ARTIFACT_RESULT_COLUMNS,
+    DomainResult,
+    validate_artifact_payload,
+    validate_model_payload,
+)
 
 from .state import BusinessQueryContext, BusinessQueryExecution, BusinessQueryInput
 
 if TYPE_CHECKING:
     from bi_agent.llm import ToolCall
 
-
-_PUBLIC_RESULT_COLUMNS = {
-    "day", "shop_id", "product_id", "line_kind", "currency", "basis",
-    "paid_amount", "paid_orders", "erp_documents", "aov", "refund_amount",
-    "cash_difference", "cohort_refund_rate", "quantity", "product_paid_amount",
-    "spend_cap", "budget", "actual_spend", "remaining_budget", "over_budget",
-    "remaining_days", "daily_cap", "contribution_cap",
-}
-_PUBLIC_FILTER_COLUMNS = {
-    "start", "end", "shop_ids", "metrics", "group_by", "compare", "top_n", "currency",
-}
+# 白名单单一定义在 runtime/models.py（推广列由 promotion.py 供给），
+# 这里只引用，避免第二份手抄集合与校验端漂移。
+_PUBLIC_RESULT_COLUMNS = ARTIFACT_RESULT_COLUMNS
+_PUBLIC_FILTER_COLUMNS = ARTIFACT_FILTER_COLUMNS
 
 
 def to_model_result(

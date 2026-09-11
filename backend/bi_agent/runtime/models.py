@@ -18,6 +18,16 @@ from pydantic import (
 )
 
 from bi_agent.metrics import Coverage, METRIC_DEFINITIONS
+from bi_agent.promotion import (
+    PROMOTION_DATE_RESULT_COLUMNS,
+    PROMOTION_LABEL_VALUES,
+    PROMOTION_LIMITATION_PATTERNS,
+    PROMOTION_METRIC_DEFINITIONS,
+    PROMOTION_MODE_VALUES,
+    PROMOTION_NUMERIC_RESULT_COLUMNS,
+    PROMOTION_PUBLIC_LIMITATIONS,
+    PROMOTION_RESULT_COLUMNS,
+)
 
 PersistenceNode = Literal[
     "received", "resolve_parameters", "validate_parameters", "authorize_scope",
@@ -47,6 +57,8 @@ PublicMessage = Literal[
 ]
 
 _METRICS = frozenset(METRIC_DEFINITIONS)
+# 口径文案字典：固定指标 + 推广口径（后者以 promotion.py 为真源）。
+_METRIC_DEFINITION_TEXTS: dict[str, str] = {**METRIC_DEFINITIONS, **PROMOTION_METRIC_DEFINITIONS}
 _TOOL_STATUSES = frozenset({
     "ok", "missing_data", "invalid_parameters", "forbidden", "unavailable",
 })
@@ -81,10 +93,11 @@ _PUBLIC_LIMITATIONS = frozenset({
     "上期覆盖不足，无法比较，仅返回绝对值",
     "比较仅支持total/shop分组",
     "同批支付额为0或无支付，同批退款率不可计算",
-})
+}) | PROMOTION_PUBLIC_LIMITATIONS
 _PUBLIC_LIMITATION_PATTERNS = (
     re.compile(r"^存在[0-9]+条未匹配的平台成功退款，退款归属未确认$"),
     re.compile(r"^结果超过[0-9]+组，请缩小日期范围或店铺范围$"),
+    *PROMOTION_LIMITATION_PATTERNS,
 )
 _STATE_KEYS = frozenset({
     "run_id", "node", "status", "revision", "normalized_request", "problems",
@@ -103,18 +116,34 @@ _ARTIFACT_KEYS = frozenset({
 })
 _FILTER_KEYS = frozenset({
     "start", "end", "shop_ids", "metrics", "group_by", "compare", "top_n", "currency",
+    "mode",
 })
-_RESULT_COLUMNS = frozenset({
-    "day", "shop_id", "product_id", "line_kind", "currency", "basis",
+
+_LINE_KINDS = frozenset({"sale", "gift", "suite", "combination", "processing"})
+_CURRENCY_VALUES = frozenset({"CNY"})
+
+# 结果列白名单以生产方为单一真源：推广列（含类型与可取集合）从 promotion.py 导出，
+# 本模块只补充固定指标侧的列，不再手抄推广列名。
+_METRIC_RESULT_COLUMNS = frozenset({
+    "day", "shop_id", "product_id", "line_kind", "currency",
     "paid_amount", "paid_orders", "erp_documents", "aov", "refund_amount",
     "cash_difference", "cohort_refund_rate", "quantity", "product_paid_amount",
-    "spend_cap", "budget", "actual_spend", "remaining_budget", "over_budget",
-    "remaining_days", "daily_cap", "contribution_cap",
 })
-_NUMERIC_RESULT_COLUMNS = _RESULT_COLUMNS - {
-    "day", "shop_id", "product_id", "line_kind", "currency", "basis",
+_ALIAS_RESULT_COLUMNS = frozenset({"shop_id", "product_id"})
+_DATE_RESULT_COLUMNS = frozenset({"day"}) | PROMOTION_DATE_RESULT_COLUMNS
+_LABEL_RESULT_VALUES: dict[str, frozenset[str]] = {
+    "line_kind": _LINE_KINDS,
+    "currency": _CURRENCY_VALUES,
+    **PROMOTION_LABEL_VALUES,
 }
-_LINE_KINDS = frozenset({"sale", "gift", "suite", "combination", "processing"})
+_RESULT_COLUMNS = _METRIC_RESULT_COLUMNS | PROMOTION_RESULT_COLUMNS
+# 剩下的列一律按十进制/整数严格校验；推广数值列集合作为交叉校验。
+_NUMERIC_RESULT_COLUMNS = (_RESULT_COLUMNS - _ALIAS_RESULT_COLUMNS - _DATE_RESULT_COLUMNS
+                           - frozenset(_LABEL_RESULT_VALUES))
+assert _NUMERIC_RESULT_COLUMNS & PROMOTION_RESULT_COLUMNS == PROMOTION_NUMERIC_RESULT_COLUMNS
+# 投影层（business_query/tool.py）复用同一份白名单，避免二次手抄漂移。
+ARTIFACT_RESULT_COLUMNS = _RESULT_COLUMNS
+ARTIFACT_FILTER_COLUMNS = _FILTER_KEYS
 _NODES = frozenset({
     "received", "resolve_parameters", "validate_parameters", "authorize_scope",
     "execute_fixed_query", "classify_result", "persist_artifact", "finalize",
@@ -347,19 +376,17 @@ def _result_rows(value: object, *, public: bool) -> None:
         for key, result_value in row.items():
             if key in _NUMERIC_RESULT_COLUMNS:
                 _numeric_result(result_value)
-            elif key == "day":
+            elif key in _DATE_RESULT_COLUMNS:
                 _date_string(result_value)
+            elif key in _LABEL_RESULT_VALUES:
+                _string_in(result_value, _LABEL_RESULT_VALUES[key])
             elif key == "shop_id":
                 _alias(result_value, public=public)
             elif key == "product_id":
                 if not isinstance(result_value, str) or not _PRODUCT_ALIAS_RE.fullmatch(result_value):
                     _unsafe_payload()
-            elif key == "line_kind":
-                _string_in(result_value, _LINE_KINDS)
-            elif key == "currency":
-                if result_value != "CNY":
-                    _unsafe_payload()
-            elif key == "basis" and result_value != "用户输入假设":
+            else:
+                # 白名单内但没有校验规则的列一律拒绝：新增列必须同步声明类型。
                 _unsafe_payload()
 
 
@@ -382,12 +409,14 @@ def _filters(value: object, *, public: bool) -> None:
             _unsafe_payload()
     if "currency" in filters and filters["currency"] != "CNY":
         _unsafe_payload()
+    if "mode" in filters:
+        _string_in(filters["mode"], PROMOTION_MODE_VALUES)
 
 
 def _metric_definitions(value: object) -> None:
-    definitions = _mapping(value, allowed=_METRICS)
+    definitions = _mapping(value, allowed=frozenset(_METRIC_DEFINITION_TEXTS))
     for metric, definition in definitions.items():
-        if definition != METRIC_DEFINITIONS[metric]:
+        if definition != _METRIC_DEFINITION_TEXTS[metric]:
             _unsafe_payload()
 
 

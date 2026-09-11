@@ -157,6 +157,78 @@ class ApiTests(unittest.TestCase):
         finally:
             client.delete(f"/api/chats/{chat_id}", headers=headers)
 
+    def test_promotion_turn_streams_a_public_artifact_and_completes(self):
+        """C-1 全链路：推广回合必须真发出 artifact 与 done，而不是被吞成笼统失败。
+
+        推广结果列与持久化白名单漂移时，to_public_artifact() 抛 ValueError 会被
+        run_chat_turn 的兜底 except 吞掉，前端只看到“本轮回答未完成”。
+        """
+        from bi_agent.agent import run_chat_turn
+        from bi_agent.chats import ChatMessage
+        from bi_agent.llm import Message, ModelReply, ToolCall
+        from bi_agent.runtime import MemoryQueryRunStore
+
+        class PromotionModel:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, messages, tools, *, timeout_s):
+                self.calls += 1
+                if self.calls == 1:
+                    call = ToolCall(
+                        id="call_1", name="evaluate_promotion", arguments={
+                            "mode": "sales_cap", "start": "2026-10-01",
+                            "end": "2026-11-01", "sales_estimate": "100000",
+                            "target_ratio": "0.12",
+                        },
+                    )
+                    reply = ModelReply(tool_calls=[call])
+                    reply._message = Message(role="assistant", content=None,
+                                             tool_calls=[call])
+                    return reply
+                reply = ModelReply(text="按假设最多可花 1.2 万元")
+                reply._message = Message(role="assistant", content=reply.text)
+                return reply
+
+        conn = Mock()
+        conn.execute.return_value.fetchall.return_value = [("S1", "店铺A")]
+        model = PromotionModel()
+        chat_id = uuid4()
+        now = datetime(2026, 9, 8, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+        saved_message = ChatMessage(id=uuid4(), role="assistant",
+                                   content="按假设最多可花 1.2 万元", artifacts=[],
+                                   status="complete", created_at=now)
+        with patch(
+            "bi_agent.agent.PostgresQueryRunStore",
+            lambda _conn, *, forbidden_values: MemoryQueryRunStore(
+                forbidden_values=frozenset({"S1", "ERP-P-9"})),
+        ), patch("bi_agent.chats.load_chat_context", return_value=({}, [])), patch(
+            "bi_agent.chats.save_user_message",
+            return_value=SimpleNamespace(id=uuid4()),
+        ), patch("bi_agent.chats.save_assistant_message",
+                 return_value=saved_message) as save_assistant, patch(
+            "bi_agent.chats.update_chat_filters",
+        ):
+            events = list(run_chat_turn(
+                conn, chat_id, "user-a", "假设10月销售额10万元、推广费用率12%，最多花多少？",
+                model=model, allowed_shop_ids=frozenset({"S1"}), now=now,
+            ))
+
+        self.assertEqual([event.event for event in events],
+                         ["status", "status", "artifact", "status", "message", "done"])
+        artifact = events[2].data
+        self.assertEqual(artifact["status"], "ok")
+        self.assertEqual(artifact["data"][0]["spend_cap"], "12000.00")
+        self.assertEqual(artifact["filters"]["mode"], "sales_cap")
+        self.assertEqual(events[-1].data, {"status": "complete"})
+        stream = "\n".join(f"{event.event}:{event.data}" for event in events)
+        self.assertNotIn("本轮回答未完成", stream)
+        self.assertNotIn("unsafe_persistence_payload", stream)
+        self.assertNotIn("S1", stream)
+        saved_artifacts = save_assistant.call_args.args[4]
+        self.assertEqual(len(saved_artifacts), 1)
+        self.assertEqual(saved_artifacts[0]["data"][0]["sales_estimate"], "100000")
+
     def test_runtime_create_run_failure_ends_with_a_sanitized_sse_error(self):
         """A run-store failure must not leak database diagnostics to the browser."""
         from bi_agent.agent import run_chat_turn

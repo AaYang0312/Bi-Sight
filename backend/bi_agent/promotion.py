@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from zoneinfo import ZoneInfo
@@ -23,9 +25,100 @@ NOT_AVAILABLE_LIMITATION = "尚未取得推广实耗及完整同口径成本，�
 _MODE_AMOUNTS = ("sales_estimate", "target_ratio", "budget", "assumed_spend")
 
 
+# ---------------------------------------------------------------------------
+# 投影契约（单一真源）
+#
+# runtime/models.py 的持久化白名单与 business_query/tool.py 的脱敏投影都引用这里，
+# 不再手抄；下方 _project() 在生产方一侧强制行键与声明完全一致，新增列必须先改契约。
+# ---------------------------------------------------------------------------
+
+# 模式集只写一次：Literal 供请求校验/schema，frozenset 供持久化白名单复用。
+PromotionMode = Literal["sales_cap", "budget_scenario", "actual_budget", "contribution_cap"]
+PROMOTION_MODE_VALUES = frozenset(get_args(PromotionMode))
+
+# 列名 -> 校验类别；date=ISO日期串，label=枚举串，decimal=十进制串，int=非负整数。
+PROMOTION_COLUMN_KINDS: Mapping[str, str] = {
+    "mode": "label",
+    "basis": "label",
+    "spent_through": "date",
+    "sales_estimate": "decimal",
+    "target_ratio": "decimal",
+    "spend_cap": "decimal",
+    "budget": "decimal",
+    "assumed_spend": "decimal",
+    "remaining_budget": "decimal",
+    "overrun": "decimal",
+    "daily_allowance": "decimal",
+    "remaining_days": "int",
+}
+
+PROMOTION_RESULT_COLUMNS = frozenset(PROMOTION_COLUMN_KINDS)
+PROMOTION_DATE_RESULT_COLUMNS = frozenset(
+    key for key, kind in PROMOTION_COLUMN_KINDS.items() if kind == "date")
+PROMOTION_LABEL_RESULT_COLUMNS = frozenset(
+    key for key, kind in PROMOTION_COLUMN_KINDS.items() if kind == "label")
+PROMOTION_NUMERIC_RESULT_COLUMNS = frozenset(
+    key for key, kind in PROMOTION_COLUMN_KINDS.items() if kind in ("decimal", "int"))
+
+# 标签列的可取值集合：mode 只允许四种模式，basis 只允许假设口径。
+PROMOTION_LABEL_VALUES: Mapping[str, frozenset[str]] = {
+    "mode": PROMOTION_MODE_VALUES,
+    "basis": frozenset({ASSUMPTION_BASIS}),
+}
+# 声明了 label 却没有可取集合的列，在白名单里会变成无规则列，先在源头拦住。
+assert frozenset(PROMOTION_LABEL_VALUES) == PROMOTION_LABEL_RESULT_COLUMNS
+assert (PROMOTION_DATE_RESULT_COLUMNS | PROMOTION_LABEL_RESULT_COLUMNS
+        | PROMOTION_NUMERIC_RESULT_COLUMNS) == PROMOTION_RESULT_COLUMNS
+
+SPEND_CAP_COLUMNS: tuple[str, ...] = ("mode", "spend_cap", "sales_estimate", "target_ratio",
+                                      "basis")
+BUDGET_SCENARIO_COLUMNS: tuple[str, ...] = ("mode", "budget", "assumed_spend",
+                                            "remaining_budget", "overrun", "remaining_days",
+                                            "daily_allowance", "spent_through", "basis")
+
+SPEND_CAP_DEFINITIONS: Mapping[str, str] = {
+    "spend_cap": "上限=假设销售额×假设费用率；预测销售不达预期时阈值需调整",
+}
+BUDGET_SCENARIO_DEFINITIONS: Mapping[str, str] = {
+    "remaining_budget": "剩余预算=预算-假设已花（下限0）",
+    "overrun": "超支=假设已花-预算（下限0），单列展示",
+    "daily_allowance": "日均可用=剩余预算/剩余天数；周期结束不除零",
+}
+PROMOTION_METRIC_DEFINITIONS: Mapping[str, str] = {
+    **SPEND_CAP_DEFINITIONS, **BUDGET_SCENARIO_DEFINITIONS,
+}
+
+PERIOD_ENDED_LIMITATION = "周期已结束或无剩余天数，无法计算日均可用"
+ASSUMPTION_ONLY_LIMITATION = "预算测算只能使用当前用户明确输入的假设，不能沿用上轮参数"
+PROMOTION_PUBLIC_LIMITATIONS = frozenset({
+    NO_SOURCE_LIMITATION, NOT_AVAILABLE_LIMITATION, PERIOD_ENDED_LIMITATION,
+    ASSUMPTION_ONLY_LIMITATION,
+})
+
+# 确认校验的问题是按键名生成的模板，按键名白名单收紧成可校验模式。
+_CONFIRMATION_KEYS = "(?:" + "|".join(_MODE_AMOUNTS) + ")"
+PROMOTION_LIMITATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"^缺少明确确认的 {_CONFIRMATION_KEYS}$"),
+    re.compile(rf"^{_CONFIRMATION_KEYS} 与当前输入不一致，请重新确认$"),
+)
+
+
+def _project(declared: tuple[str, ...], values: Mapping[str, object]) -> dict[str, object]:
+    """按声明列顺序产出结果行；行键与契约不一致即为开发期缺陷，直接失败。"""
+    extra = set(values) - set(declared)
+    missing = set(declared) - set(values)
+    if extra or missing:
+        raise ValueError(
+            f"promotion_column_drift:{sorted(missing)}:{sorted(extra)}")
+    unknown = set(declared) - PROMOTION_RESULT_COLUMNS
+    if unknown:
+        raise ValueError(f"promotion_column_undeclared:{sorted(unknown)}")
+    return {key: values[key] for key in declared}
+
+
 class PromotionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    mode: Literal["sales_cap", "budget_scenario", "actual_budget", "contribution_cap"]
+    mode: PromotionMode
     start: date
     end: date
     currency: Literal["CNY"] = "CNY"
@@ -111,19 +204,21 @@ def evaluate_promotion(request: PromotionRequest, *, confirmed_inputs: dict[str,
         return ToolResult(
             status="invalid_parameters",
             coverage=Coverage(status="missing", start=None, end=None),
-            limitations=problems + ["预算测算只能使用当前用户明确输入的假设，不能沿用上轮参数"],
+            limitations=problems + [ASSUMPTION_ONLY_LIMITATION],
             filters=filters)
     limitations = [NO_SOURCE_LIMITATION]
     if request.mode == "sales_cap":
         cap = request.sales_estimate * request.target_ratio  # type: ignore[operator]
         return ToolResult(
             status="ok",
-            data=[{"mode": "sales_cap", "spend_cap": format(cap, "f"),
-                   "sales_estimate": format(request.sales_estimate, "f"),
-                   "target_ratio": format(request.target_ratio, "f"),  # type: ignore[union-attr]
-                   "basis": ASSUMPTION_BASIS}],
-            metric_definition={"spend_cap": "上限=假设销售额×假设费用率；"
-                                            "预测销售不达预期时阈值需调整"},
+            data=[_project(SPEND_CAP_COLUMNS, {
+                "mode": "sales_cap",
+                "spend_cap": format(cap, "f"),
+                "sales_estimate": format(request.sales_estimate, "f"),
+                "target_ratio": format(request.target_ratio, "f"),  # type: ignore[union-attr]
+                "basis": ASSUMPTION_BASIS,
+            })],
+            metric_definition=dict(SPEND_CAP_DEFINITIONS),
             filters=filters,
             coverage=Coverage(status="missing", start=None, end=None),
             limitations=limitations)
@@ -134,11 +229,11 @@ def evaluate_promotion(request: PromotionRequest, *, confirmed_inputs: dict[str,
     overrun = max(Decimal(0), request.assumed_spend - request.budget)
     days = (request.end - request.spent_through).days
     if days > 0:
-        daily_allowance = remaining / days
+        daily_allowance: Decimal | None = remaining / days
     else:
         daily_allowance = None
-        limitations.append("周期已结束或无剩余天数，无法计算日均可用")
-    data: dict[str, str | int | None] = {
+        limitations.append(PERIOD_ENDED_LIMITATION)
+    data = _project(BUDGET_SCENARIO_COLUMNS, {
         "mode": "budget_scenario",
         "budget": format(request.budget, "f"),
         "assumed_spend": format(request.assumed_spend, "f"),
@@ -148,12 +243,10 @@ def evaluate_promotion(request: PromotionRequest, *, confirmed_inputs: dict[str,
         "daily_allowance": format(daily_allowance, "f") if daily_allowance is not None else None,
         "spent_through": request.spent_through.isoformat(),
         "basis": ASSUMPTION_BASIS,
-    }
+    })
     return ToolResult(
         status="ok", data=[data],
-        metric_definition={"remaining_budget": "剩余预算=预算-假设已花（下限0）",
-                           "overrun": "超支=假设已花-预算（下限0），单列展示",
-                           "daily_allowance": "日均可用=剩余预算/剩余天数；周期结束不除零"},
+        metric_definition=dict(BUDGET_SCENARIO_DEFINITIONS),
         filters=filters,
         coverage=Coverage(status="missing", start=None, end=None),
         limitations=limitations)
