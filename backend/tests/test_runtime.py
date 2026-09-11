@@ -288,6 +288,43 @@ class AttributionDisclosureContractTests(unittest.TestCase):
         self.assertEqual(_limitation_codes([self.TEXT]), ["revenue_not_attributed"])
 
 
+class TruncationLimitationContractTests(unittest.TestCase):
+    """行数上限是合法的范围提示，不是契约违规。
+
+    真实库回归发现：90 天商品分组查询命中 MAX_ROWS 后，
+    「结果行数达到N上限…」这句不在公开词表里，载荷校验抛
+    unsafe_persistence_payload，图把合法降级误报成 result_contract_violation。
+    """
+
+    TEXT = "结果行数达到1000上限，已拒绝出数以避免静默截断；请缩小日期范围或店铺范围"
+
+    def _payload(self, limitation, status="unavailable"):
+        return {
+            "status": status, "metric_definition": {},
+            "coverage": {"status": "complete", "start": "2026-06-13",
+                         "end": "2026-09-11", "gaps": []},
+            "limitations": [limitation], "data_as_of": None,
+            "filters": {}, "data": [],
+        }
+
+    def test_row_cap_disclosure_is_a_public_limitation(self):
+        from bi_agent.runtime.models import validate_artifact_payload, validate_model_payload
+
+        validate_model_payload(self._payload(self.TEXT))
+        validate_artifact_payload(self._payload(self.TEXT))
+
+    def test_row_cap_disclosure_maps_to_result_too_large(self):
+        from bi_agent.business_query.nodes import _limitation_codes
+
+        self.assertEqual(_limitation_codes([self.TEXT]), ["result_too_large"])
+
+    def test_row_cap_text_cannot_be_padded_with_identifiers(self):
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        with self.assertRaises(ValueError):
+            validate_artifact_payload(self._payload(self.TEXT + " 店铺166754"))
+
+
 class CoverageContractTests(unittest.TestCase):
     """覆盖契约加 suggested_window 时，旧 Artifact 必须继续可读。"""
 

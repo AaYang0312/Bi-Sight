@@ -107,6 +107,9 @@ _PUBLIC_LIMITATIONS = frozenset({
 _PUBLIC_LIMITATION_PATTERNS = (
     re.compile(r"^存在[0-9]+条未匹配的平台成功退款，退款归属未确认$"),
     re.compile(r"^结果超过[0-9]+组，请缩小日期范围或店铺范围$"),
+    # 行数上限是合法降级提醒，不登记就会被契约校验拒掉并误报成 result_contract_violation。
+    re.compile(r"^结果行数达到[0-9]+上限，已拒绝出数以避免静默截断；"
+               r"请缩小日期范围或店铺范围$"),
     # 商品归属披露：四个分项必现（缺项就是给猜测留空间），金额形式与 _DECIMAL_RE 同源。
     re.compile(
         r"^支付额中" + _MONEY + r"元未计入商品维度"

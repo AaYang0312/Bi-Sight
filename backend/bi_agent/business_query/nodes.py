@@ -420,6 +420,10 @@ def _limitation_codes(limitations: list[str]) -> list[str]:
         code = _LIMITATION_CODES.get(limitation)
         if code is None and limitation.startswith("结果超过") and limitation.endswith("组，请缩小日期范围或店铺范围"):
             code = "result_too_large"
+        if (code is None and limitation.startswith("结果行数达到")
+                and "已拒绝出数以避免静默截断" in limitation):
+            # 与日分组超限同一归因：都是“范围太大”，不是数据异常。
+            code = "result_too_large"
         if code is None and limitation.startswith("支付额中") and "未计入商品维度" in limitation:
             # 参数化文本：只有已通过载荷校验的披露形式能归到这个码。
             code = "revenue_not_attributed"
