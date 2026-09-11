@@ -223,7 +223,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(columns, [
             "shop_id", "day", "product_id", "quantity", "gift_quantity",
             "product_paid_amount", "allocation_verified", "line_kind",
-            "product_name",
+            "product_name", "product_name_snapshot",
         ])
         exposed = self.conn.execute(
             "SELECT table_name, view_definition FROM information_schema.views "
@@ -232,17 +232,40 @@ class DatabaseTests(unittest.TestCase):
         for name, definition in exposed:
             self.assertNotIn("purchase_price", definition, f"{name} 暴露了成本列")
 
-    def test_product_dimension_migration_is_forward_only_and_idempotent(self):
+    def test_migration_chain_005_then_007_is_forward_only(self):
+        """005 → 007 必须能按顺序执行，且各自可重复执行。"""
         from pathlib import Path
 
-        migration = Path(__file__).parents[1] / "sql" / "005_product_dimension.sql"
-        self.assertTrue(migration.exists(), "缺少 005 商品维表迁移")
-        sql = migration.read_text(encoding="utf-8")
-        self.conn.execute(sql)
-        self.conn.execute(sql)   # 可重复执行
-        self.assertEqual(
-            self.conn.execute("SELECT count(*) FROM information_schema.tables "
-                              "WHERE table_schema='bi' AND table_name='products'").fetchone()[0], 1)
+        sql_dir = Path(__file__).parents[1] / "sql"
+        # 回到 003 产出的视图形状（带 line_kind、不带名称列），再跑 005。
+        self.conn.execute("DROP VIEW IF EXISTS reporting.v_product_daily")
+        self.conn.execute("DROP TABLE IF EXISTS bi.products CASCADE")
+        self.conn.execute((sql_dir / "003_kuaimai_metric_semantics.sql").read_text(encoding="utf-8"))
+
+        fifth = (sql_dir / "005_product_dimension.sql").read_text(encoding="utf-8")
+        self.conn.execute(fifth)
+        self.conn.execute(fifth)
+        self.assertEqual(self._view_columns("v_product_daily"), [
+            "shop_id", "day", "product_id", "quantity", "gift_quantity",
+            "product_paid_amount", "allocation_verified", "line_kind", "product_name",
+        ])
+
+        seventh = (sql_dir / "007_catalog_identity.sql").read_text(encoding="utf-8")
+        self.conn.execute(seventh)
+        self.conn.execute(seventh)
+        self.assertEqual(self._view_columns("v_product_daily"), [
+            "shop_id", "day", "product_id", "quantity", "gift_quantity",
+            "product_paid_amount", "allocation_verified", "line_kind",
+            "product_name", "product_name_snapshot",
+        ])
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.catalog_state WHERE id = 1").fetchone()[0], 1)
+
+    def _view_columns(self, view: str) -> list[str]:
+        return [row[0] for row in self.conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='reporting' AND table_name=%s "
+            "ORDER BY ordinal_position", (view,)).fetchall()]
 
     # -- 交易规范化与支付重建 -------------------------------------------------
 
