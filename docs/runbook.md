@@ -65,6 +65,19 @@ uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity aftersale
 
 成交名称与规格快照（`product_name_snapshot` / `sku_label_snapshot`）只在新写入或显式重放时采集：执行完 007 的历史行仍是 NULL，名称回落到商品档案，规格则不展示，不从商品名猜。测试库实测：1488 行商品日数据全部有档案名、0 行有成交快照与规格，属预期而不是缺陷。
 
+**部署合单取证修正（`basis='items_merged'`）后必须重算历史支付事实**：判定只影响新发生的
+`rebuild_payments` 调用，已落库的合单仍会停在 `undetermined`（金额为 NULL，店铺侧看不见这笔收入）。
+对历史范围跑一次 `replay --entity orders` 即可重算；完成后核对：
+
+```powershell
+psql -d bi_agent -c "SELECT basis, verified, count(*), coalesce(sum(amount),0) "
+                "FROM bi.order_payments GROUP BY 1,2 ORDER BY 1;"
+```
+
+预期 `undetermined` 归零（或仅剩确实证据不全的单），并出现 `items_merged` 行。本地实测：
+166754 单店 685 个 undetermined 全部转为已核验，救回 68,617.84 元，且降级守卫拦截 0 次
+（没有任何已核验收入被清零）。
+
 ```powershell
 Set-Location backend
 uv run --env-file ../.env.sync python -m bi_agent.sync shops
