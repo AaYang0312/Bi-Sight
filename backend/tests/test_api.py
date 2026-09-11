@@ -17,6 +17,8 @@ warnings.filterwarnings("ignore", category=StarletteDeprecationWarning, module="
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from tests.fakeconn import S1_REF, ShopCatalogConn
+
 
 class ApiTests(unittest.TestCase):
     def test_runtime_factory_loads_app_and_selected_model(self):
@@ -190,8 +192,7 @@ class ApiTests(unittest.TestCase):
                 reply._message = Message(role="assistant", content=reply.text)
                 return reply
 
-        conn = Mock()
-        conn.execute.return_value.fetchall.return_value = [("S1", "店铺A")]
+        conn = ShopCatalogConn()   # 同时服务 _fetch_shops 与目录投影两处读取
         model = PromotionModel()
         chat_id = uuid4()
         now = datetime(2026, 9, 8, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -243,7 +244,7 @@ class ApiTests(unittest.TestCase):
                 call = ToolCall(
                     id="call_1", name="query_business", arguments={
                         "start": "2026-09-01", "end": "2026-09-08",
-                        "shop_ids": ["shop_1"], "metrics": ["paid_amount"],
+                        "shop_ids": [S1_REF], "metrics": ["paid_amount"],
                     },
                 )
                 reply = ModelReply(tool_calls=[call])
@@ -262,8 +263,7 @@ class ApiTests(unittest.TestCase):
                     'File "/srv/bi_agent/runtime/repository.py", line 42'
                 )
 
-        conn = Mock()
-        conn.execute.return_value.fetchall.return_value = [("S1", "店铺A")]
+        conn = ShopCatalogConn()   # 同时服务 _fetch_shops 与目录投影两处读取
         model = QueryingModel()
         with patch("bi_agent.agent.PostgresQueryRunStore", FailingRunStore), patch(
             "bi_agent.chats.load_chat_context", return_value=({}, [])
@@ -309,7 +309,7 @@ class ApiTests(unittest.TestCase):
                 call = ToolCall(
                     id="call_1", name="query_business", arguments={
                         "start": "2026-09-01", "end": "2026-09-08",
-                        "shop_ids": ["shop_1"], "metrics": ["paid_amount"],
+                        "shop_ids": [S1_REF], "metrics": ["paid_amount"],
                     },
                 )
                 reply = ModelReply(tool_calls=[call])
@@ -323,8 +323,7 @@ class ApiTests(unittest.TestCase):
             def save_artifact(self, run_id, artifact):  # type: ignore[no-untyped-def]
                 raise ArtifactPersistenceError("database password=not-for-public-output")
 
-        conn = Mock()
-        conn.execute.return_value.fetchall.return_value = [("S1", "店铺A")]
+        conn = ShopCatalogConn()   # 同时服务 _fetch_shops 与目录投影两处读取
         saved_user = SimpleNamespace(id=uuid4())
         chat_id = uuid4()
         model = QueryingModel()
@@ -381,7 +380,7 @@ class ApiTests(unittest.TestCase):
                     call = ToolCall(
                         id="call_1", name="query_business", arguments={
                             "start": "2026-09-01", "end": "2026-09-08",
-                            "shop_ids": ["shop_1"], "metrics": ["paid_amount"],
+                            "shop_ids": [S1_REF], "metrics": ["paid_amount"],
                         },
                     )
                     reply = ModelReply(tool_calls=[call])

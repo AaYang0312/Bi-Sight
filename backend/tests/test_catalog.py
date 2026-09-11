@@ -257,5 +257,171 @@ class CatalogMigrationTests(unittest.TestCase):
         })
 
 
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class CatalogProjectionTests(unittest.TestCase):
+    """模型只看引用，真名只进展示层（计划 Task 2 核心断言）。"""
+
+    def setUp(self):
+        from tests.dbfixtures import connect_test_db
+
+        self.conn = connect_test_db(self)
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) VALUES "
+            "('S_CAT_P','fxg','目录投影店'), ('S_CAT_Q','pdd','未授权店') "
+            "ON CONFLICT (shop_id) DO UPDATE SET display_name=EXCLUDED.display_name")
+        self.conn.execute(
+            "INSERT INTO bi.products(product_id, title, normalization_status) "
+            "VALUES ('P_CAT','直钉枪-元发','normal') "
+            "ON CONFLICT (product_id) DO UPDATE SET title=EXCLUDED.title")
+
+    def _result(self, rows):
+        from datetime import date, datetime
+
+        from bi_agent.metrics import METRIC_DEFINITIONS, Coverage, ToolResult
+
+        return ToolResult(
+            status="ok",
+            coverage=Coverage(status="complete", start=date(2026, 9, 1), end=date(2026, 9, 8)),
+            data_as_of=datetime(2026, 9, 8, tzinfo=BEIJING),
+            # 口径文本必须与生产方一字不差，否则契约校验会先拒掉这份载荷。
+            metric_definition={key: METRIC_DEFINITIONS[key]
+                               for key in ("paid_amount", "quantity")},
+            filters={"start": "2026-09-01", "end": "2026-09-08", "shop_ids": ["S_CAT_P"]},
+            data=rows,
+        )
+
+    def _project(self, rows, *, allowed=("S_CAT_P",)):
+        import json
+
+        from bi_agent.business_query.tool import to_model_result, to_public_artifact
+        from bi_agent.catalog import build_catalog
+
+        result = self._result(rows)
+        catalog = build_catalog(self.conn, result, allowed_shop_ids=frozenset(allowed))
+        model = to_model_result(result, catalog)
+        public = to_public_artifact(result, catalog)
+        return catalog, model, public, json.dumps(model, ensure_ascii=False), \
+            json.dumps(public, ensure_ascii=False)
+
+    def test_model_sees_refs_and_never_the_real_name(self):
+        _, model, _, model_json, public_json = self._project(
+            [{"shop_id": "S_CAT_P", "paid_amount": "100"}])
+
+        self.assertIn("目录投影店", public_json)
+        self.assertNotIn("目录投影店", model_json)
+        self.assertNotIn("S_CAT_P", model_json, "ERP 店铺主键不得进模型")
+        self.assertNotIn("166754", model_json)
+        shop_ref = model["data"][0]["shop_ref"]
+        self.assertRegex(shop_ref, r"^ent-[0-9a-z]{8}$")
+        self.assertEqual(model["filters"]["shop_refs"], [shop_ref])
+
+    def test_artifact_carries_names_source_and_catalog_version(self):
+        from bi_agent.catalog import catalog_version
+
+        _, _, public, _, _ = self._project(
+            [{"shop_id": "S_CAT_P", "paid_amount": "100"},
+             {"shop_id": "S_CAT_P", "product_id": "P_CAT", "quantity": "3",
+              "line_kind": "sale", "product_name": "直钉枪-元发",
+              "product_name_snapshot": "旧成交名"}])
+
+        entities = {item["ref"]: item for item in public["entities"]}
+        self.assertEqual(len(entities), 2)
+        shop = [item for item in entities.values() if item["kind"] == "shop"][0]
+        product = [item for item in entities.values() if item["kind"] == "product"][0]
+        self.assertEqual((shop["display_name"], shop["name_source"]),
+                         ("目录投影店", "shop_profile"))
+        self.assertEqual((product["display_name"], product["name_source"]),
+                         ("直钉枪-元发", "archive"))
+        self.assertEqual(public["catalog_version"], catalog_version(self.conn))
+
+    def test_snapshot_is_used_only_when_the_archive_has_no_name(self):
+        from bi_agent.business_query.tool import to_public_artifact
+        from bi_agent.catalog import build_catalog
+
+        result = self._result([{"shop_id": "S_CAT_P", "product_id": "P_NAMED",
+                               "quantity": "1", "line_kind": "sale",
+                               "product_name_snapshot": "接头-元发当时名"}])
+        catalog = build_catalog(self.conn, result, allowed_shop_ids=frozenset({"S_CAT_P"}))
+        payload = to_public_artifact(result, catalog)
+
+        product = [item for item in payload["entities"] if item["kind"] == "product"][0]
+        self.assertEqual((product["display_name"], product["name_source"]),
+                         ("接头-元发当时名", "trade_snapshot"))
+
+    def test_refs_are_stable_when_rows_are_reordered(self):
+        rows = [{"shop_id": "S_CAT_P", "product_id": "P_CAT", "quantity": "3",
+                 "line_kind": "sale"}]
+        other = [{"shop_id": "S_CAT_P", "product_id": "P_NAMED", "quantity": "9",
+                  "line_kind": "sale"}]
+
+        _, first, _, _, _ = self._project(rows + other)
+        _, reranked, _, _, _ = self._project(other + rows)
+
+        self.assertEqual({row["product_ref"] for row in first["data"]},
+                         {row["product_ref"] for row in reranked["data"]})
+
+    def test_thirty_products_get_thirty_distinct_refs(self):
+        rows = [{"shop_id": "S_CAT_P", "product_id": f"P_MANY_{index}", "quantity": str(index),
+                 "line_kind": "sale"} for index in range(30)]
+
+        _, model, _, _, _ = self._project(rows)
+
+        self.assertEqual(len({row["product_ref"] for row in model["data"]}), 30)
+
+    def test_top_n_notice_row_survives_projection(self):
+        """超 TopN 提示行只能带 notice；以前会被白名单过滤成空行并触发契约违规。"""
+        _, model, _, model_json, public_json = self._project(
+            [{"shop_id": "S_CAT_P", "paid_amount": "100"},
+             {"notice": "仅返回Top 10，共57个商品"}])
+
+        self.assertIn("仅返回Top 10，共57个商品", model_json)
+        self.assertIn("仅返回Top 10，共57个商品", public_json)
+
+    def test_notice_row_cannot_smuggle_long_erp_identifiers(self):
+        rows = [{"shop_id": "S_CAT_P", "paid_amount": "100"},
+                {"notice": "订单号 548597548700160 异常"}]
+
+        with self.assertRaises(ValueError):
+            self._project(rows)
+
+    def test_rename_is_picked_up_by_later_artifacts_without_rewriting_history(self):
+        """改名只影响之后的解析：已给出的 Artifact 载荷不被覆写。
+
+        真实名称由 v_product_daily 随行带出（bi_app 读不到 bi.products），
+        所以这里按视图同源的方式取当前档案名再投影。
+        """
+        from bi_agent.catalog import bump_catalog_version, catalog_version
+
+        def rows_with_current_name():
+            title = self.conn.execute(
+                "SELECT title FROM bi.products WHERE product_id='P_CAT'").fetchone()[0]
+            return [{"shop_id": "S_CAT_P", "product_id": "P_CAT", "quantity": "1",
+                     "line_kind": "sale", "product_name": title}]
+
+        _, _, before, _, before_json = self._project(rows_with_current_name())
+        old_version = catalog_version(self.conn)
+
+        self.conn.execute("UPDATE bi.products SET title='新档名-元发' "
+                          "WHERE product_id='P_CAT'")
+        bump_catalog_version(self.conn)
+        _, _, after, _, after_json = self._project(rows_with_current_name())
+
+        self.assertIn("直钉枪-元发", before_json)
+        self.assertIn("新档名-元发", after_json)
+        self.assertNotIn("新档名-元发", before_json)
+        self.assertEqual(after["catalog_version"], old_version + 1)
+        product_ref = lambda payload: [item["ref"] for item in payload["entities"]
+                                       if item["kind"] == "product"][0]
+        self.assertEqual(product_ref(after), product_ref(before),
+                         "改名不换引用：同一商品始终同一个 ref")
+
+    def test_unauthorized_shop_in_result_fails_closed(self):
+        from bi_agent.catalog import CatalogUnauthorized
+
+        with self.assertRaises(CatalogUnauthorized):
+            self._project([{"shop_id": "S_CAT_Q", "paid_amount": "100"}],
+                          allowed=("S_CAT_P",))
+
+
 if __name__ == "__main__":
     unittest.main()

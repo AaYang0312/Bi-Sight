@@ -10,6 +10,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from bi_agent.catalog import Catalog
 from bi_agent.metrics import Coverage, QueryRequest, ToolResult
 from bi_agent.runtime.models import (
     ArtifactRef,
@@ -104,7 +105,7 @@ class BusinessQueryContext:
     subject_id: str
     question: str
     previous_filters: dict[str, object]
-    shop_aliases: dict[str, str]
+    shop_refs: dict[str, str]
     allowed_shop_ids: frozenset[str]
     now: datetime
     deadline: float
@@ -120,6 +121,7 @@ class BusinessQueryRuntime:
     resolved_args: dict[str, object] = field(default_factory=dict)
     request: QueryRequest | None = None
     result: ToolResult | None = None
+    catalog: Catalog | None = None
 
 
 @dataclass

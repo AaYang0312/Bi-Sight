@@ -17,6 +17,7 @@ from pydantic import (
     model_validator,
 )
 
+from bi_agent.catalog import EntityKind, REF_RE, is_safe_display_name
 from bi_agent.metrics import Coverage, METRIC_DEFINITIONS
 from bi_agent.promotion import (
     PROMOTION_DATE_RESULT_COLUMNS,
@@ -109,13 +110,16 @@ _EVENT_KEYS = frozenset({
     "limitation_codes", "artifact_refs", "result_count",
 })
 _NORMALIZED_REQUEST_KEYS = frozenset({
-    "shop_aliases", "metrics", "start", "end", "group_by", "compare", "top_n", "currency",
+    "shop_refs", "metrics", "start", "end", "group_by", "compare", "top_n", "currency",
 })
 _ARTIFACT_KEYS = frozenset({
-    "status", "metric_definition", "coverage", "limitations", "data_as_of", "filters", "data",
+    "status", "metric_definition", "coverage", "limitations", "data_as_of", "filters",
+    "data", "entities", "catalog_version",
 })
+# 名称只在授权展示层出现：模型载荷带上这两项就是契约违规。
+_PUBLIC_ONLY_ARTIFACT_KEYS = frozenset({"entities", "catalog_version"})
 _FILTER_KEYS = frozenset({
-    "start", "end", "shop_ids", "metrics", "group_by", "compare", "top_n", "currency",
+    "start", "end", "shop_refs", "metrics", "group_by", "compare", "top_n", "currency",
     "mode",
 })
 
@@ -125,11 +129,13 @@ _CURRENCY_VALUES = frozenset({"CNY"})
 # 结果列白名单以生产方为单一真源：推广列（含类型与可取集合）从 promotion.py 导出，
 # 本模块只补充固定指标侧的列，不再手抄推广列名。
 _METRIC_RESULT_COLUMNS = frozenset({
-    "day", "shop_id", "product_id", "line_kind", "currency",
+    "day", "shop_ref", "product_ref", "line_kind", "currency",
     "paid_amount", "paid_orders", "erp_documents", "aov", "refund_amount",
-    "cash_difference", "cohort_refund_rate", "quantity", "product_paid_amount",
+    "cash_difference", "cohort_refund_rate", "quantity", "product_paid_amount", "notice",
 })
-_ALIAS_RESULT_COLUMNS = frozenset({"shop_id", "product_id"})
+_REF_RESULT_COLUMNS = frozenset({"shop_ref", "product_ref"})
+# 文本列只有上限、转义与长数字主键三道限制；不放开成“任意字符串都收”。
+_TEXT_RESULT_COLUMNS = frozenset({"notice"})
 _DATE_RESULT_COLUMNS = frozenset({"day"}) | PROMOTION_DATE_RESULT_COLUMNS
 _LABEL_RESULT_VALUES: dict[str, frozenset[str]] = {
     "line_kind": _LINE_KINDS,
@@ -138,7 +144,8 @@ _LABEL_RESULT_VALUES: dict[str, frozenset[str]] = {
 }
 _RESULT_COLUMNS = _METRIC_RESULT_COLUMNS | PROMOTION_RESULT_COLUMNS
 # 剩下的列一律按十进制/整数严格校验；推广数值列集合作为交叉校验。
-_NUMERIC_RESULT_COLUMNS = (_RESULT_COLUMNS - _ALIAS_RESULT_COLUMNS - _DATE_RESULT_COLUMNS
+_NUMERIC_RESULT_COLUMNS = (_RESULT_COLUMNS - _REF_RESULT_COLUMNS - _DATE_RESULT_COLUMNS
+                           - _TEXT_RESULT_COLUMNS
                            - frozenset(_LABEL_RESULT_VALUES))
 assert _NUMERIC_RESULT_COLUMNS & PROMOTION_RESULT_COLUMNS == PROMOTION_NUMERIC_RESULT_COLUMNS
 # 投影层（business_query/tool.py）复用同一份白名单，避免二次手抄漂移。
@@ -148,9 +155,11 @@ _NODES = frozenset({
     "received", "resolve_parameters", "validate_parameters", "authorize_scope",
     "execute_fixed_query", "classify_result", "persist_artifact", "finalize",
 })
-_ALIAS_RE = re.compile(r"^shop_[1-9][0-9]*$")
-_PUBLIC_SHOP_RE = re.compile(r"^店铺[1-9][0-9]*$")
-_PRODUCT_ALIAS_RE = re.compile(r"^商品[A-Z]+$")
+# 引用与展示名的形式规则只定义在 bi_agent.catalog 一处，这里复用不拄写。
+_REF_RE = REF_RE
+_ENTITY_KINDS = frozenset(kind.value for kind in EntityKind)
+_NAME_SOURCES = frozenset({"archive", "trade_snapshot", "shop_profile", "unresolved"})
+_ENTITY_KEYS = frozenset({"ref", "kind", "display_name", "sku_label", "name_source"})
 _DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _GAP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}~[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _DECIMAL_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
@@ -203,18 +212,39 @@ def _datetime_string(value: object) -> None:
         _unsafe_payload()
 
 
-def _alias(value: object, *, public: bool) -> None:
-    if not isinstance(value, str):
-        _unsafe_payload()
-    pattern = _PUBLIC_SHOP_RE if public else _ALIAS_RE
-    if not pattern.fullmatch(value):
+def _ref(value: object) -> None:
+    """模型与展示层只允许不透明引用；ERP 店铺号与商品号一律拒收。"""
+    if not isinstance(value, str) or not _REF_RE.fullmatch(value):
         _unsafe_payload()
 
 
-def _alias_or_invalid_shop(value: object) -> None:
+def _entities(value: object) -> None:
+    if not isinstance(value, list):
+        _unsafe_payload()
+    seen: set[str] = set()
+    for item in value:
+        entity = _mapping(item, allowed=_ENTITY_KEYS,
+                         required=frozenset({"ref", "kind", "name_source"}))
+        _ref(entity["ref"])
+        if entity["ref"] in seen:
+            _unsafe_payload()
+        seen.add(entity["ref"])
+        _string_in(entity["kind"], _ENTITY_KINDS)
+        _string_in(entity["name_source"], _NAME_SOURCES)
+        for key in ("display_name", "sku_label"):
+            present = entity.get(key) is not None
+            if present and not is_safe_display_name(entity[key]):
+                _unsafe_payload()
+        if entity["name_source"] != "unresolved" and entity.get("display_name") is None:
+            _unsafe_payload()
+        if entity["name_source"] == "unresolved" and entity.get("display_name") is not None:
+            _unsafe_payload()
+
+
+def _ref_or_invalid_shop(value: object) -> None:
     if value == "invalid_shop":
         return
-    _alias(value, public=False)
+    _ref(value)
 
 
 def _string_list(value: object, validator) -> None:
@@ -260,8 +290,8 @@ def _artifact_refs(value: object) -> None:
 
 def _normalized_request(value: object) -> dict[str, object]:
     request = _mapping(value, allowed=_NORMALIZED_REQUEST_KEYS)
-    if "shop_aliases" in request:
-        _string_list(request["shop_aliases"], _alias_or_invalid_shop)
+    if "shop_refs" in request:
+        _string_list(request["shop_refs"], _ref_or_invalid_shop)
     if "metrics" in request:
         _string_list(request["metrics"], lambda item: _string_in(item, _METRICS))
     for boundary in ("start", "end"):
@@ -380,10 +410,10 @@ def _result_rows(value: object, *, public: bool) -> None:
                 _date_string(result_value)
             elif key in _LABEL_RESULT_VALUES:
                 _string_in(result_value, _LABEL_RESULT_VALUES[key])
-            elif key == "shop_id":
-                _alias(result_value, public=public)
-            elif key == "product_id":
-                if not isinstance(result_value, str) or not _PRODUCT_ALIAS_RE.fullmatch(result_value):
+            elif key in _REF_RESULT_COLUMNS:
+                _ref(result_value)
+            elif key in _TEXT_RESULT_COLUMNS:
+                if not is_safe_display_name(result_value):
                     _unsafe_payload()
             else:
                 # 白名单内但没有校验规则的列一律拒绝：新增列必须同步声明类型。
@@ -395,8 +425,8 @@ def _filters(value: object, *, public: bool) -> None:
     for boundary in ("start", "end"):
         if boundary in filters:
             _date_string(filters[boundary])
-    if "shop_ids" in filters:
-        _string_list(filters["shop_ids"], lambda item: _alias(item, public=public))
+    if "shop_refs" in filters:
+        _string_list(filters["shop_refs"], _ref)
     if "metrics" in filters:
         _string_list(filters["metrics"], lambda item: _string_in(item, _METRICS))
     if "group_by" in filters:
@@ -422,6 +452,13 @@ def _metric_definitions(value: object) -> None:
 
 def _public_metric_payload(value: object, *, public: bool) -> dict[str, object]:
     payload = _mapping(value, allowed=_ARTIFACT_KEYS, required=frozenset({"status"}))
+    if not public and _PUBLIC_ONLY_ARTIFACT_KEYS & payload.keys():
+        # 展示名与目录版本不得出现在给模型的载荷里。
+        _unsafe_payload()
+    if "entities" in payload:
+        _entities(payload["entities"])
+    if "catalog_version" in payload:
+        _non_negative_int(payload["catalog_version"])
     _string_in(payload["status"], _PUBLIC_PAYLOAD_STATUSES)
     if "metric_definition" in payload:
         _metric_definitions(payload["metric_definition"])

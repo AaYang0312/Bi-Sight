@@ -1,6 +1,7 @@
-"""单Agent对话：两个工具、有限回合、会话筛选与匿名映射。
+"""单Agent对话：两个工具、有限回合、会话筛选与不透明引用。
 
-模型只看到匿名店铺编号与聚合结果；权限验证在映射前后都执行；
+模型只看到店铺的 ent- 引用与聚合结果，永远看不到真实店名、品名或 ERP 主键；
+真名在后端确定性地改写到正文里，权限验证在映射前后都执行；
 金额一律来自确定性工具结果，模型不重算。
 """
 
@@ -23,6 +24,13 @@ from .business_query.tool import (
     to_public_artifact as _to_public_artifact,
 )
 from .business_query import BusinessQueryContext
+from .catalog import (
+    Catalog,
+    build_catalog,
+    ref_for_key,
+    render_display_text,
+    shop_display_labels,
+)
 from .llm import ChatModel, Message, ModelError, ModelReply, ToolCall
 from .metrics import QueryRequest, ToolResult, resolve_period
 from .promotion import PromotionRequest, evaluate_promotion
@@ -36,12 +44,14 @@ MAX_KEPT_TURNS = 6
 
 _SYSTEM_PROMPT = """你是内部电商经营助手。当前北京时间：{now:%Y-%m-%d %H:%M}（Asia/Shanghai）。
 只能使用两个工具：
-- query_business：按已确认口径查询经营指标，日期end排他，店铺使用匿名编号{alias_doc}。
+- query_business：按已确认口径查询经营指标，日期end排他；shop_ids 只能填 ent- 形式的店铺引用，
+  可用引用：{ref_doc}。引用与真实店名的对应关系你看不到，也不要猜。
 - evaluate_promotion：仅按当前用户明确假设测算预算；当前未取得真实推广消耗。
 支持指标：支付金额、支付订单数、客单价、ERP单据数、退款发生额、期间收支差额、同批退款率、商品销量、商品支付金额。
 支持维度：合计、按日、按店铺、按商品。
+结果里的 shop_ref/product_ref 是实体引用：正文直接引用它们，系统会负责换成经营者可读的名称。
+「销售额」在未确认支付/出库口径前不能直接当支付金额；只能按店铺筛，不能按商品名筛。
 数据共同截止与覆盖限制会在工具结果中给出；未覆盖的历史不能编造数字。
-「销售额」在未确认支付/出库口径前不能直接当支付金额；店铺同名时必须先澄清。
 已知能力之外（广告实耗、全平台汇总、净利润）明确说不可用。
 不要重算金额，不要把相关性写成因果；数字以工具结果为准。"""
 
@@ -70,7 +80,7 @@ _PII_PATTERNS = (
 class SessionState(BaseModel):
     model_config = ConfigDict(extra="forbid")
     subject: str
-    shop_aliases: dict[str, str] = Field(default_factory=dict)  # shop_id -> 匿名编号
+    shop_refs: dict[str, str] = Field(default_factory=dict)   # shop_id -> ent- 引用
     filters: dict[str, object] = Field(default_factory=dict)
     turns: list[Message] = Field(default_factory=list)
 
@@ -79,6 +89,8 @@ class TurnResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str
     results: list[ToolResult] = Field(default_factory=list)
+    # 已投影的公开载荷（带 entities）：展示层直接用，不再二次投影。
+    artifacts: list[dict[str, object]] = Field(default_factory=list)
     clarification: str | None = None
     error_code: str | None = None
     state: SessionState
@@ -125,22 +137,22 @@ def _fetch_shops(conn, allowed_shop_ids: frozenset[str]) -> list[tuple[str, str]
     return [(str(row[0]), str(row[1] or "")) for row in rows]
 
 
-def _ensure_aliases(state: SessionState, allowed_shop_ids: frozenset[str],
-                    shops: list[tuple[str, str]]) -> SessionState:
-    aliases = dict(state.shop_aliases)
+def _ensure_shop_refs(state: SessionState,
+                      allowed_shop_ids: frozenset[str]) -> SessionState:
+    """引用由 (kind, shop_id) 纯派生：重排、换授权范围、重跑都不会换号。"""
+    refs = dict(state.shop_refs)
     changed = False
-    for index, shop_id in enumerate(sorted(allowed_shop_ids), start=1):
-        alias = f"shop_{index}"
-        existing = aliases.get(shop_id)
-        if existing != alias:
-            aliases[shop_id] = alias
+    for shop_id in sorted(allowed_shop_ids):
+        ref = ref_for_key("shop", shop_id)
+        if refs.get(shop_id) != ref:
+            refs[shop_id] = ref
             changed = True
-    for shop_id in list(aliases):
+    for shop_id in list(refs):
         if shop_id not in allowed_shop_ids:
-            aliases.pop(shop_id)
+            refs.pop(shop_id)
             changed = True
     if changed:
-        state = state.model_copy(update={"shop_aliases": aliases})
+        state = state.model_copy(update={"shop_refs": refs})
     return state
 
 
@@ -153,13 +165,13 @@ def _detect_metrics(question: str) -> list[str]:
 
 
 def _detect_shop_ids(question: str, shops: list[tuple[str, str]],
-                     aliases: dict[str, str]) -> tuple[list[str], list[str]]:
+                     refs: dict[str, str]) -> tuple[list[str], list[str]]:
     """返回 (匹配的shop_ids, 同名店铺歧义名单)。"""
     matched: list[str] = []
     ambiguous: list[str] = []
-    alias_reverse = {alias: shop_id for shop_id, alias in aliases.items()}
-    for alias, shop_id in alias_reverse.items():
-        if re.search(rf"{alias}\b", question):
+    ref_reverse = {ref: shop_id for shop_id, ref in refs.items()}
+    for ref, shop_id in ref_reverse.items():
+        if ref in question:
             matched.append(shop_id)
     for shop_id, display_name in shops:
         if display_name and display_name in question:
@@ -179,10 +191,11 @@ def _contains_pii(question: str) -> bool:
 
 
 def _anonymize_question(question: str, shops: list[tuple[str, str]],
-                        aliases: dict[str, str]) -> str:
+                        refs: dict[str, str]) -> str:
+    """把用户问题里的真实店名换成引用：同名店己在前面的歧义澄清里拦下。"""
     for shop_id, display_name in shops:
         if display_name:
-            question = question.replace(display_name, aliases.get(shop_id, "未授权店铺"))
+            question = question.replace(display_name, refs.get(shop_id, "未授权店铺"))
     return question
 
 
@@ -196,14 +209,28 @@ def _trim_turns(turns: list[Message]) -> list[Message]:
     return turns
 
 
-def to_model_result(result: ToolResult, state: SessionState) -> dict[str, object]:
-    """模型只看匿名店铺、匿名商品和必要聚合结果。"""
-    return _to_model_result(result, state.shop_aliases)
+def to_model_result(result: ToolResult, catalog: Catalog) -> dict[str, object]:
+    """模型只看引用与必要聚合结果。"""
+    return _to_model_result(result, catalog)
 
 
-def to_public_artifact(result: ToolResult, state: SessionState) -> dict[str, object]:
-    """聊天附件同样不保存ERP ID，但使用适合经营者阅读的标签。"""
-    return _to_public_artifact(result, state.shop_aliases)
+def to_public_artifact(result: ToolResult, catalog: Catalog) -> dict[str, object]:
+    """聊天附件不保存ERP ID，但随附授权范围内的真实展示名。"""
+    return _to_public_artifact(result, catalog)
+
+
+def _display_map(artifacts: list[dict[str, object]]) -> dict[str, str | None]:
+    """从已投影的公开载荷里收集 ref -> 展示名，用于正文确定性改写。"""
+    mapping: dict[str, str | None] = {}
+    for payload in artifacts:
+        entities = payload.get("entities")
+        if not isinstance(entities, list):
+            continue
+        for entity in entities:
+            if isinstance(entity, dict) and isinstance(entity.get("ref"), str):
+                name = entity.get("display_name")
+                mapping[entity["ref"]] = name if isinstance(name, str) else None
+    return mapping
 
 
 def encode_sse(event: ChatEvent) -> bytes:
@@ -246,7 +273,7 @@ def run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: Cha
                 subject_id=subject,
             ),
         )
-        artifacts = [to_public_artifact(result, turn.state) for result in turn.results]
+        artifacts = list(turn.artifacts)
         if artifacts:
             yield ChatEvent(event="status", data={"stage": "querying"})
             for artifact in artifacts:
@@ -332,7 +359,7 @@ def _tool_schemas() -> list[dict[str, object]]:
     return [
         {"type": "function", "function": {
             "name": "query_business",
-            "description": "按已确认口径查询经营指标，日期end排他，店铺使用匿名编号",
+            "description": "按已确认口径查询经营指标，日期end排他；shop_ids 只填 ent- 店铺引用",
             "parameters": QueryRequest.model_json_schema()}},
         {"type": "function", "function": {
             "name": "evaluate_promotion",
@@ -389,10 +416,9 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
             text="请删除个人信息（手机号、邮箱、订单号）后重新提问；本工具只输出聚合结果。",
             clarification="请删除个人信息后重新提问", state=state)
     shops = _fetch_shops(conn, allowed_shop_ids)
-    state = _ensure_aliases(state, allowed_shop_ids, shops)
-    alias_doc = "，".join(
-        f"{shop_id}用{state.shop_aliases[shop_id]}表示"
-        for shop_id in sorted(state.shop_aliases))
+    state = _ensure_shop_refs(state, allowed_shop_ids)
+    # 只报引用：真实店名与 ERP 主键一律不进入提示词。
+    ref_doc = "，".join(sorted(set(state.shop_refs.values())))
 
     # 澄清：销售额口径
     if "销售额" in question and "支付" not in question and "出库" not in question \
@@ -405,21 +431,22 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
     values = explicit_assumptions(question)
     period = resolve_period(question, now=now)
     detected_metrics = _detect_metrics(question)
-    matched_shops, ambiguous_names = _detect_shop_ids(question, shops, state.shop_aliases)
+    matched_shops, ambiguous_names = _detect_shop_ids(question, shops, state.shop_refs)
     if ambiguous_names:
         names = "、".join(ambiguous_names)
         return TurnResult(
-            text="", clarification=f"存在多个同名店铺（{names}），请指明要查询的店铺编号。",
+            text="", clarification=f"存在多个同名店铺（{names}），请加上平台或指明店铺引用。",
             state=state)
 
     tools = _tool_schemas()
     system = Message(role="system",
                      content=_SYSTEM_PROMPT.format(now=now.astimezone(BEIJING),
-                                                   alias_doc=alias_doc or "（无店铺）"))
+                                                   ref_doc=ref_doc or "（无店铺）"))
     messages = [system] + list(state.turns)
     messages.append(Message(role="user",
-                            content=_anonymize_question(question, shops, state.shop_aliases)))
+                            content=_anonymize_question(question, shops, state.shop_refs)))
     results: list[ToolResult] = []
+    artifacts: list[dict[str, object]] = []
     calls_used = 0
     correction_used = False
     text_answer: str | None = None
@@ -467,7 +494,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                         subject_id=turn_context.subject_id,
                         question=question,
                         previous_filters=filters,
-                        shop_aliases=state.shop_aliases,
+                        shop_refs=state.shop_refs,
                         allowed_shop_ids=allowed_shop_ids,
                         now=now,
                         deadline=deadline,
@@ -495,12 +522,18 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                     last_error = execution.domain_result.error.public_message
                     error_code = execution.domain_result.error.code
                     results.clear()
+                    artifacts.clear()
                     filters = dict(state.filters)
                     stop_after_batch = True
                     break
                 if execution.tool_result is not None:
                     calls_used += 1
                     results.append(execution.tool_result)
+                    # 图内已按同一目录投出公开载荷：展示层直接复用，不二次投影。
+                    artifacts.extend(
+                        artifact.public_payload
+                        for artifact in execution.domain_result.artifacts
+                    )
                     if execution.session_filters:
                         filters.update(execution.session_filters)
                 messages.append(Message(
@@ -536,9 +569,13 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                 continue
             calls_used += 1
             results.append(outcome)
+            promo_catalog = build_catalog(conn, outcome,
+                                         allowed_shop_ids=allowed_shop_ids)
+            artifacts.append(to_public_artifact(outcome, promo_catalog))
             messages.append(Message(
                 role="tool", tool_call_id=call.id,
-                content=json.dumps(to_model_result(outcome, state), ensure_ascii=False)))
+                content=json.dumps(to_model_result(outcome, promo_catalog),
+                                   ensure_ascii=False)))
         if stop_after_batch:
             break
     if text_answer is None and last_error is None:
@@ -551,5 +588,8 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
         "filters": filters,
         "turns": _trim_turns(messages[1:]),
     })
-    return TurnResult(text=text_answer or last_error or "", results=results,
+    # 确定性改写：模型只可能写出引用，用户读到的是已核验的展示名。
+    # 名字未取得时保留引用，不丢答案、不编名。
+    text = render_display_text(text_answer or last_error or "", _display_map(artifacts))
+    return TurnResult(text=text, results=results, artifacts=artifacts,
                       clarification=None, error_code=error_code, state=new_state)

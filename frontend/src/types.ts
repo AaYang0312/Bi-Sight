@@ -5,6 +5,18 @@ export type ChatSummary = {
   updated_at: string
 }
 
+/**
+ * 授权展示实体：引用由后端稳定派生，展示名只在授权投影里出现。
+ * display_name 为 null 表示名称未取得——前端显示占位，不猜名字。
+ */
+export type DisplayEntity = {
+  ref: string
+  kind: 'shop' | 'product' | 'sku'
+  display_name?: string | null
+  sku_label?: string | null
+  name_source: 'archive' | 'trade_snapshot' | 'shop_profile' | 'unresolved'
+}
+
 export type Artifact = Record<string, unknown>
 
 export type ChatMessage = {

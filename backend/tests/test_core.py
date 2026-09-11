@@ -14,6 +14,8 @@ import httpx
 
 from bi_agent.llm import ToolCall
 from bi_agent.metrics import Coverage, ToolResult
+from bi_agent.catalog import ref_for_key
+from tests.fakeconn import S1_REF, ShopCatalogConn, catalog_rows
 
 
 class ConfigTests(unittest.TestCase):
@@ -316,6 +318,11 @@ class SyncNormalisationTests(unittest.TestCase):
 
             def execute(self, sql, parameters):
                 self.parameters.append(parameters)
+                if "FROM bi.entity_refs" in sql:
+                    # 引用落表的回读：按同一派生规则给出，别把断言带偏。
+                    kind, keys = parameters
+                    return _FakeResult([(key, ref_for_key(kind, key)) for key in keys])
+                return _FakeResult([])   # 未命中变更：fetchone() 返回 None
 
         class Client:
             def call(self, method, parameters):
@@ -517,6 +524,41 @@ class ProductMasterNormalisationTests(unittest.TestCase):
         item = normalise_item_master(self._raw(modified="不是时间"))
 
         self.assertIsNone(item["source_modified_at"])
+
+
+class ItemNameSnapshotTests(unittest.TestCase):
+    """成交名称快照：订单响应实测带 sysTitle / sysSkuPropertiesName，不额外调接口。"""
+
+    @staticmethod
+    def _item(**overrides):
+        raw = {"id": "L1", "oid": "PL1", "tid": "C1", "itemSysId": "P1", "skuSysId": "S1",
+               "num": "1", "payAmount": "10", "type": 0,
+               "sysTitle": "接头-元发", "sysSkuPropertiesName": "接头-元发适五20PP"}
+        raw.update(overrides)
+        return raw
+
+    def _normalised(self, **overrides):
+        from bi_agent.sync import normalise_trade
+
+        trade = normalise_trade({
+            "sid": "E1", "userId": "S1", "tid": "C1", "payAmount": "10",
+            "updTime": 1788166354000, "payTime": 1788166354000,
+            "orders": [self._item(**overrides)],
+        })
+        return trade["items"][0]
+
+    def test_documented_line_text_fields_are_kept_as_snapshots(self):
+        item = self._normalised()
+
+        self.assertEqual(item["product_name_snapshot"], "接头-元发")
+        self.assertEqual(item["sku_label_snapshot"], "接头-元发适五20PP")
+
+    def test_blank_line_text_stays_null_instead_of_borrowing_the_platform_title(self):
+        item = self._normalised(sysTitle="  ", sysSkuPropertiesName=None,
+                               title="平台长标题不算商品名")
+
+        self.assertIsNone(item["product_name_snapshot"])
+        self.assertIsNone(item["sku_label_snapshot"])
 
 
 class PageCompletionEvidenceTests(unittest.TestCase):
@@ -874,9 +916,14 @@ class FakeWarehouse:
     """
 
     def __init__(self, *, daily_rows=(), product_rows=(), shops=(), data_as_of=None,
-                 cohort=(None, None), unmatched=0):
+                 cohort=(None, None), unmatched=0, shop_profiles=(), catalog_version=7):
         self.daily_rows = [tuple(row) for row in daily_rows]
-        self.product_rows = [tuple(row) for row in product_rows]
+        # v_product_daily 末两列是档案名 / 成交快照；测试行没给就按视图形状补上。
+        self.product_rows = [tuple(row) if len(row) == 10
+                             else tuple(row) + (f"档案-{row[2]}", None)
+                             for row in product_rows]
+        self.shop_profiles = [tuple(row) for row in shop_profiles]
+        self.catalog_version = catalog_version
         self.shops = [tuple(row) for row in shops]
         self.data_as_of = data_as_of
         self.cohort = tuple(cohort)
@@ -904,6 +951,10 @@ class FakeWarehouse:
         self.statements.append((text, params))
         if "set_config(" in text or text.startswith("SET TRANSACTION"):
             return _FakeResult([])
+        catalog = catalog_rows(text, shops=self.shop_profiles,
+                               version=self.catalog_version)
+        if catalog is not None:
+            return _FakeResult(catalog.fetchall())
         if "FROM reporting.v_shops" in text:
             return _FakeResult([row for row in self.shops if row[0] in params[0]])
         if "FROM reporting.v_coverage" in text:
@@ -975,6 +1026,7 @@ class MetricBudgetTests(unittest.TestCase):
             product_rows=[("S1", self.START, "P1", Decimal("2"), Decimal("0"),
                            Decimal("200"), True, "sale") for _ in range(3)],
             shops=[("S1", True, "CNY")],
+            shop_profiles=[("S1", "fxg", "档案店S1")],
             data_as_of=self.DATA_AS_OF,
             cohort=(Decimal("700"), Decimal("70")),
         )
@@ -1086,8 +1138,10 @@ class MetricRowCapTests(unittest.TestCase):
                 product_rows.append((shops[0], day, product_id, Decimal("1"),
                                      Decimal("0"), Decimal("100"), True, "sale"))
         return FakeWarehouse(daily_rows=daily_rows, product_rows=product_rows,
-                            shops=[(shop_id, True, "CNY") for shop_id in shops],
-                            data_as_of=self.DATA_AS_OF)
+                             shops=[(shop_id, True, "CNY") for shop_id in shops],
+                             shop_profiles=[(shop_id, "fxg", f"档案店{shop_id}")
+                                            for shop_id in shops],
+                             data_as_of=self.DATA_AS_OF)
 
     def _query(self, warehouse, *, group_by: str, metrics, shop_ids=None):
         import time as time_module
@@ -1508,14 +1562,18 @@ class PromotionTests(unittest.TestCase):
     def test_projection_accepts_every_promotion_shape(self):
         """model 投影与 public artifact 投影对四种模式都不能拒绝自己的生产结果。"""
         from bi_agent.business_query.tool import to_model_result, to_public_artifact
+        from bi_agent.catalog import build_catalog
         from bi_agent.promotion import PromotionRequest, evaluate_promotion
+        from tests.fakeconn import ShopCatalogConn
 
         for args, confirmed in self.promotion_cases():
             result = evaluate_promotion(PromotionRequest.model_validate(args),
                                         confirmed_inputs=confirmed, now=self.NOW)
             with self.subTest(mode=args["mode"], status=result.status):
-                model_payload = to_model_result(result, {"S1": "shop_1"})
-                public_payload = to_public_artifact(result, {"S1": "shop_1"})
+                catalog = build_catalog(ShopCatalogConn(), result,
+                                        allowed_shop_ids=frozenset({"S1"}))
+                model_payload = to_model_result(result, catalog)
+                public_payload = to_public_artifact(result, catalog)
                 self.assertEqual(model_payload["status"], result.status)
                 self.assertEqual(public_payload["status"], result.status)
                 self.assertEqual(public_payload["filters"]["mode"], args["mode"])
@@ -1577,7 +1635,7 @@ class PromotionTests(unittest.TestCase):
 
         covered = (models._NUMERIC_RESULT_COLUMNS | models._DATE_RESULT_COLUMNS
                    | frozenset(models._LABEL_RESULT_VALUES)
-                   | models._ALIAS_RESULT_COLUMNS)
+                   | models._REF_RESULT_COLUMNS | models._TEXT_RESULT_COLUMNS)
         self.assertEqual(covered, models.ARTIFACT_RESULT_COLUMNS)
 
 
@@ -1607,19 +1665,18 @@ class AgentTests(unittest.TestCase):
         )
 
     def _conn(self, shops=(("S1", "店铺A"),)):
-        conn = Mock()
-        conn.execute.return_value.fetchall.return_value = [tuple(s) for s in shops]
-        return conn
+        # 同一次连接要服务两处读取：Agent 的两列档案与目录投影的三列档案。
+        return ShopCatalogConn(shops)
 
     def _call(self, **overrides):
         from bi_agent.llm import ToolCall
 
         args = {"start": "2026-09-01", "end": "2026-09-08",
-                "shop_ids": ["shop_1"], "metrics": ["paid_amount"]}
+                "shop_ids": [S1_REF], "metrics": ["paid_amount"]}
         args.update(overrides)
         return ToolCall(id="call_1", name="query_business", arguments=args)
 
-    def test_first_turn_maps_alias_and_calls_query(self):
+    def test_first_turn_maps_ref_and_calls_query(self):
         from bi_agent.agent import SessionState, answer
 
         model = Mock()
@@ -1640,8 +1697,9 @@ class AgentTests(unittest.TestCase):
         first_model_messages = model.complete.call_args_list[0].args[0]
         model_question = [message.content for message in first_model_messages
                           if message.role == "user"][-1]
-        self.assertIn("shop_1", model_question)
+        self.assertIn(S1_REF, model_question)
         self.assertNotIn("S1", model_question)
+        self.assertNotIn("店铺A", model_question, "真实店名不得进模型")
         self.assertEqual(turn.text, "最近7天支付金额1000元")
 
     def test_agent_routes_business_queries_only_through_the_graph_adapter(self):
@@ -1758,7 +1816,7 @@ class AgentTests(unittest.TestCase):
                 arguments={
                     "start": "2026-09-01",
                     "end": "2026-09-08",
-                    "shop_ids": ["shop_1"],
+                    "shop_ids": [S1_REF],
                     "metrics": ["paid_amount"],
                 },
             )]),
@@ -1783,7 +1841,7 @@ class AgentTests(unittest.TestCase):
 
         calls = [ToolCall(id=f"call_{i}", name="query_business",
                           arguments={"start": "2026-09-01", "end": "2026-09-08",
-                                     "shop_ids": ["shop_1"],
+                                     "shop_ids": [S1_REF],
                                      "metrics": ["paid_amount"]})
                  for i in range(1, 6)]
         model = Mock()
@@ -1803,7 +1861,7 @@ class AgentTests(unittest.TestCase):
 
         return ToolCall(id=call_id, name="query_business",
                         arguments={"start": "2026-09-01", "end": "2026-09-08",
-                                   "shop_ids": ["shop_1"], "metrics": ["paid_amount"]})
+                                   "shop_ids": [S1_REF], "metrics": ["paid_amount"]})
 
     def test_tool_budget_exhaustion_asks_model_for_final_answer(self):
         """工具预算耗尽后必须补一次纯文本回合，不能把内部占位文案给用户。"""
@@ -1976,11 +2034,12 @@ class AgentTests(unittest.TestCase):
                          "synthetic-private-context")
         tool_messages = [m for m in second_call_messages if m.role == "tool"]
         self.assertEqual(tool_messages[0].tool_call_id, "call_1")
-        # 匿名映射：发给模型的结果不含真实店铺ID
+        # 引用映射：发给模型的结果不含真实店铺ID与店名
         self.assertNotIn("S1", tool_messages[0].content)
 
     def test_model_result_hides_erp_identifiers(self):
-        from bi_agent.agent import SessionState, to_model_result
+        from bi_agent.agent import to_model_result
+        from bi_agent.catalog import build_catalog, ref_for_key
 
         result = ToolResult(
             status="ok",
@@ -1989,12 +2048,74 @@ class AgentTests(unittest.TestCase):
             coverage=Coverage(status="complete", start=date(2026, 9, 1),
                               end=date(2026, 9, 8)),
         )
-        payload = to_model_result(result, SessionState(
-            subject="u1", shop_aliases={"S1": "shop_1"}))
-        self.assertEqual(payload["data"][0]["shop_id"], "shop_1")
-        self.assertEqual(payload["filters"]["shop_ids"], ["shop_1"])
-        self.assertNotIn("S1", json.dumps(payload, ensure_ascii=False))
-        self.assertNotIn("ERP-P-9", json.dumps(payload, ensure_ascii=False))
+        catalog = build_catalog(self._conn(), result,
+                                allowed_shop_ids=frozenset({"S1"}))
+        payload = to_model_result(result, catalog)
+        self.assertEqual(payload["data"][0]["shop_ref"], S1_REF)
+        self.assertEqual(payload["data"][0]["product_ref"],
+                         ref_for_key("product", "ERP-P-9"))
+        self.assertEqual(payload["filters"]["shop_refs"], [S1_REF])
+        self.assertNotIn("entities", payload, "展示名不得进模型载荷")
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("S1", rendered)
+        self.assertNotIn("ERP-P-9", rendered)
+
+    def test_final_text_is_rewritten_from_refs_to_real_names(self):
+        """方案 C：模型手里只有引用，用户读到的是已核验的展示名。"""
+        from bi_agent.agent import SessionState, answer
+
+        known = ToolResult(
+            status="ok", data=[{"shop_id": "S1", "paid_amount": "1000"}],
+            filters={"shop_ids": ["S1"]},
+            coverage=Coverage(status="complete", start=date(2026, 9, 1),
+                              end=date(2026, 9, 8)),
+        )
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[self._call()]),
+            _reply(text=f"{S1_REF} 支付金额 1000 元")]
+        with patch("bi_agent.business_query.nodes.metrics.query_business",
+                   return_value=known):
+            turn = answer("最近7天店铺A的支付金额", SessionState(subject="u1"),
+                          model=model, conn=self._conn(),
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
+
+        self.assertEqual(turn.text, "店铺A 支付金额 1000 元")
+        self.assertNotIn(S1_REF, turn.text)
+        # 模型载荷：只拿得到引用，拿不到真名。
+        tool_messages = [message for message in turn.state.turns if message.role == "tool"]
+        self.assertIn(S1_REF, tool_messages[0].content)
+        self.assertNotIn("店铺A", tool_messages[0].content)
+        # 公开附件：带展示名与目录版本。
+        self.assertEqual(turn.artifacts[0]["entities"][0]["display_name"], "店铺A")
+        self.assertEqual(turn.artifacts[0]["catalog_version"], 7)
+
+    def test_unresolved_name_keeps_the_reference_instead_of_losing_the_answer(self):
+        """档案没名字时：正文保留引用并照旧给出数字，不编名也不丢答案。"""
+        from bi_agent.agent import SessionState, answer
+
+        known = ToolResult(
+            status="ok", data=[{"shop_id": "S1", "paid_amount": "1000"}],
+            filters={"shop_ids": ["S1"]},
+            coverage=Coverage(status="complete", start=date(2026, 9, 1),
+                              end=date(2026, 9, 8)),
+        )
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[self._call()]),
+            _reply(text=f"{S1_REF} 支付金额 1000 元")]
+        with patch("bi_agent.business_query.nodes.metrics.query_business",
+                   return_value=known):
+            turn = answer("最近7天支付金额", SessionState(subject="u1"),
+                          model=model, conn=self._conn(shops=(("S1", ""),)),
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
+
+        self.assertIn(S1_REF, turn.text)
+        self.assertIn("1000", turn.text)
+        self.assertIsNone(turn.artifacts[0]["entities"][0].get("display_name"))
+        self.assertEqual(turn.artifacts[0]["entities"][0]["name_source"], "unresolved")
 
     def test_state_isolation_between_users(self):
         from bi_agent.agent import SessionState, answer
@@ -2084,7 +2205,7 @@ class AgentTests(unittest.TestCase):
         model_payload = json.loads(tool_messages[0].content)
         self.assertEqual(model_payload["data"][0]["spend_cap"], "12000.00")
         self.assertEqual(model_payload["filters"]["mode"], "sales_cap")
-        public_payload = to_public_artifact(turn.results[0], turn.state)
+        public_payload = turn.artifacts[0]
         self.assertEqual(public_payload["data"][0]["basis"], "用户输入假设")
         self.assertNotIn("S1", json.dumps(public_payload, ensure_ascii=False))
 

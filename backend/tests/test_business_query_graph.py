@@ -34,6 +34,7 @@ from bi_agent.runtime.models import (
     RecoveryAction,
     RunStatus,
 )
+from tests.fakeconn import S1_REF, S2_REF, CatalogConn
 
 
 class BusinessQueryTransitionTests(unittest.TestCase):
@@ -66,7 +67,7 @@ class BusinessQueryStateContractTests(unittest.TestCase):
         cases = (
             {"normalized_request": {"question": "查询店铺 S1 的销售额"}},
             {"limitations": ["psycopg.errors.SyntaxError: relation missing"]},
-            {"normalized_request": {"shop_aliases": ["S1"]}},
+            {"normalized_request": {"shop_refs": ["S1"]}},
         )
 
         for values in cases:
@@ -104,7 +105,7 @@ class BusinessQueryStateContractTests(unittest.TestCase):
         state = BusinessQueryState(run_id=uuid4())
 
         with self.assertRaisesRegex(ValidationError, "unsafe_persistence_payload"):
-            state.model_copy(update={"normalized_request": {"shop_aliases": ["S1"]}})
+            state.model_copy(update={"normalized_request": {"shop_refs": ["S1"]}})
 
     def test_safe_future_state_shape_remains_serializable(self):
         now = datetime.now(timezone.utc)
@@ -112,7 +113,7 @@ class BusinessQueryStateContractTests(unittest.TestCase):
             run_id=uuid4(),
             node=BusinessQueryNode.CLASSIFY_RESULT,
             normalized_request={
-                "shop_aliases": ["shop_1"],
+                "shop_refs": [S1_REF],
                 "metrics": ["paid_amount"],
                 "start": "2026-09-01",
                 "end": "2026-09-08",
@@ -153,7 +154,7 @@ class BusinessQueryStateContractTests(unittest.TestCase):
             subject_id="user-1",
             question="查询真实店铺 S1 的销售额",
             previous_filters={"shop_id": "S1"},
-            shop_aliases={"shop_1": "S1"},
+            shop_refs={"S1": S1_REF},
             allowed_shop_ids={"S1"},
             now=now,
             deadline=monotonic() + 30,
@@ -199,7 +200,7 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
                 subject_id="user-1",
                 question=question,
                 previous_filters=previous_filters or {},
-                shop_aliases={"S1": "shop_1"},
+                shop_refs={"S1": S1_REF},
                 allowed_shop_ids=frozenset({"S1"}),
                 now=now,
                 deadline=monotonic() + 30,
@@ -213,7 +214,7 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
         validate_parameters(runtime)
         authorize_scope(runtime)
 
-    def test_resolve_inherits_filters_fills_period_and_persists_aliases(self):
+    def test_resolve_inherits_filters_fills_period_and_persists_refs(self):
         runtime = self._runtime(
             question="那上个月呢",
             previous_filters={
@@ -228,7 +229,7 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
         self.assertEqual(runtime.resolved_args["metrics"], ["paid_amount"])
         self.assertEqual(runtime.resolved_args["start"], "2026-08-01")
         self.assertEqual(runtime.resolved_args["end"], "2026-09-01")
-        self.assertEqual(runtime.state.normalized_request["shop_aliases"], ["shop_1"])
+        self.assertEqual(runtime.state.normalized_request["shop_refs"], [S1_REF])
         self.assertNotIn("S1", json.dumps(runtime.state.model_dump(mode="json")))
 
     def test_missing_shop_stops_before_query_execution(self):
@@ -254,7 +255,7 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
         runtime = self._runtime(
             question="查询店铺",
             arguments={
-                "shop_ids": ["shop_1"],
+                "shop_ids": [S1_REF],
                 "start": "not-a-date",
                 "end": "2026-09-02",
                 "metrics": ["paid_amount"],
@@ -281,10 +282,10 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
             ("group_by", {"group_by": "region"}, "invalid_group_by"),
             ("compare", {"compare": "next_period"}, "invalid_compare"),
             ("top_n", {"top_n": 0}, "invalid_top_n"),
-            ("shop_ids", {"shop_ids": "shop_1"}, "invalid_shop"),
+            ("shop_ids", {"shop_ids": S1_REF}, "invalid_shop"),
         )
         base = {
-            "shop_ids": ["shop_1"],
+            "shop_ids": [S1_REF],
             "start": "2026-09-01",
             "end": "2026-09-02",
             "metrics": ["paid_amount"],
@@ -302,7 +303,7 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
                 self.assertEqual(runtime.state.error.code, "invalid_parameters")  # type: ignore[union-attr]
 
     def test_unknown_aliases_and_injection_strings_are_forbidden_without_querying(self):
-        for shop_id in ("shop_2", "'; DROP TABLE reporting.v_shops; --"):
+        for shop_id in (S2_REF, "'; DROP TABLE reporting.v_shops; --"):
             with self.subTest(shop_id=shop_id):
                 runtime = self._runtime(
                     question="查询店铺",
@@ -322,7 +323,7 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
                 self.assertEqual(runtime.state.error.code, "forbidden")  # type: ignore[union-attr]
                 self.assertEqual(runtime.state.problems, ["forbidden"])
                 self.assertEqual(
-                    runtime.state.normalized_request["shop_aliases"], ["invalid_shop"]
+                    runtime.state.normalized_request["shop_refs"], ["invalid_shop"]
                 )
                 self.assertNotIn(shop_id, json.dumps(runtime.state.model_dump(mode="json")))
                 query_business.assert_not_called()
@@ -346,7 +347,7 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
         self.assertEqual(runtime.state.error.code, "forbidden")  # type: ignore[union-attr]
         self.assertEqual(runtime.state.problems, ["forbidden"])
         self.assertEqual(
-            runtime.state.normalized_request["shop_aliases"], ["invalid_shop"]
+            runtime.state.normalized_request["shop_refs"], ["invalid_shop"]
         )
         self.assertNotIn("S1", json.dumps(runtime.state.model_dump(mode="json")))
         query_business.assert_not_called()
@@ -390,7 +391,7 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
                 self.assertEqual(runtime.state.error.code, "invalid_parameters")  # type: ignore[union-attr]
                 self.assertEqual(runtime.state.problems, ["invalid_shop"])
                 self.assertEqual(
-                    runtime.state.normalized_request["shop_aliases"], ["invalid_shop"]
+                    runtime.state.normalized_request["shop_refs"], ["invalid_shop"]
                 )
                 self.assertNotIn("shop_ids", runtime.state.normalized_request)
                 query_business.assert_not_called()
@@ -399,7 +400,7 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
         runtime = self._runtime(
             question="查询店铺",
             arguments={
-                "shop_ids": ["shop_1"],
+                "shop_ids": [S1_REF],
                 "start": "2026-09-01",
                 "end": "2026-09-02",
                 "metrics": ["paid_amount"],
@@ -443,7 +444,7 @@ class BusinessQueryExecutionTests(unittest.TestCase):
             subject_id="user-1",
             question="查询店铺的支付金额",
             previous_filters={},
-            shop_aliases={"S1": "shop_1"},
+            shop_refs={"S1": S1_REF},
             allowed_shop_ids=frozenset({"S1"}),
             now=self.NOW,
             deadline=deadline if deadline is not None else monotonic() + 30,
@@ -454,7 +455,7 @@ class BusinessQueryExecutionTests(unittest.TestCase):
         return BusinessQueryInput(
             tool_call_id="call_1",
             arguments={
-                "shop_ids": ["shop_1"],
+                "shop_ids": [S1_REF],
                 "start": self.START.isoformat(),
                 "end": self.END.isoformat(),
                 "metrics": ["paid_amount"],
@@ -483,7 +484,7 @@ class BusinessQueryExecutionTests(unittest.TestCase):
 
         with patch("bi_agent.metrics.query_business", return_value=result) as query_business:
             execution = _execute_business_query_graph(
-                object(), store, self._tool_input(), context or self._context()
+                CatalogConn(), store, self._tool_input(), context or self._context()
             )
         return execution, query_business
 
@@ -499,7 +500,7 @@ class BusinessQueryExecutionTests(unittest.TestCase):
         self.assertEqual(
             run["normalized_request"],
             {
-                "shop_aliases": ["shop_1"],
+                "shop_refs": [S1_REF],
                 "metrics": ["paid_amount"],
                 "start": "2026-09-01",
                 "end": "2026-09-08",
@@ -604,7 +605,7 @@ class BusinessQueryExecutionTests(unittest.TestCase):
             side_effect=ValueError("malformed projection"),
         ):
             execution = _execute_business_query_graph(
-                object(), store, self._tool_input(), self._context()
+                CatalogConn(), store, self._tool_input(), self._context()
             )
 
         query_business.assert_called_once()
@@ -623,7 +624,7 @@ class BusinessQueryExecutionTests(unittest.TestCase):
         with patch("bi_agent.metrics.query_business", return_value=self._result()):
             with self.assertRaisesRegex(RuntimeError, "connection reset"):
                 _execute_business_query_graph(
-                    object(), store, self._tool_input(), self._context()
+                    CatalogConn(), store, self._tool_input(), self._context()
                 )
 
         self.assertEqual(len(store.runs), 1)
@@ -659,7 +660,7 @@ class BusinessQueryExecutionTests(unittest.TestCase):
             side_effect=ValueError("unsafe_persistence_payload"),
         ) as project:
             execution = _execute_business_query_graph(
-                object(), store, self._tool_input(), self._context()
+                CatalogConn(), store, self._tool_input(), self._context()
             )
 
         project.assert_called_once()

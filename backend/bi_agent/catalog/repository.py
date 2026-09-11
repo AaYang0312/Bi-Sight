@@ -12,6 +12,7 @@ from .models import (
     DisplayEntity,
     EntityKind,
     is_safe_display_name,
+    pick_display_name,
     ref_for_key,
     shop_display_labels,
 )
@@ -123,20 +124,11 @@ def resolve_display_entities(
                 display_name=label if is_safe_display_name(label) else None,
                 name_source="shop_profile" if is_safe_display_name(label) else "unresolved"))
             continue
-        archive = titles.get(natural_key) or ""
-        snapshot = (snapshot_names or {}).get(natural_key)
-        if is_safe_display_name(archive):
-            entities.append(DisplayEntity(
-                ref=ref, kind=EntityKind(kind), display_name=archive,
-                sku_label=_label(sku_labels, natural_key), name_source="archive"))
-        elif is_safe_display_name(snapshot):
-            entities.append(DisplayEntity(
-                ref=ref, kind=EntityKind(kind), display_name=str(snapshot).strip(),
-                sku_label=_label(sku_labels, natural_key), name_source="trade_snapshot"))
-        else:
-            entities.append(DisplayEntity(
-                ref=ref, kind=EntityKind(kind),
-                sku_label=_label(sku_labels, natural_key), name_source="unresolved"))
+        archive = titles.get(natural_key)
+        name, source = pick_display_name(archive, (snapshot_names or {}).get(natural_key))
+        entities.append(DisplayEntity(
+            ref=ref, kind=EntityKind(kind), display_name=name,
+            sku_label=_label(sku_labels, natural_key), name_source=source))
     return entities
 
 

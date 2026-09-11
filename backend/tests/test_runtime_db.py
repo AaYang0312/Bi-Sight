@@ -5,6 +5,7 @@ independent local ``*_test`` database remains unchanged.  The same guardrails
 as ``test_db.py`` prevent this module from connecting to a production host.
 """
 
+import json
 import os
 import traceback
 import unittest
@@ -15,6 +16,7 @@ from uuid import uuid4
 import psycopg
 
 from .dbfixtures import connect_test_db
+from .fakeconn import P1_REF, S1_REF, S2_REF
 from bi_agent.runtime import PostgresQueryRunStore
 from bi_agent.runtime.models import (
     ArtifactPersistenceError,
@@ -78,9 +80,9 @@ class RuntimeStoreValidationTests(unittest.TestCase):
             state={
                 "node": "resolve_parameters",
                 "revision": 1,
-                "normalized_request": {"shop_aliases": ["S1"]},
+                "normalized_request": {"shop_refs": ["S1"]},
             },
-            normalized_request={"shop_aliases": ["S1"]},
+            normalized_request={"shop_refs": ["S1"]},
             payload={},
             error_code=None,
         )
@@ -97,9 +99,9 @@ class RuntimeStoreValidationTests(unittest.TestCase):
             state={
                 "node": "validate_parameters",
                 "revision": 1,
-                "normalized_request": {"shop_aliases": ["shop_1"]},
+                "normalized_request": {"shop_refs": [S1_REF]},
             },
-            normalized_request={"shop_aliases": ["shop_2"]},
+            normalized_request={"shop_refs": [S2_REF]},
             payload={},
             error_code=None,
         )
@@ -108,7 +110,7 @@ class RuntimeStoreValidationTests(unittest.TestCase):
             self.store.transition(uuid4(), transition)
 
     def test_transition_derives_top_level_normalized_request_from_state_without_io(self):
-        normalized_request = {"shop_aliases": ["shop_2"]}
+        normalized_request = {"shop_refs": [S2_REF]}
         transition = RunTransition(
             expected_revision=0,
             node="resolve_parameters",
@@ -438,7 +440,7 @@ class RuntimeStoreDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
         run_id = store.create_run(NewQueryRun(
             chat_id=chat_id, user_message_id=message_id, subject_id="u1",
             tool_call_id="call_1", attempt_no=1,
-            normalized_request={"shop_aliases": ["shop_1"]},
+            normalized_request={"shop_refs": [S1_REF]},
             state={"node": "received"},
         ))
         row = self.conn.execute(
@@ -459,7 +461,7 @@ class RuntimeStoreDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
             chat_id=chat_id, user_message_id=message_id, subject_id="u1",
             tool_call_id="call_1", attempt_no=1, state={"node": "received"},
         ))
-        normalized_request = {"shop_aliases": ["shop_1"]}
+        normalized_request = {"shop_refs": [S1_REF]}
         transition = RunTransition(
             expected_revision=0,
             node="resolve_parameters",
@@ -523,7 +525,12 @@ class RuntimeStoreDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
         ))
         payload = {
             "status": "ok",
-            "data": [{"shop_id": "店铺1", "product_id": "商品A"}],
+            "data": [{"shop_ref": S1_REF, "product_ref": P1_REF}],
+            "entities": [{"ref": S1_REF, "kind": "shop", "display_name": "店铺A",
+                          "name_source": "shop_profile"},
+                         {"ref": P1_REF, "kind": "product", "display_name": "直钉枪",
+                          "name_source": "archive"}],
+            "catalog_version": 7,
         }
 
         artifact = store.save_artifact(run_id, NewArtifact(payload=payload))
@@ -532,6 +539,8 @@ class RuntimeStoreDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
         self.assertEqual(self.conn.execute(
             "SELECT payload FROM bi.query_artifacts WHERE id=%s", (artifact.id,)
         ).fetchone()[0], payload)
+        self.assertNotIn("S1", json.dumps(payload, ensure_ascii=False))
+        self.assertIn("店铺A", json.dumps(payload, ensure_ascii=False))
 
     def test_store_revalidates_constructed_commands_before_writing(self):
         chat_id, message_id = self._seed_user_message()

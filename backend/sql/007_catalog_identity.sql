@@ -67,9 +67,15 @@ FROM (
 ) daily
 LEFT JOIN bi.products product ON product.product_id = daily.product_id;
 
+-- 目录版本对聊天 API 可读：Artifact 要记录它解析名称时用的目录版本（后续缓存失效用）。
+-- 只暴露单行版本，不暴露 bi.entity_refs 里的引用→ERP主键映射。
+CREATE OR REPLACE VIEW reporting.v_catalog_version AS
+SELECT version, updated_at FROM bi.catalog_state WHERE id = 1;
+
 -- 权限：001 的“ON ALL TABLES IN SCHEMA”不覆盖后建表，必须逐项授权。
 GRANT SELECT, INSERT, UPDATE ON bi.entity_refs TO bi_sync;
 GRANT SELECT, UPDATE ON bi.catalog_state TO bi_sync;
 GRANT SELECT ON bi.products TO bi_sync;
+GRANT SELECT ON reporting.v_catalog_version TO bi_reader, bi_app;
 REVOKE ALL ON bi.entity_refs, bi.catalog_state FROM PUBLIC;
 REVOKE ALL ON bi.entity_refs, bi.catalog_state FROM bi_app;

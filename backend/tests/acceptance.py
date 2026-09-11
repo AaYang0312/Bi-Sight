@@ -24,6 +24,7 @@ from uuid import NAMESPACE_URL, uuid5
 from bi_agent.agent import SessionState, answer
 from bi_agent.llm import Message, ModelReply, ToolCall
 from bi_agent.metrics import ToolResult
+from tests.fakeconn import S1_REF
 
 QUESTIONS_PATH = Path(__file__).with_name("questions.jsonl")
 FROZEN_NOW = None  # 由seed后的测试数据决定，从tests.test_db导入
@@ -64,7 +65,7 @@ def _model_script(question: dict) -> list[ModelReply]:
     这正是离线验收要覆盖的协议路径。
     """
     qid = question["id"]
-    query = {"shop_ids": ["shop_1"]}
+    query = {"shop_ids": [S1_REF]}
     if qid in {"02", }:
         query["metrics"] = ["paid_orders", "aov"]
     elif qid == "03":
@@ -86,7 +87,7 @@ def _model_script(question: dict) -> list[ModelReply]:
                 _reply(text="该店铺不在授权范围。")]
     if qid == "07":
         return [_call_reply("query_business", query), _reply(text="最近7天支付1000元。"),
-                _call_reply("query_business", {"shop_ids": ["shop_1"]}, call_id="call_2"),
+                _call_reply("query_business", {"shop_ids": [S1_REF]}, call_id="call_2"),
                 _reply(text="上个月覆盖不足，无法查询。")]
     if qid == "16":
         return [_call_reply("evaluate_promotion", {"mode": "actual_budget"}),
@@ -334,10 +335,10 @@ def run_provider_smoke() -> int:
     seed_business_case(conn)
     from bi_agent.agent import _tool_schemas
 
-    state = SessionState(subject="smoke", shop_aliases={"S1": "shop_1"})
+    state = SessionState(subject="smoke", shop_refs={"S1": S1_REF})
     messages: list[Message] = [Message(
         role="user",
-        content="店铺shop_1最近7天（截至2026-09-08）的支付金额是多少？请调用工具查询。")]
+        content=f"店铺{S1_REF}最近7天（截至2026-09-08）的支付金额是多少？请调用工具查询。")]
     tools = _tool_schemas()
     reply = model.complete(messages, tools, timeout_s=30)
     if not reply.tool_calls:
@@ -360,7 +361,7 @@ def run_provider_smoke() -> int:
                 subject_id=turn_context.subject_id,
                 question=messages[-1].content or "",
                 previous_filters={},
-                shop_aliases=state.shop_aliases,
+                shop_refs=state.shop_refs,
                 allowed_shop_ids=frozenset({"S1"}),
                 now=FROZEN_NOW,
                 deadline=time.monotonic() + 30,

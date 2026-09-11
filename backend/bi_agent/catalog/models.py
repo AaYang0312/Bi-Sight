@@ -120,6 +120,18 @@ def shop_display_labels(shops: Iterable[Mapping[str, Any]]) -> dict[str, str | N
     return labels
 
 
+def pick_display_name(archive: object, snapshot: object) -> tuple[str | None, NameSource]:
+    """商品名取用优先级只这一处：档案名 > 成交快照 > 未取得。
+
+    两者都拿不出可安全展示的名称时返回 None，由展示层渲染“名称未取得”，绝不编造。
+    """
+    if is_safe_display_name(archive):
+        return str(archive).strip(), "archive"
+    if is_safe_display_name(snapshot):
+        return str(snapshot).strip(), "trade_snapshot"
+    return None, "unresolved"
+
+
 def render_display_text(text: str, display_by_ref: Mapping[str, str | None]) -> str:
     """把正文里的引用换成展示名；未知引用与无名称引用原样保留。
 

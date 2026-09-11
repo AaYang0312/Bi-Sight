@@ -19,7 +19,12 @@ from bi_agent.runtime.models import (
     RunTransition,
     StaleRunRevision,
 )
+from bi_agent.catalog import ref_for_key
 from bi_agent.runtime.memory import MemoryQueryRunStore
+
+# 稳定引用由 (kind, ERP主键) 纯派生；测试用同源常量，不手抄哈希。
+S1_REF = ref_for_key("shop", "S1")
+S2_REF = ref_for_key("shop", "S2")
 
 
 class RuntimeModelTests(unittest.TestCase):
@@ -39,14 +44,22 @@ class RuntimeModelTests(unittest.TestCase):
         result = DomainResult(
             run_id=uuid4(),
             status=DomainStatus.SUCCESS,
-            model_payload={"status": "ok", "data": [{"shop_id": "shop_1"}]},
+            model_payload={"status": "ok", "data": [{"shop_ref": S1_REF}]},
             artifacts=[DomainArtifact(
                 ref=ArtifactRef(id=artifact_id, type="metric_result"),
-                public_payload={"status": "ok", "data": [{"shop_id": "店铺1"}]},
+                public_payload={
+                    "status": "ok", "data": [{"shop_ref": S1_REF}],
+                    "entities": [{"ref": S1_REF, "kind": "shop",
+                               "display_name": "元发钉枪(抖音)", "name_source": "shop_profile"}],
+                    "catalog_version": 3,
+                },
             )],
         )
         self.assertEqual(result.artifacts[0].ref.id, artifact_id)
-        self.assertEqual(result.artifacts[0].public_payload["data"][0]["shop_id"], "店铺1")
+        self.assertEqual(result.artifacts[0].public_payload["data"][0]["shop_ref"], S1_REF)
+        self.assertEqual(result.artifacts[0].public_payload["entities"][0]["display_name"],
+                       "元发钉枪(抖音)")
+        self.assertNotIn("entities", result.model_payload)
 
     def test_error_envelope_rejects_diagnostic_and_secret_text(self):
         for field, value in (
@@ -146,17 +159,17 @@ class RuntimeModelTests(unittest.TestCase):
                 expected_revision=0,
                 node="validate_parameters",
                 status=RunStatus.RUNNING,
-                normalized_request={"shop_aliases": ["shop_2"]},
+                normalized_request={"shop_refs": [S2_REF]},
                 state={
                     "node": "validate_parameters",
                     "revision": 1,
-                    "normalized_request": {"shop_aliases": ["shop_1"]},
+                    "normalized_request": {"shop_refs": [S1_REF]},
                 },
             )
 
     def test_allowlisted_future_state_event_and_artifact_shapes_are_valid(self):
         normalized_request = {
-            "shop_aliases": ["shop_1"],
+            "shop_refs": [S1_REF],
             "metrics": ["paid_amount"],
             "start": "2026-09-01",
             "end": "2026-09-08",
@@ -200,13 +213,13 @@ class RuntimeModelTests(unittest.TestCase):
             "filters": {
                 "start": "2026-09-01",
                 "end": "2026-09-08",
-                "shop_ids": ["店铺1"],
+                "shop_refs": [S1_REF],
                 "metrics": ["paid_amount"],
                 "group_by": "shop",
                 "compare": "none",
                 "currency": "CNY",
             },
-            "data": [{"shop_id": "店铺1", "paid_amount": "1000"}],
+            "data": [{"shop_ref": S1_REF, "paid_amount": "1000"}],
         }
         record = NewQueryRun(
             chat_id=uuid4(), user_message_id=uuid4(), subject_id="u1",
@@ -238,7 +251,7 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
         self.record = NewQueryRun(
             chat_id=uuid4(), user_message_id=uuid4(), subject_id="u1",
             tool_call_id="call_1", attempt_no=1,
-            normalized_request={"shop_aliases": ["shop_1"]},
+            normalized_request={"shop_refs": [S1_REF]},
             state={"node": "received"},
         )
 
@@ -258,7 +271,7 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
     def test_transition_atomically_updates_only_the_validated_normalized_request(self):
         run_id = self.store.create_run(self.record)
         normalized_request = {
-            "shop_aliases": ["shop_1"],
+            "shop_refs": [S1_REF],
             "metrics": ["paid_amount"],
             "start": "2026-09-01",
             "end": "2026-09-08",
@@ -289,7 +302,7 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
 
     def test_transition_derives_normalized_request_from_state_when_assertion_is_omitted(self):
         run_id = self.store.create_run(self.record)
-        normalized_request = {"shop_aliases": ["shop_2"]}
+        normalized_request = {"shop_refs": [S2_REF]}
         transition = RunTransition(
             expected_revision=0,
             node="resolve_parameters",
@@ -315,11 +328,11 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
                 expected_revision=0,
                 node="resolve_parameters",
                 status=RunStatus.RUNNING,
-                normalized_request={"shop_aliases": ["S1"]},
+                normalized_request={"shop_refs": ["S1"]},
                 state={
                     "node": "resolve_parameters",
                     "revision": 1,
-                    "normalized_request": {"shop_aliases": ["S1"]},
+                    "normalized_request": {"shop_refs": ["S1"]},
                 },
             )
 
@@ -330,18 +343,18 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
             node="validate_parameters",
             event_type=RunTransition.model_fields["event_type"].default,
             status=RunStatus.RUNNING,
-            normalized_request={"shop_aliases": ["shop_2"]},
+            normalized_request={"shop_refs": [S2_REF]},
             state={
                 "node": "validate_parameters",
                 "revision": 1,
-                "normalized_request": {"shop_aliases": ["shop_1"]},
+                "normalized_request": {"shop_refs": [S1_REF]},
             },
         )
 
         with self.assertRaisesRegex(ValueError, "^normalized_request_mismatch$"):
             self.store.transition(run_id, transition)
 
-        self.assertEqual(self.store.runs[run_id]["normalized_request"], {"shop_aliases": ["shop_1"]})
+        self.assertEqual(self.store.runs[run_id]["normalized_request"], {"shop_refs": [S1_REF]})
         self.assertEqual(self.store.runs[run_id]["state"], {"node": "received"})
         self.assertEqual(self.store.runs[run_id]["revision"], 0)
         self.assertEqual(self.store.events[run_id], [])

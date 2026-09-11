@@ -1,12 +1,13 @@
 """Safe projections for business-query tool results.
 
-This module deliberately depends on aliases rather than ``SessionState`` so the
-state graph and the legacy Agent can share one projection implementation.
+This module deliberately depends on the request-scoped ``Catalog`` rather than
+``SessionState`` so the state graph and the legacy Agent share one projection.
+The catalog is the only place that turns real ERP keys into opaque refs and real
+names, so neither view can leak an identifier by accident.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from bi_agent.metrics import ToolResult
@@ -21,6 +22,7 @@ from bi_agent.runtime.models import (
 from .state import BusinessQueryContext, BusinessQueryExecution, BusinessQueryInput
 
 if TYPE_CHECKING:
+    from bi_agent.catalog import Catalog
     from bi_agent.llm import ToolCall
 
 # 白名单单一定义在 runtime/models.py（推广列由 promotion.py 供给），
@@ -29,19 +31,15 @@ _PUBLIC_RESULT_COLUMNS = ARTIFACT_RESULT_COLUMNS
 _PUBLIC_FILTER_COLUMNS = ARTIFACT_FILTER_COLUMNS
 
 
-def to_model_result(
-    result: ToolResult, shop_aliases: Mapping[str, str]
-) -> dict[str, object]:
-    """Return the validated alias-only payload permitted for the model."""
-    payload = _safe_result(result, shop_aliases, model_view=True)
+def to_model_result(result: ToolResult, catalog: "Catalog") -> dict[str, object]:
+    """Return the validated ref-only payload permitted for the model."""
+    payload = _safe_result(result, catalog, model_view=True)
     return validate_model_payload(payload)
 
 
-def to_public_artifact(
-    result: ToolResult, shop_aliases: Mapping[str, str]
-) -> dict[str, object]:
-    """Return the validated public artifact payload, never ERP identifiers."""
-    payload = _safe_result(result, shop_aliases, model_view=False)
+def to_public_artifact(result: ToolResult, catalog: "Catalog") -> dict[str, object]:
+    """Return the validated public artifact payload: refs plus authorized names."""
+    payload = _safe_result(result, catalog, model_view=False)
     return validate_artifact_payload(payload)
 
 
@@ -71,16 +69,16 @@ def execute_business_query_tool(
     """
     from .graph import _execute_business_query_graph
 
-    aliases = getattr(session_state, "shop_aliases", {})
-    if not isinstance(aliases, dict):
-        aliases = {}
+    refs = getattr(session_state, "shop_refs", {})
+    if not isinstance(refs, dict):
+        refs = {}
     graph_context = BusinessQueryContext(
         chat_id=context.chat_id,
         user_message_id=context.user_message_id,
         subject_id=context.subject_id,
         question=context.question,
         previous_filters=dict(context.previous_filters),
-        shop_aliases=dict(aliases),
+        shop_refs={str(key): str(value) for key, value in refs.items()},
         allowed_shop_ids=context.allowed_shop_ids,
         now=context.now,
         deadline=context.deadline,
@@ -99,24 +97,15 @@ def execute_business_query_tool(
 
 
 def _safe_result(
-    result: ToolResult, shop_aliases: Mapping[str, str], *, model_view: bool
+    result: ToolResult, catalog: "Catalog", *, model_view: bool
 ) -> dict[str, object]:
-    """Keep allowlisted aggregates and replace every shop/product identifier."""
+    """Keep allowlisted aggregates and replace every ERP identifier with its ref.
+
+    Real names never enter the model view; they ride along only in the public
+    artifact as ``entities``. Unknown or unauthorized identifiers raise
+    ``CatalogUnauthorized`` so the caller fails closed instead of guessing.
+    """
     payload = result.model_dump(mode="json")
-    product_aliases: dict[str, str] = {}
-
-    def map_shop(value: object) -> str:
-        alias = shop_aliases.get(str(value))
-        if alias is None:
-            return "未授权店铺"
-        return alias if model_view else f"店铺{alias.removeprefix('shop_')}"
-
-    def map_product(value: object) -> object:
-        if not isinstance(value, str):
-            return value
-        if value not in product_aliases:
-            product_aliases[value] = f"商品{chr(ord('A') + len(product_aliases) % 26)}"
-        return product_aliases[value]
 
     rows: list[dict[str, object]] = []
     raw_rows = payload.get("data")
@@ -124,11 +113,13 @@ def _safe_result(
         for row in raw_rows:
             if not isinstance(row, dict):
                 continue
-            clean = {key: value for key, value in row.items() if key in _PUBLIC_RESULT_COLUMNS}
-            if "shop_id" in clean:
-                clean["shop_id"] = map_shop(clean["shop_id"])
-            if "product_id" in clean:
-                clean["product_id"] = map_product(clean["product_id"])
+            # 白名单里没有 shop_id/product_id：真实主键在这一步自然被丢掉。
+            clean = {key: value for key, value in row.items()
+                     if key in _PUBLIC_RESULT_COLUMNS}
+            if row.get("shop_id") is not None:
+                clean["shop_ref"] = catalog.shop_ref(str(row["shop_id"]))
+            if row.get("product_id") is not None:
+                clean["product_ref"] = catalog.product_ref(str(row["product_id"]))
             rows.append(clean)
 
     filters: dict[str, object] = {}
@@ -138,10 +129,11 @@ def _safe_result(
             key: value for key, value in raw_filters.items()
             if key in _PUBLIC_FILTER_COLUMNS
         }
-    if isinstance(filters.get("shop_ids"), list):
-        filters["shop_ids"] = [map_shop(shop_id) for shop_id in filters["shop_ids"]]
+        raw_shops = raw_filters.get("shop_ids")
+        if isinstance(raw_shops, list):
+            filters["shop_refs"] = [catalog.shop_ref(str(shop_id)) for shop_id in raw_shops]
 
-    return {
+    body: dict[str, object] = {
         "status": payload.get("status"),
         "metric_definition": payload.get("metric_definition"),
         "coverage": payload.get("coverage"),
@@ -150,3 +142,7 @@ def _safe_result(
         "filters": filters,
         "data": rows,
     }
+    if not model_view:
+        body["entities"] = catalog.entities_payload()
+        body["catalog_version"] = catalog.catalog_version
+    return body

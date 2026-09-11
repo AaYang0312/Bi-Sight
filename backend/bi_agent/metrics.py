@@ -286,7 +286,7 @@ LIMIT %s
 
 _PRODUCT_SQL = """
 SELECT shop_id, day, product_id, quantity, gift_quantity, product_paid_amount,
-       allocation_verified, line_kind
+       allocation_verified, line_kind, product_name, product_name_snapshot
 FROM reporting.v_product_daily
 WHERE shop_id = ANY(%s) AND day >= %s AND day < %s
 ORDER BY day, shop_id, product_id
@@ -642,6 +642,7 @@ def _product_rows(conn, request: QueryRequest, *, start_ts: datetime,
     rank_metric = ("product_paid_amount" if "product_paid_amount" in request.metrics
                    else "quantity")
     by_product: dict[tuple[str, str, str], dict[str, Decimal | int | bool | None]] = {}
+    names: dict[tuple[str, str], dict[str, str | None]] = {}
     for row in raw:
         entry = by_product.setdefault((row[0], row[2], row[7]), {
             "quantity": Decimal(0), "gift_quantity": Decimal(0),
@@ -650,13 +651,22 @@ def _product_rows(conn, request: QueryRequest, *, start_ts: datetime,
         entry["gift_quantity"] += row[4]
         entry["product_paid_amount"] += row[5]
         entry["allocation_verified"] = bool(entry["allocation_verified"] and row[6])
+        # 名称列只当内部输入：真实展示名由 catalog 投影层按一处优先级解析。
+        kept = names.setdefault((row[0], row[2]), {"product_name": None,
+                                                   "product_name_snapshot": None})
+        for index, key in ((8, "product_name"), (9, "product_name_snapshot")):
+            if kept[key] is None and row[index] is not None:
+                kept[key] = str(row[index])
     ranked = sorted(by_product.items(),
                     key=lambda item: (item[1][rank_metric] or 0, item[0]),
                     reverse=True)
     rows: list[dict[str, str | int | None]] = []
     for (shop_id, product_id, line_kind), entry in ranked[:request.top_n]:
+        kept = names.get((shop_id, product_id), {})
         rows.append({
             "shop_id": shop_id, "product_id": product_id, "line_kind": line_kind,
+            "product_name": kept.get("product_name"),
+            "product_name_snapshot": kept.get("product_name_snapshot"),
             "quantity": _render(entry["quantity"]),
             "gift_quantity": _render(entry["gift_quantity"]),
             "product_paid_amount": _render(entry["product_paid_amount"]),

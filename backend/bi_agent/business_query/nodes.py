@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import ValidationError
 
 from bi_agent import metrics
+from bi_agent.catalog import CatalogUnauthorized, build_catalog
 from bi_agent.metrics import Coverage, METRIC_DEFINITIONS, QueryRequest, ToolResult, resolve_period
 from bi_agent.runtime.models import (
     ArtifactPersistenceError,
@@ -27,7 +28,7 @@ from .tool import to_public_artifact
 _GROUP_BY = frozenset({"total", "day", "shop", "product"})
 _COMPARE = frozenset({"none", "previous_period"})
 _SHOP_IDS_SOURCE = "_shop_ids_source"
-_ALIASED_SHOPS = "aliases"
+_REF_SHOPS = "refs"
 _PREVIOUS_FILTER_SHOPS = "previous_filters"
 _UNRECOGNIZED_SHOPS = "unrecognized"
 _MISSING_SHOPS = "missing"
@@ -54,7 +55,7 @@ _ProblemCode = Literal[
 
 
 def resolve_parameters(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
-    """Fill omitted filters and replace aliases without persisting real shop IDs."""
+    """Fill omitted filters and replace refs without persisting real shop IDs."""
     if runtime.state.status is not RunStatus.RUNNING:
         return runtime
     runtime.state = transition_state(
@@ -62,10 +63,10 @@ def resolve_parameters(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
     )
 
     args = dict(runtime.resolved_args)
-    alias_reverse = {
-        alias: shop_id for shop_id, alias in runtime.context.shop_aliases.items()
+    ref_reverse = {
+        ref: shop_id for shop_id, ref in runtime.context.shop_refs.items()
     }
-    shop_aliases, shop_source = _resolve_shops(args, runtime, alias_reverse)
+    shop_refs, shop_source = _resolve_shops(args, runtime, ref_reverse)
     args[_SHOP_IDS_SOURCE] = shop_source
 
     if "start" not in args or "end" not in args:
@@ -88,7 +89,7 @@ def resolve_parameters(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
     runtime.resolved_args = args
     runtime.state = runtime.state.model_copy(
         update={
-            "normalized_request": _normalized_request(args, shop_aliases=shop_aliases)
+            "normalized_request": _normalized_request(args, shop_refs=shop_refs)
         }
     )
     if "shop_ids" not in args or not args["shop_ids"]:
@@ -126,7 +127,7 @@ def validate_parameters(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
         return runtime
 
     runtime.request = request
-    aliases = runtime.state.normalized_request.get("shop_aliases")
+    refs = runtime.state.normalized_request.get("shop_refs")
     normalized_request: dict[str, object] = {
         "metrics": list(request.metrics),
         "start": request.start.isoformat(),
@@ -136,8 +137,8 @@ def validate_parameters(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
         "top_n": request.top_n,
         "currency": request.currency,
     }
-    if isinstance(aliases, list):
-        normalized_request["shop_aliases"] = aliases
+    if isinstance(refs, list):
+        normalized_request["shop_refs"] = refs
     runtime.state = runtime.state.model_copy(
         update={"normalized_request": normalized_request}
     )
@@ -155,7 +156,7 @@ def authorize_scope(
     shop_source = runtime.resolved_args.get(_SHOP_IDS_SOURCE)
     if (
         request is None
-        or shop_source not in {_ALIASED_SHOPS, _PREVIOUS_FILTER_SHOPS}
+        or shop_source not in {_REF_SHOPS, _PREVIOUS_FILTER_SHOPS}
         or not set(request.shop_ids) <= runtime.context.allowed_shop_ids
     ):
         runtime.state = runtime.state.model_copy(
@@ -235,6 +236,29 @@ def execute_fixed_query(runtime: BusinessQueryRuntime, conn: object) -> Business
             coverage=Coverage(status="missing", start=None, end=None),
             limitations=[],
         )
+        return runtime
+
+    # 目录投影在建立即用同一个 conn：结果行里出现未授权店铺就是越权，宁可不出数。
+    try:
+        runtime.catalog = build_catalog(
+            conn, runtime.result, allowed_shop_ids=runtime.context.allowed_shop_ids
+        )
+    except CatalogUnauthorized:
+        runtime.result = None
+        _set_failure(
+            runtime,
+            code="forbidden",
+            stage=BusinessQueryNode.EXECUTE_FIXED_QUERY,
+            public_message="查询范围无权限。",
+        )
+    except Exception:  # noqa: BLE001 - 名称解析失败不得把未核验的行发出去
+        runtime.result = None
+        _set_failure(
+            runtime,
+            code="result_contract_violation",
+            stage=BusinessQueryNode.EXECUTE_FIXED_QUERY,
+            public_message="查询结果异常。",
+        )
     return runtime
 
 
@@ -274,7 +298,7 @@ def persist_artifact(runtime: BusinessQueryRuntime, store: object) -> BusinessQu
         return runtime
     runtime.state = transition_state(runtime.state, BusinessQueryNode.PERSIST_ARTIFACT)
     result = runtime.result
-    if result is None:
+    if result is None or runtime.catalog is None:
         _set_failure(
             runtime,
             code="result_contract_violation",
@@ -283,7 +307,7 @@ def persist_artifact(runtime: BusinessQueryRuntime, store: object) -> BusinessQu
         )
         return runtime
     try:
-        public_payload = to_public_artifact(result, runtime.context.shop_aliases)
+        public_payload = to_public_artifact(result, runtime.catalog)
         artifact = NewArtifact(
             payload=public_payload,
             data_as_of=result.data_as_of,
@@ -463,25 +487,31 @@ def _event_payload(runtime: BusinessQueryRuntime) -> dict[str, object]:
 def _resolve_shops(
     args: dict[str, object],
     runtime: BusinessQueryRuntime,
-    alias_reverse: dict[str, str],
+    ref_reverse: dict[str, str],
 ) -> tuple[list[str] | None, str]:
+    """Turn model-supplied opaque refs back into real shop IDs.
+
+    Anything that is not a known ref is kept verbatim and flagged
+    ``invalid_shop``: authorize_scope only runs when every value resolved, so
+    passing a real ERP key or a made-up name cannot reach the query.
+    """
     raw_shops = args.get("shop_ids")
     if isinstance(raw_shops, list) and raw_shops:
         mapped: list[object] = []
-        aliases: list[str] = []
-        all_recognized_aliases = True
+        refs: list[str] = []
+        all_recognized = True
         for value in raw_shops:
-            if isinstance(value, str) and value in alias_reverse:
-                mapped.append(alias_reverse[value])
-                aliases.append(value)
+            if isinstance(value, str) and value in ref_reverse:
+                mapped.append(ref_reverse[value])
+                refs.append(value)
                 continue
             mapped.append(value)
-            aliases.append("invalid_shop")
-            all_recognized_aliases = False
+            refs.append("invalid_shop")
+            all_recognized = False
         args["shop_ids"] = mapped
         return (
-            aliases,
-            _ALIASED_SHOPS if all_recognized_aliases else _UNRECOGNIZED_SHOPS,
+            refs,
+            _REF_SHOPS if all_recognized else _UNRECOGNIZED_SHOPS,
         )
     if not raw_shops:
         previous_shops = runtime.context.previous_filters.get("shop_ids")
@@ -490,7 +520,7 @@ def _resolve_shops(
             args["shop_ids"] = resolved
             return (
                 [
-                    runtime.context.shop_aliases.get(shop_id, "invalid_shop")
+                    runtime.context.shop_refs.get(shop_id, "invalid_shop")
                     for shop_id in resolved
                 ],
                 _PREVIOUS_FILTER_SHOPS,
@@ -500,11 +530,11 @@ def _resolve_shops(
 
 
 def _normalized_request(
-    args: dict[str, object], *, shop_aliases: list[str] | None
+    args: dict[str, object], *, shop_refs: list[str] | None
 ) -> dict[str, object]:
     normalized: dict[str, object] = {}
-    if shop_aliases is not None:
-        normalized["shop_aliases"] = shop_aliases
+    if shop_refs is not None:
+        normalized["shop_refs"] = shop_refs
     metrics = args.get("metrics")
     if isinstance(metrics, list) and all(
         isinstance(metric, str) and metric in METRIC_DEFINITIONS for metric in metrics

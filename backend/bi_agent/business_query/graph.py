@@ -255,8 +255,11 @@ def _execution_result(runtime: BusinessQueryRuntime) -> BusinessQueryExecution:
     artifacts: list[DomainArtifact] = []
     if runtime.result is not None and output_is_safe:
         try:
-            model_payload = to_model_result(runtime.result, runtime.context.shop_aliases)
-            public_payload = to_public_artifact(runtime.result, runtime.context.shop_aliases)
+            if runtime.catalog is None:
+                # 没建立目录就无法把主键换成引用：与投影失败同样关闭三个出口。
+                raise ValueError("catalog_not_built")
+            model_payload = to_model_result(runtime.result, runtime.catalog)
+            public_payload = to_public_artifact(runtime.result, runtime.catalog)
             artifacts = [
                 DomainArtifact(ref=ref, public_payload=public_payload)
                 for ref in state.artifact_refs

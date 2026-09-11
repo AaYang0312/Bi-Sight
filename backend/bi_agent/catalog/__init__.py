@@ -11,10 +11,12 @@ from .models import (
     EntityRef,
     NameSource,
     is_safe_display_name,
+    pick_display_name,
     ref_for_key,
     render_display_text,
     shop_display_labels,
 )
+from .projection import Catalog, CatalogUnauthorized, build_catalog
 from .repository import (
     bump_catalog_version,
     catalog_version,
@@ -26,15 +28,19 @@ from .repository import (
 __all__ = [
     "PLATFORM_LABELS",
     "REF_RE",
+    "Catalog",
+    "CatalogUnauthorized",
     "DisplayEntity",
     "EntityKind",
     "EntityRef",
     "NameSource",
+    "build_catalog",
     "bump_catalog_version",
     "catalog_version",
     "ensure_refs",
     "is_safe_display_name",
     "lookup_refs",
+    "pick_display_name",
     "ref_for_key",
     "render_display_text",
     "resolve_display_entities",

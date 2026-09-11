@@ -214,6 +214,111 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self._product("source_modified_at")[0],
                          datetime.fromtimestamp(1788166354, tz=BEIJING))
 
+    def test_sync_persists_stable_refs_for_reverse_lookup(self):
+        """引用落表：反查与撞车检测依赖这张表，不能只靠读侧现算。"""
+        from bi_agent.catalog import lookup_refs, ref_for_key
+        from bi_agent.sync import sync_products, sync_shops
+
+        class Shops:
+            def call(self, method, parameters):
+                return {"success": True, "total": 1, "hasNext": False,
+                        "list": [{"userId": "S_REF", "state": 4, "active": 1,
+                                  "title": "引用落表店"}]}
+
+        sync_shops(self.conn, Shops())
+        sync_products(self.conn, self._goods_client([self._goods_row()], total=1))
+
+        shop_ref = ref_for_key("shop", "S_REF")
+        product_ref = ref_for_key("product", self.GOODS_ID)
+        self.assertEqual(lookup_refs(self.conn, [shop_ref, product_ref]),
+                         {shop_ref: ("shop", "S_REF"),
+                          product_ref: ("product", self.GOODS_ID)})
+
+    def test_archive_name_join_leaves_totals_untouched(self):
+        """补名称前后同范围数值必须一致：名称只能做展示，不能改变金额、销量与父项口径。"""
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self._seed_shop()
+        paid_at = datetime(2026, 9, 2, 12, tzinfo=BEIJING)
+        trade = normalise_trade({
+            "sid": "E_JOIN", "userId": "S1", "tid": "C_JOIN", "payAmount": "100",
+            "updTime": _ms(paid_at), "payTime": _ms(paid_at),
+            "orders": [
+                {"oid": "L_PARENT", "tid": "C_JOIN", "itemSysId": "P_JOIN", "type": 2,
+                 "num": "1", "payAmount": "100", "sysTitle": "套件当时名"},
+                {"oid": "L_CHILD", "tid": "C_JOIN", "itemSysId": "P_JOIN", "type": 1,
+                 "num": "2", "payAmount": "0", "sysTitle": "子件当时名"},
+            ],
+        })
+        totals = ("SELECT coalesce(sum(quantity), 0), coalesce(sum(gift_quantity), 0), "
+                  "coalesce(sum(product_paid_amount), 0), count(*), "
+                  "count(product_name) FROM reporting.v_product_daily "
+                  "WHERE shop_id='S1' AND product_id='P_JOIN'")
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(self.conn, trade, batch_id="join"))
+            before = self.conn.execute(totals).fetchone()   # 档案还不存在：名称 JOIN 不中
+            self.assertEqual(before[4], 0)
+            self.conn.execute(
+                "INSERT INTO bi.products(product_id, title, normalization_status) "
+                "VALUES ('P_JOIN', '套件-元发', 'normal') "
+                "ON CONFLICT (product_id) DO UPDATE SET title=EXCLUDED.title")
+            after = self.conn.execute(totals).fetchone()
+
+        self.assertEqual(after[:4], before[:4], "名称列不得改变销量、赠品量与支付额")
+        self.assertEqual(after[4], after[3], "档案命中后每个聚合组都拿到名称")
+
+    def test_trade_line_snapshots_are_persisted_and_survive_replay(self):
+        """重放时上游没带名称，不得把已留住的成交快照洗成空。"""
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self._seed_shop()
+        paid_at = datetime(2026, 9, 2, 12, tzinfo=BEIJING)
+
+        def trade(orders, upd_time):
+            return normalise_trade({
+                "sid": "E_SNAP", "userId": "S1", "tid": "C_SNAP", "payAmount": "100",
+                "updTime": _ms(upd_time), "payTime": _ms(paid_at), "orders": orders,
+            })
+
+        named = [{"oid": "L_SNAP", "tid": "C_SNAP", "itemSysId": "P_SNAP", "type": 0,
+                  "num": "1", "payAmount": "100", "sysTitle": "接头-元发",
+                  "sysSkuPropertiesName": "接头 20PP"}]
+        unnamed = [{key: value for key, value in named[0].items()
+                    if not key.startswith("sys")}]
+        columns = ("SELECT product_name_snapshot, sku_label_snapshot FROM bi.order_items "
+                   "WHERE shop_id='S1' AND erp_id='E_SNAP' AND line_id='L_SNAP'")
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(self.conn, trade(named, paid_at), batch_id="snap"))
+            self.assertEqual(self.conn.execute(columns).fetchone(),
+                             ("接头-元发", "接头 20PP"))
+            self.assertTrue(apply_trade(self.conn,
+                                        trade(unnamed, paid_at + timedelta(hours=1)),
+                                        batch_id="replay"))
+            self.assertEqual(self.conn.execute(columns).fetchone(),
+                             ("接头-元发", "接头 20PP"))
+
+    def test_archive_and_shop_sync_bump_catalog_version_only_on_name_change(self):
+        from bi_agent.catalog import catalog_version
+        from bi_agent.sync import sync_products, sync_shops
+
+        before = catalog_version(self.conn)
+        sync_products(self.conn, self._goods_client([self._goods_row()], total=1))
+        self.assertEqual(catalog_version(self.conn), before + 1)
+
+        sync_products(self.conn, self._goods_client([self._goods_row()], total=1))
+        self.assertEqual(catalog_version(self.conn), before + 1, "同一版本档案不推进目录版本")
+
+        class Shops:
+            def call(self, method, parameters):
+                return {"success": True, "total": 1, "hasNext": False,
+                        "list": [{"userId": "S_CAT_VERSION", "state": 4, "active": 1,
+                                  "title": "目录版本店"}]}
+
+        sync_shops(self.conn, Shops())
+        self.assertEqual(catalog_version(self.conn), before + 2)
+        sync_shops(self.conn, Shops())
+        self.assertEqual(catalog_version(self.conn), before + 2, "名称未变不推进版本")
+
     def test_product_daily_view_gives_the_archive_name_without_the_cost(self):
         """成本价只能留在 bi.products，不能随商品名进任何 reporting 视图。"""
         columns = [row[0] for row in self.conn.execute(

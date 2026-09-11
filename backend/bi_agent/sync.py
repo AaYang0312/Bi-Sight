@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from .catalog import EntityKind, bump_catalog_version, ensure_refs
 from .config import load_sync_settings
 from .kuaimai import KuaimaiClient, KuaimaiError, parse_page
 
@@ -199,6 +200,10 @@ def _normalise_item(raw_item: dict[str, Any], erp_id: str, index: int,
         "source_type": source_type,
         "product_id": (str(raw_item.get("itemSysId") or "").strip() or None),
         "sku_id": (str(raw_item.get("skuSysId") or "").strip() or None),
+        # 成交名称快照：ERP 侧商品名与 SKU 规格名原样留存。档案会改名，
+        # 快照只用于留住“当时成交叫什么”；平台标题 title 不当商品名。
+        "product_name_snapshot": (str(raw_item.get("sysTitle") or "").strip() or None),
+        "sku_label_snapshot": (str(raw_item.get("sysSkuPropertiesName") or "").strip() or None),
         "paid_at": parse_timestamp(raw_item.get("payTime")) or fallback_paid_at,
         "quantity": quantity,
         "gift_quantity": gift_quantity,
@@ -491,19 +496,24 @@ def apply_trade(conn, trade: dict[str, Any], *, batch_id: str, force: bool = Fal
         (trade["active"], trade["shop_id"], trade["erp_id"]),
     )
     if trade["items_present"]:
-        conn.execute(
-            "DELETE FROM bi.order_items WHERE shop_id=%s AND erp_id=%s",
+        # 先删后插是热路径；用 DELETE ... RETURNING 拿回旧快照，
+        # 上游本次没带名称时不得把已留住的成交名称洗成空。
+        removed = conn.execute(
+            "DELETE FROM bi.order_items WHERE shop_id=%s AND erp_id=%s "
+            "RETURNING line_id, product_name_snapshot, sku_label_snapshot",
             (trade["shop_id"], trade["erp_id"]),
-        )
+        ).fetchall()
+        kept_snapshots = {str(row[0]): (row[1], row[2]) for row in removed}
         for item in trade["items"]:
+            previous = kept_snapshots.get(item["line_id"], (None, None))
             conn.execute(
                 """
                 INSERT INTO bi.order_items
                     (shop_id, erp_id, line_id, commercial_id, platform_line_id, product_id,
                      source_type, sku_id, paid_at, quantity, gift_quantity, raw_paid_amount,
                      raw_payment, raw_unit_cost, allocated_paid_amount, allocation_verified,
-                     line_kind, active)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     line_kind, active, product_name_snapshot, sku_label_snapshot)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     trade["shop_id"], trade["erp_id"], item["line_id"], item["commercial_id"],
@@ -512,6 +522,8 @@ def apply_trade(conn, trade: dict[str, Any], *, batch_id: str, force: bool = Fal
                     item["raw_paid_amount"], item["raw_payment"], item["raw_unit_cost"],
                     item["allocated_paid_amount"], item["allocation_verified"],
                     item["line_kind"], item["active"],
+                    item["product_name_snapshot"] or previous[0],
+                    item["sku_label_snapshot"] or previous[1],
                 ),
             )
     old_ids |= set(trade["commercial_ids"])
@@ -1108,6 +1120,8 @@ def sync_shops(conn, client: KuaimaiClient) -> int:
     """拉取店铺档案并更新bi.shops；不输出店铺名称到控制台。"""
     page_no = 1
     collected = 0
+    label_changes = 0
+    seen_shop_ids: list[str] = []
     with conn.transaction():
         while True:
             page = parse_page(client.call("erp.shop.list.query", {
@@ -1122,19 +1136,31 @@ def sync_shops(conn, client: KuaimaiClient) -> int:
                 enabled = _source_bool(raw.get("active"))
                 if enabled is None:
                     enabled = state in {"3", "4", "enable", "enabled"}
-                conn.execute(
+                changed = conn.execute(
                     "INSERT INTO bi.shops(shop_id, platform, display_name, enabled) "
                     "VALUES (%s, %s, %s, %s) "
                     "ON CONFLICT (shop_id) DO UPDATE SET platform=EXCLUDED.platform, "
-                    "display_name=EXCLUDED.display_name, enabled=EXCLUDED.enabled",
+                    "display_name=EXCLUDED.display_name, enabled=EXCLUDED.enabled "
+                    "WHERE (bi.shops.platform, bi.shops.display_name, bi.shops.enabled) "
+                    "IS DISTINCT FROM (EXCLUDED.platform, EXCLUDED.display_name, "
+                    "EXCLUDED.enabled) "
+                    "RETURNING shop_id",
                     (shop_id, str(raw.get("source") or "unknown"),
                      str(raw.get("title") or raw.get("nick") or raw.get("shopName") or ""),
                      enabled),
-                )
+                ).fetchone()
+                if changed is not None:
+                    # 平台/停用状态会改变同名店的展示后缀，因此一并算目录变更。
+                    label_changes += 1
+                seen_shop_ids.append(shop_id)
                 collected += 1
             if len(page.rows) < PAGE_SIZE:
                 break
             page_no += 1
+        # 引用落表：展示层靠纯派生，反查与撞车检校靠这张表。
+        ensure_refs(conn, EntityKind.SHOP.value, seen_shop_ids)
+        if label_changes:
+            bump_catalog_version(conn)
     return collected
 
 
@@ -1202,6 +1228,7 @@ def sync_products(conn, client: KuaimaiClient) -> dict[str, int]:
     stats = {"fetched": 0, "upserted": 0, "skipped": 0, "invalid": 0}
     page_no = 1
     total: int | None = None
+    synced_product_ids: list[str] = []
     with conn.transaction():
         while True:
             page = parse_page(client.call(ITEM_SOURCE, {
@@ -1226,12 +1253,17 @@ def sync_products(conn, client: KuaimaiClient) -> dict[str, int]:
                      item["source_modified_at"]),
                 ).fetchone()
                 stats["upserted" if written else "skipped"] += 1
+                synced_product_ids.append(str(item["product_id"]))
             assert total is not None
             if stats["fetched"] >= total:
                 break
             if len(page.rows) < PAGE_SIZE:
                 raise KuaimaiError("invalid_response")
             page_no += 1
+        ensure_refs(conn, EntityKind.PRODUCT.value, synced_product_ids)
+        if stats["upserted"]:
+            # 档案名称真的变过才推进目录版本，供 Artifact 记录它解析时用的版本。
+            bump_catalog_version(conn)
     return stats
 
 
