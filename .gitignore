@@ -4,6 +4,8 @@ __pycache__/
 *.py[cod]
 frontend/node_modules/
 frontend/dist/
+# tsc -b 的增量构建缓存，不入库
+*.tsbuildinfo
 .env
 .env.*
 !.env.example
@@ -17,6 +19,8 @@ exports/
 可参考/
 *.dump
 logs/
+.serena
 
 # 本机公网测试拓扑（域名、SSH别名、端口等）
 public_test.local.cmd
+.DS_Store
