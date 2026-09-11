@@ -411,6 +411,108 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(Decimal(str(by_product["P_DIFF"]["product_paid_amount"])),
                          Decimal("100"), "规格列不得改变支付额")
 
+    def _attribution_limitation(self, result) -> str | None:
+        return next((item for item in result.limitations if "未计入商品维度" in item), None)
+
+    def _cover_orders(self, start: datetime, end: datetime) -> None:
+        """给 S1 建 orders 覆盖：没有覆盖时查询先被门禁拦下，测不到归属。"""
+        self.conn.execute(
+            "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered, "
+            "data_as_of, quality_status, quality_rule) VALUES "
+            "('erp.trade.list.query', 'orders', 'S1', %s, "
+            "tstzmultirange(tstzrange(%s, %s, '[)')), %s, 'passed', 'test-fixture') "
+            "ON CONFLICT (source, entity, shop_id) DO UPDATE SET "
+            "watermark = EXCLUDED.watermark, "
+            "covered = bi.sync_state.covered + EXCLUDED.covered, "
+            "data_as_of = greatest(coalesce(bi.sync_state.data_as_of, '-infinity'), "
+            "                       EXCLUDED.data_as_of), "
+            "quality_status = EXCLUDED.quality_status, "
+            "quality_rule = EXCLUDED.quality_rule",
+            (end, start, end, end))
+
+    def _query_ok(self, start: str, end: str):
+        import time as time_module
+
+        from bi_agent.metrics import QueryRequest, query_business
+
+        return query_business(
+            self.conn, QueryRequest(start=start, end=end, shop_ids=["S1"],
+                                    metrics=["paid_amount"]),
+            allowed_shop_ids=frozenset({"S1"}), now=FROZEN_NOW,
+            deadline=time_module.monotonic() + 30)
+
+    def test_fully_attributed_revenue_adds_no_disclosure(self):
+        """全都能归属时不得多插一句：避免把正常查询变成噪声。"""
+        from bi_agent.sync import apply_trade
+
+        self._seed_shop()
+        pay_time = datetime(2026, 9, 1, 12, 0, tzinfo=BEIJING)
+        self._cover_orders(datetime(2026, 9, 1, tzinfo=BEIJING), datetime(2026, 9, 2, tzinfo=BEIJING))
+        apply_trade(self.conn, self._trade("E_AT1", ["C_AT1"], "100.00", pay_time,
+                                           datetime(2026, 9, 1, 13, 0, tzinfo=BEIJING), [
+                                               {"oid": "AT1-1", "tid": "C_AT1",
+                                                "itemSysId": "P_A", "num": "1",
+                                                "payAmount": "100.00"}]),
+                    batch_id="attribution-ok")
+        result = self._query_ok("2026-09-01", "2026-09-02")
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertIsNone(self._attribution_limitation(result), result.limitations)
+
+    def test_closed_line_revenue_is_disclosed_as_unattributed(self):
+        """关闭单保留支付事实、商品视图只取有效行：差额必须逐元说清。
+
+        模型拿不到归因就会自己编（实测它把差额归给了“赠品/非父项行”，
+        而真因是关闭行），所以成因要随金额一起给出。
+        """
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self._seed_shop()
+        pay_time = datetime(2026, 9, 1, 12, 0, tzinfo=BEIJING)
+        self._cover_orders(datetime(2026, 9, 1, tzinfo=BEIJING), datetime(2026, 9, 2, tzinfo=BEIJING))
+        trade = normalise_trade({
+            "sid": "E_AT2", "userId": "S1", "tid": "C_AT2", "payAmount": "12.80",
+            "payTime": _ms(pay_time),
+            "updTime": _ms(datetime(2026, 9, 1, 13, 0, tzinfo=BEIJING)),
+            "unifiedStatus": "CLOSED", "sysStatus": "CLOSED",
+            "orders": [{"oid": "AT2-1", "tid": "C_AT2", "itemSysId": "P_A",
+                         "num": "1", "payAmount": "12.80"}],
+        })
+        self.assertFalse(trade["active"], "CLOSED 单据及其行应判为非有效")
+        apply_trade(self.conn, trade, batch_id="attribution-closed")
+
+        result = self._query_ok("2026-09-01", "2026-09-02")
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(Decimal(str(result.data[0]["paid_amount"])), Decimal("12.80"),
+                         "已收款的关闭单仍计入店铺支付额")
+        self.assertEqual(self._attribution_limitation(result),
+                         "支付额中12.8元未计入商品维度"
+                         "（关闭订单行12.8元；赠品行0元；无商品归属0元；其他0元）")
+
+    def test_gift_line_is_attributed_to_gift_not_closed(self):
+        """赠品行不能当作关闭行披露：成因分类错了比不披更糟。"""
+        from bi_agent.sync import apply_trade
+
+        self._seed_shop()
+        pay_time = datetime(2026, 9, 1, 12, 0, tzinfo=BEIJING)
+        self._cover_orders(datetime(2026, 9, 1, tzinfo=BEIJING), datetime(2026, 9, 2, tzinfo=BEIJING))
+        apply_trade(self.conn, self._trade("E_AT3", ["C_AT3"], "110.00", pay_time,
+                                           datetime(2026, 9, 1, 13, 0, tzinfo=BEIJING), [
+                                               {"oid": "AT3-1", "tid": "C_AT3",
+                                                "itemSysId": "P_A", "num": "1",
+                                                "payAmount": "100.00"},
+                                               {"oid": "AT3-2", "tid": "C_AT3",
+                                                "itemSysId": "P_B", "num": "0",
+                                                "giftNum": "2", "payAmount": "10.00"},
+                                           ]), batch_id="attribution-gift")
+
+        result = self._query_ok("2026-09-01", "2026-09-02")
+
+        self.assertEqual(self._attribution_limitation(result),
+                         "支付额中10元未计入商品维度"
+                         "（关闭订单行0元；赠品行10元；无商品归属0元；其他0元）")
+
     def test_migration_chain_005_then_007_is_forward_only(self):
         """005 → 007 必须能按顺序执行，且各自可重复执行。"""
         from pathlib import Path

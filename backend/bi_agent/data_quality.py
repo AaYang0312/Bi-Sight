@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Iterable, Literal, Sequence
 from zoneinfo import ZoneInfo
 
@@ -141,6 +142,92 @@ def reconcile_source_quality(conn, *, shop_id: str, entity: str,
          source, entity, shop_id),
     )
     return status
+
+
+_ATTRIBUTION_SQL = """
+WITH pay AS (
+  SELECT p.commercial_id, p.amount
+  FROM reporting.v_payments p
+  WHERE p.shop_id = ANY(%s) AND p.verified AND p.amount IS NOT NULL
+    AND p.paid_at >= %s AND p.paid_at < %s
+), ln AS (
+  -- eligible 与 reporting.v_product_daily 的纳入条件同集合，否则披露会与数字自相矛盾。
+  SELECT a.commercial_id,
+         coalesce(sum(a.eligible_amount) FILTER (
+             WHERE a.paid_at >= %s AND a.paid_at < %s), 0) AS eligible,
+         coalesce(sum(a.closed_amount), 0) AS closed,
+         coalesce(sum(a.gift_amount), 0) AS gift,
+         coalesce(sum(a.no_product_amount), 0) AS no_product
+  FROM reporting.v_payment_attribution a
+  WHERE a.shop_id = ANY(%s)
+    AND a.commercial_id IN (SELECT commercial_id FROM pay)
+  GROUP BY a.commercial_id
+), per AS (
+  -- 只取正差额：行合计大于支付额（分摊溢出方向）不算未归属收入。
+  SELECT greatest(pay.amount - coalesce(ln.eligible, 0), 0) AS residual,
+         coalesce(ln.closed, 0) AS closed, coalesce(ln.gift, 0) AS gift,
+         coalesce(ln.no_product, 0) AS no_product
+  FROM pay LEFT JOIN ln ON ln.commercial_id = pay.commercial_id
+), bucketed AS (
+  -- 四类互斥，按 residual 逐项扣减归因；扣不掉的进 other，绝不凭空造成因。
+  SELECT residual,
+         least(residual, closed) AS b_closed,
+         least(residual - least(residual, closed), gift) AS b_gift,
+         least(residual - least(residual, closed)
+                       - least(residual - least(residual, closed), gift),
+               no_product) AS b_no_product
+  FROM per
+)
+SELECT coalesce(sum(residual), 0), coalesce(sum(b_closed), 0),
+       coalesce(sum(b_gift), 0), coalesce(sum(b_no_product), 0),
+       coalesce(sum(residual - b_closed - b_gift - b_no_product), 0)
+FROM bucketed
+"""
+
+
+@dataclass(frozen=True)
+class AttributionGap:
+    """已核验支付额里没能进商品维度的部分及其成因分解。"""
+
+    total: Decimal
+    closed: Decimal
+    gift: Decimal
+    no_product: Decimal
+    other: Decimal
+
+    @property
+    def material(self) -> bool:
+        return self.total > 0
+
+
+def _money(value: Decimal) -> str:
+    """金额按原值渲染，只去尾零：不做舍入，免得分项与合计对不上。"""
+    text = format(value, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def attribution_gap(conn, *, shop_ids: Sequence[str],
+                    start_ts: datetime, end_ts: datetime) -> AttributionGap:
+    """按请求窗口与店铺范围算支付额的商品归属差额。"""
+    shops = [str(shop_id) for shop_id in shop_ids]
+    if not shops:
+        return AttributionGap(Decimal(0), Decimal(0), Decimal(0), Decimal(0), Decimal(0))
+    row = conn.execute(_ATTRIBUTION_SQL,
+                       (shops, start_ts, end_ts, start_ts, end_ts, shops)).fetchone()
+    return AttributionGap(*(Decimal(str(value or 0)) for value in row))
+
+
+def describe_attribution_gap(gap: AttributionGap) -> str | None:
+    """把差额连同成因写成一句披露；没有差额就返回 None（不给正常查询添噪声）。
+
+    四个分项必须全部出现：实测模型在拿不到归因时会自己编原因
+    （把关闭行造成的差额说成“赠品/非父项行”），显式给 0 才能排除错猜。
+    """
+    if not gap.material:
+        return None
+    return (f"支付额中{_money(gap.total)}元未计入商品维度"
+            f"（关闭订单行{_money(gap.closed)}元；赠品行{_money(gap.gift)}元；"
+            f"无商品归属{_money(gap.no_product)}元；其他{_money(gap.other)}元）")
 
 
 def required_entities(metrics: Sequence[str]) -> list[str]:

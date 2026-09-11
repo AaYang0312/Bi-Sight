@@ -245,6 +245,49 @@ class RuntimeModelTests(unittest.TestCase):
         self.assertEqual(store.runs[run_id]["status"], "succeeded")
 
 
+class AttributionDisclosureContractTests(unittest.TestCase):
+    """归属披露是参数化文本：形状要校验，不能给注入留口。"""
+
+    TEXT = ("支付额中3130.51元未计入商品维度"
+            "（关闭订单行3130.51元；赠品行0元；无商品归属0元；其他0元）")
+
+    def _payload(self, limitation):
+        return {
+            "status": "ok", "metric_definition": {},
+            "coverage": {"status": "complete", "start": "2026-09-01",
+                         "end": "2026-09-10", "gaps": []},
+            "limitations": [limitation], "data_as_of": None,
+            "filters": {}, "data": [],
+        }
+
+    def test_well_formed_disclosure_is_accepted(self):
+        from bi_agent.runtime.models import validate_artifact_payload, validate_model_payload
+
+        validate_artifact_payload(self._payload(self.TEXT))
+        validate_model_payload(self._payload(self.TEXT))
+
+    def test_disclosure_carrying_identifiers_or_free_text_is_rejected(self):
+        """披露只能是一串金额，不得夹入店铺主键或自行改写的成因。"""
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        for bad in (
+            "支付额中3130.51元未计入商品维度（关闭订单行3130.51元；赠品行0元；"
+            "无商品归属0元；其他0元；店铺166754）",
+            "支付额中abc元未计入商品维度（关闭订单行0元；赠品行0元；无商品归属0元；其他0元）",
+            "支付额中3130.51元未计入商品维度",
+            "支付额中99元未计入商品维度（赠品99元）",
+        ):
+            with self.subTest(bad=bad[:24]):
+                with self.assertRaises(ValueError):
+                    validate_artifact_payload(self._payload(bad))
+
+    def test_graph_maps_disclosure_to_a_stable_code(self):
+        """归因文本要能进结构化事件，不能只存一句人话。"""
+        from bi_agent.business_query.nodes import _limitation_codes
+
+        self.assertEqual(_limitation_codes([self.TEXT]), ["revenue_not_attributed"])
+
+
 class CoverageContractTests(unittest.TestCase):
     """覆盖契约加 suggested_window 时，旧 Artifact 必须继续可读。"""
 

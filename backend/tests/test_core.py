@@ -978,6 +978,9 @@ class FakeWarehouse:
                                 for shop_id in params[6]])
         if "FROM reporting.v_source_batches" in text:
             return _FakeResult([])                        # 离线用例不伪造批次血缘
+        if "FROM reporting.v_payment_attribution" in text:
+            # 健康替身：total, closed, gift, no_product, other 全零 = 完全归属。
+            return _FakeResult([(0, 0, 0, 0, 0)])
         if text.startswith("SELECT count(*) FROM reporting.v_refunds"):
             return _FakeResult([(self.unmatched,)])
         if text.startswith("WITH cohort"):

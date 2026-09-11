@@ -45,7 +45,8 @@ METRIC_DEFINITIONS: dict[str, str] = {
 # 指标→实体依赖与覆盖来源定义在 data_quality（覆盖门禁的唯一真源）；
 # 本模块只引用，不再存第二份，避免门禁与指标两边口径漂移。
 from bi_agent.data_quality import (
-    ENTITY_REQUIREMENTS, UNMATCHED_REFUNDS_SQL, assess_query_coverage)
+    ENTITY_REQUIREMENTS, UNMATCHED_REFUNDS_SQL, attribution_gap,
+    assess_query_coverage, describe_attribution_gap)
 
 
 class QueryRequest(BaseModel):
@@ -423,6 +424,13 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
     if assessment.quality_status == "unknown":
         # 从未对账不等于数据有错：可以出数，但必须把未核验这件事说明白。
         limitations.append("来源质量未核验（尚无对账记录）")
+
+    # 商品归属披露：已核验支付额里没进商品维度的部分，连成因一起说清，
+    # 不給模型留下自己猜原因的空间。
+    attribution = describe_attribution_gap(
+        attribution_gap(conn, shop_ids=request.shop_ids, start_ts=start_ts, end_ts=end_ts))
+    if attribution:
+        limitations.append(attribution)
 
     # 未匹配成功退款影响退款归属
     refund_metrics = {"refund_amount", "cash_difference", "cohort_refund_rate"}

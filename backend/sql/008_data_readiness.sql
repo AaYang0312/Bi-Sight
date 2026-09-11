@@ -104,8 +104,33 @@ SELECT source, entity, shop_id, batch_id, lower(business_window) AS window_start
        business_end, recorded_at
 FROM bi.sync_batches;
 
+-- 5b) 支付归属视图：把行的商品可归属情况按商业单预聚合成金额桶。
+--     聊天 API 以 bi_app 身份运行，只能读 reporting 视图，所以指标层的归属披露
+--     必须走这里，不能直接查 bi.order_items。粒度停在商业单，不落商品主键。
+CREATE OR REPLACE VIEW reporting.v_payment_attribution AS
+SELECT i.shop_id,
+       i.commercial_id,
+       i.paid_at,
+       coalesce(sum(i.allocated_paid_amount) FILTER (
+           WHERE i.active AND i.line_kind <> 'gift' AND i.product_id IS NOT NULL), 0)
+           AS eligible_amount,
+       coalesce(sum(i.allocated_paid_amount) FILTER (WHERE NOT i.active), 0)
+           AS closed_amount,
+       coalesce(sum(i.allocated_paid_amount) FILTER (
+           WHERE i.active AND i.line_kind = 'gift'), 0) AS gift_amount,
+       coalesce(sum(i.allocated_paid_amount) FILTER (
+           WHERE i.active AND i.line_kind <> 'gift' AND i.product_id IS NULL), 0)
+           AS no_product_amount
+FROM bi.order_items i
+WHERE i.allocated_paid_amount IS NOT NULL AND i.commercial_id IS NOT NULL
+GROUP BY i.shop_id, i.commercial_id, i.paid_at;
+
+COMMENT ON VIEW reporting.v_payment_attribution IS
+  '按商业单聚合的支付归属桶；用于披露"已收款但没进商品维度"的金额与成因。';
+
 GRANT SELECT, INSERT, UPDATE ON bi.sync_batches TO bi_sync;
 REVOKE ALL ON bi.sync_batches FROM PUBLIC;
 REVOKE ALL ON bi.sync_batches FROM bi_app;
 GRANT SELECT ON reporting.v_source_batches TO bi_reader, bi_app;
+GRANT SELECT ON reporting.v_payment_attribution TO bi_reader, bi_app;
 GRANT SELECT ON reporting.v_coverage TO bi_reader, bi_app;

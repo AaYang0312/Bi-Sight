@@ -83,7 +83,12 @@ _LIMITATION_CODES = frozenset({
     "result_too_large", "cohort_rate_not_computable",
     # 覆盖与质量是两件事：缺数据与对账未通过必须分开归因。
     "source_quality_failed", "source_quality_unverified",
+    # 支付额未进商品维度：金额与成因由确定 SQL 产生，必须可归因不可自创。
+    "revenue_not_attributed",
 })
+# 披露文本里的金额片段：与 _DECIMAL_RE 同一形式，不另加一套数字规则。
+_MONEY = r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?"
+
 _PUBLIC_LIMITATIONS = frozenset({
     "店铺不在授权范围",
     "本次查询时间预算已耗尽",
@@ -102,6 +107,11 @@ _PUBLIC_LIMITATIONS = frozenset({
 _PUBLIC_LIMITATION_PATTERNS = (
     re.compile(r"^存在[0-9]+条未匹配的平台成功退款，退款归属未确认$"),
     re.compile(r"^结果超过[0-9]+组，请缩小日期范围或店铺范围$"),
+    # 商品归属披露：四个分项必现（缺项就是给猜测留空间），金额形式与 _DECIMAL_RE 同源。
+    re.compile(
+        r"^支付额中" + _MONEY + r"元未计入商品维度"
+        r"（关闭订单行" + _MONEY + r"元；赠品行" + _MONEY + r"元；"
+        r"无商品归属" + _MONEY + r"元；其他" + _MONEY + r"元）$"),
     *PROMOTION_LIMITATION_PATTERNS,
 )
 _STATE_KEYS = frozenset({
