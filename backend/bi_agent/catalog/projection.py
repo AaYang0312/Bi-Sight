@@ -88,6 +88,8 @@ def build_catalog(conn, result, *, allowed_shop_ids: frozenset[str]) -> Catalog:
         raise CatalogUnauthorized("shop_not_authorized")
 
     labels = shop_display_labels(_shop_rows(conn))
+    platforms = {str(row["shop_id"]): (str(row["platform"]).strip() or None)
+                 for row in _shop_rows(conn)}
     entities: list[DisplayEntity] = []
     shop_refs: dict[str, str] = {}
     for shop_id in sorted({*shop_ids, *filter_shop_ids}):
@@ -95,7 +97,7 @@ def build_catalog(conn, result, *, allowed_shop_ids: frozenset[str]) -> Catalog:
         shop_refs[shop_id] = ref
         label = labels.get(shop_id)
         entities.append(DisplayEntity(
-            ref=ref, kind=EntityKind.SHOP,
+            ref=ref, kind=EntityKind.SHOP, platform=platforms.get(shop_id),
             display_name=label if is_safe_display_name(label) else None,
             name_source="shop_profile" if is_safe_display_name(label) else "unresolved"))
 

@@ -724,3 +724,10 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
     transition-delay: 0s !important;
   }
 }
+
+/* 店铺所属平台标签：用已通过对比度门禁的 --text-3，不新 introducing 新色值。 */
+.entity-platform {
+  margin-left: 6px; padding: 1px 5px; border: 1px solid var(--hair);
+  border-radius: 999px; color: var(--text-3);
+  font-size: 10.5px; font-weight: 600; letter-spacing: .04em;
+}

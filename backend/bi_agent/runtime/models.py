@@ -85,6 +85,7 @@ _LIMITATION_CODES = frozenset({
     "source_quality_failed", "source_quality_unverified",
     # 支付额未进商品维度：金额与成因由确定 SQL 产生，必须可归因不可自创。
     "revenue_not_attributed",
+    "source_not_onboarded",
 })
 # 披露文本里的金额片段：与 _DECIMAL_RE 同一形式，不另加一套数字规则。
 _MONEY = r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?"
@@ -110,6 +111,9 @@ _PUBLIC_LIMITATION_PATTERNS = (
     # 行数上限是合法降级提醒，不登记就会被契约校验拒掉并误报成 result_contract_violation。
     re.compile(r"^结果行数达到[0-9]+上限，已拒绝出数以避免静默截断；"
                r"请缩小日期范围或店铺范围$"),
+    # 来源未开通：家数可变，其余文字固定；与“覆盖有缺口”不同类，不能混因。
+    re.compile(r"^[0-9]+ 家店铺的来源尚未开通（未授权或未同步），"
+               r"缩小日期范围不会补上这段数据$"),
     # 商品归属披露：四个分项必现（缺项就是给猜测留空间），金额形式与 _DECIMAL_RE 同源。
     re.compile(
         r"^支付额中" + _MONEY + r"元未计入商品维度"
@@ -174,9 +178,12 @@ _NODES = frozenset({
 })
 # 引用与展示名的形式规则只定义在 bi_agent.catalog 一处，这里复用不拄写。
 _REF_RE = REF_RE
+# 与 catalog 同一形式：平台码是短标识，不是文本。
+_PLATFORM_CODE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,15}$")
 _ENTITY_KINDS = frozenset(kind.value for kind in EntityKind)
 _NAME_SOURCES = frozenset({"archive", "trade_snapshot", "shop_profile", "unresolved"})
-_ENTITY_KEYS = frozenset({"ref", "kind", "display_name", "sku_label", "name_source"})
+_ENTITY_KEYS = frozenset({"ref", "kind", "display_name", "sku_label", "name_source",
+                          "platform"})
 _DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _GAP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}~[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _DECIMAL_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
@@ -255,6 +262,12 @@ def _entities(value: object) -> None:
         if entity["name_source"] != "unresolved" and entity.get("display_name") is None:
             _unsafe_payload()
         if entity["name_source"] == "unresolved" and entity.get("display_name") is not None:
+            _unsafe_payload()
+        platform = entity.get("platform")
+        # platform 不在 required 里：旧 Artifact 没这个字段，必须继续可读。
+        # 平台码只能是不带修饰的短标识，不能当第二条自由文本通道。
+        if platform is not None and (not isinstance(platform, str)
+                                     or not _PLATFORM_CODE_RE.fullmatch(platform)):
             _unsafe_payload()
 
 

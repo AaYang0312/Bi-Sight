@@ -178,6 +178,43 @@ class CoverageAssessmentTests(unittest.TestCase):
 
     # -- 来源批次凭证 --------------------------------------------------------
 
+    def test_shop_without_onboarded_source_is_reported_as_unconfigured(self):
+        """未开通来源的店与“有覆盖但窗口缺一天”是两回事。
+
+        前者缩小日期范围永远拿不到数据（平台未授权/从未同步），
+        把两者都说成“请缩小范围”会误导经营者。
+        """
+        self.conn.execute(
+            "UPDATE bi.shops SET capabilities = '{orders,aftersales_occurrence}' WHERE shop_id='DQ_S1'")
+        self._state(
+            "DQ_S1",
+            covered=[(datetime(2026, 9, 4, tzinfo=BEIJING),
+                      datetime(2026, 9, 11, tzinfo=BEIJING))],
+            data_as_of=datetime(2026, 9, 11, tzinfo=BEIJING),
+        )
+        assessment = self._assess(self._request(shop_ids=["DQ_S1", "DQ_S2"]))
+
+        self.assertEqual(assessment.source_unconfigured, ("DQ_S2",),
+                         "未登记能力的店必须单独归因")
+        self.assertEqual(assessment.status, "partial")
+
+    def test_configured_shop_is_not_reported_as_unconfigured(self):
+        self.conn.execute(
+            "UPDATE bi.shops SET capabilities = '{orders,aftersales_occurrence}' WHERE shop_id='DQ_S1'")
+        self.conn.execute(
+            "UPDATE bi.shops SET capabilities = '{orders}' WHERE shop_id='DQ_S2'")
+        for shop in ("DQ_S1", "DQ_S2"):
+            self._state(
+                shop,
+                covered=[(datetime(2026, 9, 4, tzinfo=BEIJING),
+                          datetime(2026, 9, 11, tzinfo=BEIJING))],
+                data_as_of=datetime(2026, 9, 11, tzinfo=BEIJING),
+            )
+        assessment = self._assess(self._request(shop_ids=["DQ_S1", "DQ_S2"]))
+
+        self.assertEqual(assessment.source_unconfigured, ())
+        self.assertEqual(assessment.status, "complete")
+
     def test_assessment_names_the_batches_behind_the_numbers(self):
         """来源批次要能回答“这些数字是哪几批同步出来的”。"""
         self._state(

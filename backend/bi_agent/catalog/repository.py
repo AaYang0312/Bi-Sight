@@ -81,6 +81,12 @@ def _shop_labels(conn) -> dict[str, str | None]:
         {"shop_id": row[0], "platform": row[1], "display_name": row[2]} for row in rows])
 
 
+def _shop_platforms(conn) -> dict[str, str | None]:
+    """平台码单独取：展示名去重已经用过一次 rows，不复用同一返回以免两处互相约束。"""
+    rows = conn.execute("SELECT shop_id, platform FROM bi.shops").fetchall()
+    return {str(row[0]): (str(row[1]).strip() or None) for row in rows}
+
+
 def _archive_titles(conn, product_ids: Sequence[str]) -> dict[str, str]:
     if not product_ids:
         return {}
@@ -107,6 +113,7 @@ def resolve_display_entities(
     product_keys = sorted({key for kind, key in targets.values()
                            if kind in {EntityKind.PRODUCT, EntityKind.SKU}})
     labels = _shop_labels(conn) if shop_keys else {}
+    platforms = _shop_platforms(conn) if shop_keys else {}
     titles = _archive_titles(conn, product_keys) if product_keys else {}
 
     entities: list[DisplayEntity] = []
@@ -120,7 +127,7 @@ def resolve_display_entities(
                 continue
             label = labels.get(natural_key)
             entities.append(DisplayEntity(
-                ref=ref, kind=EntityKind.SHOP,
+                ref=ref, kind=EntityKind.SHOP, platform=platforms.get(natural_key),
                 display_name=label if is_safe_display_name(label) else None,
                 name_source="shop_profile" if is_safe_display_name(label) else "unresolved"))
             continue

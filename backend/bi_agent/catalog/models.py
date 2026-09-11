@@ -12,7 +12,7 @@ from collections import Counter
 from enum import StrEnum
 from typing import Any, Iterable, Literal, Mapping
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 # 引用格式：kind+ERP主键 的 sha256 前 8 位，稳定可持久，重排/重跑都不变。
 REF_RE = re.compile(r"^ent-[0-9a-z]{8}$")
@@ -52,8 +52,12 @@ class EntityRef(BaseModel):
     catalog_version: int
 
 
+# 平台码是短标识（tb/fxg/pdd…）：不允许把展示字段当自由文本注入。
+_PLATFORM_CODE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,15}$")
+
+
 class DisplayEntity(BaseModel):
-    """授权展示实体：引用 + 可读名称 + 名称来源。"""
+    """授权展示实体：引用 + 可读名称 + 名称来源 + （店铺）平台码。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -62,6 +66,15 @@ class DisplayEntity(BaseModel):
     display_name: str | None = None
     sku_label: str | None = None
     name_source: NameSource = "unresolved"
+    # 平台码只供授权展示层区分店铺属于哪个平台；商品不带平台。
+    platform: str | None = None
+
+    @field_validator("platform")
+    @classmethod
+    def _platform_is_a_short_code(cls, value: str | None) -> str | None:
+        if value is not None and not _PLATFORM_CODE_RE.fullmatch(value):
+            raise ValueError("unsafe_platform_code")
+        return value
 
 
 def ref_for_key(kind: str, natural_key: str) -> str:

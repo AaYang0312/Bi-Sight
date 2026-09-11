@@ -288,6 +288,55 @@ class AttributionDisclosureContractTests(unittest.TestCase):
         self.assertEqual(_limitation_codes([self.TEXT]), ["revenue_not_attributed"])
 
 
+    def test_entity_platform_code_is_validated(self):
+        """旧 Artifact 无 platform 仍可读；新字段只接受短码。"""
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        base = {"ref": S1_REF, "kind": "shop", "display_name": "元发钉枪",
+                "name_source": "shop_profile"}
+        validate_artifact_payload(self._payload_with_entities([dict(base)]))
+        validate_artifact_payload(self._payload_with_entities([dict(base, platform="fxg")]))
+        for bad in ("FXG 抖音", "fxg;drop", "", "x" * 20):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    validate_artifact_payload(self._payload_with_entities(
+                        [dict(base, platform=bad)]))
+
+    def _payload_with_entities(self, entities):
+        return {
+            "status": "ok", "metric_definition": {},
+            "coverage": {"status": "complete", "start": "2026-09-01",
+                         "end": "2026-09-08", "gaps": []},
+            "limitations": [], "data_as_of": None, "filters": {}, "data": [],
+            "entities": entities, "catalog_version": 0,
+        }
+
+
+    def test_unonboarded_source_disclosure_is_public_and_mapped(self):
+        """“来源未开通”得能进载荷并归因，否则与覆盖缺口无法区分。"""
+        from bi_agent.business_query.nodes import _limitation_codes
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        text = "2 家店铺的来源尚未开通（未授权或未同步），缩小日期范围不会补上这段数据"
+        payload = self._payload(text, status="missing_data")
+        validate_artifact_payload(payload)
+        self.assertEqual(_limitation_codes([text]), ["source_not_onboarded"])
+        for bad in (" 家店铺的来源尚未开通（未授权或未同步），缩小日期范围不会补上这段数据",
+                    "2 家店铺的来源尚未开通，随便加点什么"):
+            with self.subTest(bad=bad[:12]):
+                with self.assertRaises(ValueError):
+                    validate_artifact_payload(self._payload(bad, status="missing_data"))
+
+    def _payload(self, limitation, status="unavailable"):
+        return {
+            "status": status, "metric_definition": {},
+            "coverage": {"status": "complete", "start": "2026-09-01",
+                         "end": "2026-09-10", "gaps": []},
+            "limitations": [limitation], "data_as_of": None,
+            "filters": {}, "data": [],
+        }
+
+
 class TruncationLimitationContractTests(unittest.TestCase):
     """行数上限是合法的范围提示，不是契约违规。
 

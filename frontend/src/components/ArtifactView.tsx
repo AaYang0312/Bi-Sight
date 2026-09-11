@@ -23,6 +23,23 @@ const DIMENSION_COLUMNS = new Set([
   'notice',
 ])
 
+/**
+ * 平台码 → 可读名。后端 PLATFORM_LABELS 才是单一真源（它也用这份表做重名后缀）；
+ * 未收录的码原样输出，不猜、不置空。
+ */
+const PLATFORM_LABELS: Record<string, string> = {
+  fxg: '抖音', tb: '淘宝', tm: '天猫', pdd: '拼多多', jd: '京东', kuaishou: '快手',
+  wxsph: '视频号', '1688': '1688',
+}
+const PLATFORM_CODE_RE = /^[a-z0-9][a-z0-9_-]{0,15}$/
+
+function platformOf(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const code = value.trim()
+  // 不合法的码直接丢掉：宁可少一个标签，也不把载荷里任意文本当展示内容。
+  return PLATFORM_CODE_RE.test(code) ? code : null
+}
+
 export function artifactEntities(artifact: Artifact): Map<string, DisplayEntity> {
   const byRef = new Map<string, DisplayEntity>()
   const entities = Array.isArray(artifact.entities) ? artifact.entities : []
@@ -35,6 +52,7 @@ export function artifactEntities(artifact: Artifact): Map<string, DisplayEntity>
       sku_label: typeof item.sku_label === 'string' ? item.sku_label : null,
       name_source: typeof item.name_source === 'string'
         ? item.name_source as DisplayEntity['name_source'] : 'unresolved',
+      platform: platformOf(item.platform),
     })
   }
   return byRef
@@ -54,6 +72,19 @@ export function cellText(value: unknown, entities: Map<string, DisplayEntity>) {
     return `${entity.display_name}${source}${spec}`
   }
   return text(value)
+}
+
+/**
+ * 单元格对应的平台标签：只在名称本身没带上平台时补一个标签。
+ * 重名店铺的名称已经带（抖音）这类后缀，再追一遍就是噪声。
+ */
+export function cellPlatform(value: unknown, entities: Map<string, DisplayEntity>): string | null {
+  if (!isRef(value)) return null
+  const entity = entities.get(value)
+  if (!entity || entity.kind !== 'shop' || !entity.platform) return null
+  const label = PLATFORM_LABELS[entity.platform] ?? entity.platform
+  if (entity.display_name && entity.display_name.includes(label)) return null
+  return label
 }
 
 function isRef(value: unknown): value is string {
@@ -109,8 +140,19 @@ export function ArtifactView({ artifact }: { artifact: Artifact }) {
             <tbody>{dataRows.map((row, index) => (
               <tr key={`${row.day ?? ''}-${row.product_ref ?? row.shop_ref ?? index}`}>
                 {columns.map((key) => (
-                  <td key={key} data-ref={isRef(row[key]) ? row[key] : undefined}>
+                  <td
+                    key={key}
+                    data-ref={isRef(row[key]) ? row[key] : undefined}
+                    data-platform={(() => {
+                      if (!isRef(row[key])) return undefined
+                      const entity = entities.get(row[key])
+                      return entity?.kind === 'shop' ? (entity.platform ?? undefined) : undefined
+                    })()}
+                  >
                     {cellText(row[key], entities)}
+                    {cellPlatform(row[key], entities) && (
+                      <span className="entity-platform">{cellPlatform(row[key], entities)}</span>
+                    )}
                   </td>
                 ))}
               </tr>

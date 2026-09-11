@@ -20,7 +20,8 @@ const artifact: Artifact = {
     { notice: '仅返回Top 2，共57个商品' },
   ],
   entities: [
-    { ref: SHOP_REF, kind: 'shop', display_name: '元发钉枪(抖音)', name_source: 'shop_profile' },
+    { ref: SHOP_REF, kind: 'shop', display_name: '元发钉枪(抖音)', name_source: 'shop_profile',
+      platform: 'fxg' },
     { ref: PRODUCT_REF, kind: 'product', display_name: '接头-元发', sku_label: '20PP',
       name_source: 'trade_snapshot' },
     { ref: UNKNOWN_REF, kind: 'product', name_source: 'unresolved' },
@@ -41,6 +42,23 @@ describe('ArtifactView 名称投影', () => {
 
   it('marks snapshot names and appends the sku label', () => {
     expect(html).toContain('接头-元发（成交名） 20PP')
+  })
+
+  it('tags each shop with its platform', () => {
+    // 平台属于哪一家店是经营者做跨平台判断的第一层信息。
+    expect(html).toContain('抖音')
+    expect(html).toContain('data-platform="fxg"')
+  })
+
+  it('falls back to the raw platform code when the label is unknown', () => {
+    const withUnknown = {
+      ...artifact,
+      entities: [
+        { ref: SHOP_REF, kind: 'shop', display_name: '某店', name_source: 'shop_profile',
+          platform: 'wsxc' },
+      ],
+    }
+    expect(renderToStaticMarkup(<ArtifactView artifact={withUnknown} />)).toContain('wsxc')
   })
 
   it('shows an unresolved name as a placeholder, never the raw ref', () => {

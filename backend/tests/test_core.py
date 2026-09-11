@@ -338,6 +338,59 @@ class SyncNormalisationTests(unittest.TestCase):
         self.assertTrue(conn.parameters[1][-1])
 
 
+    def test_normalise_trade_treats_placeholder_pay_time_as_missing(self):
+        """未付款/已关闭单的 payTime=2000-01-01 是占位值，不是真实支付时间。
+
+        真实数据实测：抖音与快手各一单（WAIT_BUYER_PAY / CLOSED）带 946656000000。
+        当成已支付时间入库会让未付的单独进支付日指标，也会让它拿到已核验支付事实。
+        """
+        from bi_agent.sync import normalise_trade
+
+        trade = normalise_trade({
+            "sid": "E_PLACE", "userId": "S1", "tid": "C_PLACE",
+            "payTime": 946656000000,                       # 2000-01-01 00:00 +08
+            "updTime": 1788825531000, "payAmount": "4.30",
+            "unifiedStatus": "WAIT_BUYER_PAY",
+            "orders": [{"oid": "L_P1", "tid": "C_PLACE", "itemSysId": "P_A",
+                         "num": "1", "payAmount": "4.30"}],
+        })
+
+        self.assertIsNone(trade["paid_at"], "占位支付时间应判为未取得")
+        self.assertEqual(trade["raw_pay_amount"], Decimal("4.30"), "金额仍要原样留住")
+        self.assertEqual(trade["normalization_status"], "normal")
+        self.assertIsNone(trade["items"][0]["paid_at"])
+
+    def test_normalise_aftersale_treats_placeholder_completion_time_as_missing(self):
+        from bi_agent.sync import normalise_aftersale
+
+        record = normalise_aftersale({
+            "aftersaleId": "A_PLACE", "userId": "S1", "tid": "C_P1",
+            "rawRefundMoney": "10.00", "onlineStatus": 7, "status": 9,
+            "modified": 1788825531000,
+            "platformCompleteTime": 946656000000, "finished": 946656000000,
+        })
+
+        self.assertIsNone(record["platform_completed_at"])
+        self.assertIsNone(record["system_completed_at"])
+        self.assertFalse(record["platform_success"],
+                         "没有真实完成时间就不能宣布平台退款已完成")
+
+    def test_real_business_time_is_not_rejected_by_the_floor(self):
+        """下限不能误伤真数据：2026 年的支付时间必须原样保留。"""
+        from bi_agent.sync import normalise_trade
+
+        trade = normalise_trade({
+            "sid": "E_REAL", "userId": "S1", "tid": "C_REAL",
+            "payTime": 1788797057000, "updTime": 1788825531000,
+            "payAmount": "10.00",
+            "orders": [{"oid": "L_R1", "tid": "C_REAL", "itemSysId": "P_A",
+                         "num": "1", "payAmount": "10.00"}],
+        })
+
+        self.assertIsNotNone(trade["paid_at"])
+        self.assertEqual(trade["paid_at"].year, 2026)
+
+
 class SyncSchemaTests(unittest.TestCase):
     def test_sync_schema_rejects_missing_mapping_columns(self):
         from bi_agent.kuaimai import KuaimaiError
@@ -978,7 +1031,8 @@ class FakeWarehouse:
 
     def __init__(self, *, daily_rows=(), product_rows=(), shops=(), data_as_of=None,
                  cohort=(None, None), unmatched=0, shop_profiles=(), catalog_version=7,
-                 quality_status="passed", quality_rule=QUALITY_RULE):
+                 quality_status="passed", quality_rule=QUALITY_RULE,
+                 capabilities=("orders", "aftersales_occurrence", "aftersales_cohort")):
         self.daily_rows = [tuple(row) for row in daily_rows]
         # 视图列形以 tests.dbfixtures.PRODUCT_DAILY_COLUMNS 为单一真源，这里不再手抄列数：
         # 测试行没给末尾的名称 / 成交快照 / 规格列就按契约补上。
@@ -996,6 +1050,7 @@ class FakeWarehouse:
         # 替身默认代表“已对账通过的健康库”；真实库默认是 unknown，两边不同。
         self.quality_status = quality_status
         self.quality_rule = quality_rule
+        self.capabilities = tuple(capabilities)
         self.cohort = tuple(cohort)
         self.unmatched = unmatched
         self.statements: list[tuple[str, tuple]] = []
@@ -1025,6 +1080,10 @@ class FakeWarehouse:
                                version=self.catalog_version)
         if catalog is not None:
             return _FakeResult(catalog.fetchall())
+        if "capabilities FROM reporting.v_shops" in text:
+            # 健廉替身 = 三家实体的来源都已开通，不干扰现有离线用例的 limitations 断言。
+            return _FakeResult([(row[0], list(self.capabilities)) for row in self.shops
+                                if row[0] in params[0]])
         if "FROM reporting.v_shops" in text:
             return _FakeResult([row for row in self.shops if row[0] in params[0]])
         if "FROM reporting.v_coverage" in text:

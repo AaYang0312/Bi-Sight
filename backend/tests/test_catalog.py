@@ -353,7 +353,36 @@ class CatalogProjectionTests(unittest.TestCase):
                          ("直钉枪-元发", "archive"))
         self.assertEqual(public["catalog_version"], catalog_version(self.conn))
 
+    def test_shop_entity_carries_the_platform_code(self):
+        """操作者要能看出店铺属于哪个平台：平台码随实体一起返回。
+
+        模型仍只看 ent- 引用，平台名不因此进入模型载荷。
+        """
+        _, _, public, model_json, _ = self._project(
+            [{"shop_id": "S_CAT_P", "paid_amount": "100"}])
+
+        shop = [item for item in public["entities"] if item["kind"] == "shop"][0]
+        self.assertEqual(shop["platform"], "fxg")
+        self.assertNotIn("fxg", model_json, "平台码不得进入模型载荷")
+
+    def test_product_entity_has_no_platform(self):
+        _, _, public, _, _ = self._project(
+            [{"shop_id": "S_CAT_P", "product_id": "P_CAT", "quantity": "1",
+              "line_kind": "sale", "product_name": "直钉枪-元发"}])
+
+        product = [item for item in public["entities"] if item["kind"] == "product"][0]
+        self.assertIsNone(product["platform"])
+
+    def test_unknown_shop_platform_code_is_rejected(self):
+        """平台码得是短码，不能把展示字段当自由文本注入。"""
+        from bi_agent.catalog import DisplayEntity
+
+        self.assertRaises(Exception, DisplayEntity,
+                          ref="ent-1111aaaa", kind="shop",
+                          platform="fxg; 顺手写点东西")
+
     def test_product_entity_shows_the_sku_spec_when_rows_agree(self):
+        """每一行都给出同一个规格才展示。"""
         _, _, public, _, _ = self._project(
             [{"shop_id": "S_CAT_P", "product_id": "P_CAT", "quantity": "3",
               "line_kind": "sale", "product_name": "直钉枪-元发",

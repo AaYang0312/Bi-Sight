@@ -15,6 +15,11 @@ export type DisplayEntity = {
   display_name?: string | null
   sku_label?: string | null
   name_source: 'archive' | 'trade_snapshot' | 'shop_profile' | 'unresolved'
+  /**
+   * 店铺属于哪个平台的短码（后端校验后才会到这里）。
+   * 模型载荷不含平台，所以跨平台判断只能在展示层做。
+   */
+  platform?: string | null
 }
 
 export type Artifact = Record<string, unknown>

@@ -68,6 +68,10 @@ WHERE shop_id = ANY(%s) AND platform_success AND refund_canonical
 # 核验口径版本：规则一变，旧的 passed 自动失效（降级为 unknown）。
 QUALITY_RULE = "kuaimai-reconcile/1"
 
+_CAPABILITIES_SQL = """
+SELECT shop_id, capabilities FROM reporting.v_shops WHERE shop_id = ANY(%s)
+"""
+
 QualityStatus = Literal["unknown", "passed", "failed"]
 CoverageStatus = Literal["complete", "partial", "missing"]
 Window = tuple[str, str]
@@ -105,6 +109,8 @@ class CoverageAssessment:
     source_batches: tuple[str, ...]
     gaps: tuple[CoverageGap, ...]
     suggested_window: Window | None
+    # 来源尚未开通（能力未登记）的店铺：只能留在服务端，不得迚入模型载荷。
+    source_unconfigured: tuple[str, ...] = ()
 
 
 def _effective_quality(status: object, rule: object) -> QualityStatus:
@@ -267,6 +273,24 @@ def _suggested(covered_windows: tuple[Window, ...], requested: Window,
                                  - date.fromisoformat(item[0]), item[0]))
 
 
+def _unconfigured_shops(conn, shop_ids: Sequence[str], entities: Sequence[str]) -> tuple[str, ...]:
+    """本次请求需要的实体里，哪家店还根本没有开通来源。
+
+    capabilities 由对账维护（见 001 注释与迚接验收记录）：空数组就是
+    “这张店从来没有一份已核验数据”。跟“有覆盖但缺几天”必须分开说。
+    """
+    if not shop_ids or not entities:
+        return ()
+    rows = conn.execute(_CAPABILITIES_SQL, (list(shop_ids),)).fetchall()
+    needed = set(entities)
+    unconfigured: list[str] = []
+    for shop_id, capabilities in rows:
+        have = {str(item) for item in (capabilities or [])}
+        if not needed <= have:
+            unconfigured.append(str(shop_id))
+    return tuple(sorted(unconfigured))
+
+
 def assess_query_coverage(conn, request) -> CoverageAssessment:
     """在跑指标 SQL 之前判定：能不能出数、缺哪一段、来源是否已核验。
 
@@ -286,7 +310,10 @@ def assess_query_coverage(conn, request) -> CoverageAssessment:
     batches: list[str] = []
     pairs = 0
 
-    for entity in required_entities(request.metrics):
+    entities = required_entities(request.metrics)
+    unconfigured = _unconfigured_shops(conn, shop_ids, entities)
+
+    for entity in entities:
         source = ENTITY_SOURCES[entity]
         # 一个实体一次查完：区间运算留在 SQL 里，不按店铺逐条往返。
         states = {str(row[0]): row for row in conn.execute(
@@ -341,5 +368,6 @@ def assess_query_coverage(conn, request) -> CoverageAssessment:
         quality_status=quality_status,
         source_batches=tuple(sorted(set(batches))),
         gaps=tuple(gaps),
+        source_unconfigured=unconfigured,
         suggested_window=_suggested(covered_windows, requested, status),
     )

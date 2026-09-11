@@ -29,6 +29,8 @@ from .kuaimai import KuaimaiClient, KuaimaiError, parse_page
 logger = logging.getLogger(__name__)
 
 BEIJING = ZoneInfo("Asia/Shanghai")
+# 业务时间下限：早于此的支付/完成时间只可能是 ERP 占位值，不参与时间窗口归属。
+BUSINESS_TIME_FLOOR = datetime(2010, 1, 1, tzinfo=BEIJING)
 
 ORDER_SOURCE = "erp.trade.list.query"
 AFTERSALE_SOURCE = "erp.aftersale.list.query"
@@ -53,6 +55,20 @@ _REQUIRED_SYNC_COLUMNS = {
 # ---------------------------------------------------------------------------
 # 基础解析：金额与时间
 # ---------------------------------------------------------------------------
+
+
+def parse_business_timestamp(value: Any) -> datetime | None:
+    """业务时间（支付 / 退款完成）专用解析：明显占位值一律按“未取得”处理。
+
+    快麦对未付款 / 已关闭单会回 `payTime = 2000-01-01 00:00` 这类占位值
+    （真实账号实测：WAIT_BUYER_PAY 与 CLOSED 单各一）。当成真实支付时间入库，
+    会让从未付款的单独出现在支付日指标里，也会让它撑出一个“已核验支付事实”。
+    置 NULL 后该单不落入任何时间窗口，金额依旧原样保留在 raw 字段，不猜也不补 0。
+    """
+    parsed = parse_timestamp(value)
+    if parsed is not None and parsed < BUSINESS_TIME_FLOOR:
+        return None
+    return parsed
 
 
 def to_decimal(value: Any) -> Decimal | None:
@@ -223,7 +239,7 @@ def normalise_trade(raw: dict[str, Any], *, source: str = ORDER_SOURCE) -> dict[
     erp_id = str(raw.get("sid") or "").strip()
     shop_id = str(raw.get("userId") or "").strip()
     source_updated_at = parse_timestamp(raw.get("updTime")) or parse_timestamp(raw.get("modified"))
-    paid_at = parse_timestamp(raw.get("payTime"))
+    paid_at = parse_business_timestamp(raw.get("payTime"))
     raw_pay_amount = to_decimal(raw.get("payAmount"))
     status = "normal"
     if not erp_id or not shop_id or source_updated_at is None:
@@ -576,8 +592,8 @@ def normalise_aftersale(raw: dict[str, Any], *,
     source_updated_at = (parse_timestamp(raw.get("modified"))
                          or parse_timestamp(raw.get("modifiedTime"))
                          or parse_timestamp(raw.get("updTime")))
-    platform_completed_at = parse_timestamp(raw.get("platformCompleteTime"))
-    system_completed_at = parse_timestamp(raw.get("finished"))
+    platform_completed_at = parse_business_timestamp(raw.get("platformCompleteTime"))
+    system_completed_at = parse_business_timestamp(raw.get("finished"))
     online_status = raw.get("onlineStatus")
     work_status = raw.get("status")
     online_value = _source_int(online_status)

@@ -407,6 +407,11 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
     coverage = _coverage_of(assessment)
     data_as_of = assessment.data_as_of
 
+    # 来源尚未开通的店铺单独说清：这类店缩小日期范围永远拿不到数据。
+    if assessment.source_unconfigured:
+        limitations.append(
+            f"{len(assessment.source_unconfigured)} 家店铺的来源尚未开通（未授权或未同步），"
+            "缩小日期范围不会补上这段数据")
     if assessment.quality_status == "failed":
         # 对账已知失败：不能用“覆盖完整”盖住口径问题，直接拒绝出数。
         return ToolResult(
