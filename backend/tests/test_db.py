@@ -536,6 +536,133 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(rows[1][1], Decimal("120.00"))
         self.assertTrue(rows[1][2])
 
+    def test_merged_order_certifies_from_line_amounts(self):
+        """真实合单形态：单头 payAmount 只等于此中一个子单。
+
+        实测快麦合单（如 ERP 单 6000726513644043）单头=14.25，行级合计=386.05，
+        旧规则因单头与行对不上而整张丢章，店铺侧直接漏记这笔收入。
+        行级 payAmount 每行自带 tid，能精确归属，所以按行取证。
+        """
+        from bi_agent.sync import apply_trade
+
+        self._seed_shop()
+        pay_time = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
+        upd_time = datetime(2026, 9, 3, 10, 0, tzinfo=BEIJING)
+        trade = self._trade("E_M", ["C_M1", "C_M2"], "14.25", pay_time, upd_time, [
+            {"oid": "E-M1", "tid": "C_M1", "itemSysId": "P_A", "num": "1",
+             "payAmount": "14.25"},
+            {"oid": "E-M2", "tid": "C_M2", "itemSysId": "P_B", "num": "1",
+             "payAmount": "371.80"},
+        ])
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(self.conn, trade, batch_id="merge-head-short"))
+            rows = self.conn.execute(
+                "SELECT commercial_id, amount, verified, basis FROM bi.order_payments "
+                "WHERE shop_id='S1' AND commercial_id IN ('C_M1','C_M2') "
+                "ORDER BY commercial_id").fetchall()
+
+        self.assertEqual([(str(r[0]), str(r[1]), r[2], r[3]) for r in rows],
+                         [("C_M1", "14.250000", True, "items_merged"),
+                          ("C_M2", "371.800000", True, "items_merged")],
+                         "合单要按行级 tid 归属取证，不能整张丢章")
+
+    def test_merged_order_with_missing_child_lines_stays_undetermined(self):
+        """子单声明了却没有行：数据未到齐，不能拿不完整证据发核验章。"""
+        from bi_agent.sync import apply_trade
+
+        self._seed_shop()
+        pay_time = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
+        upd_time = datetime(2026, 9, 3, 10, 0, tzinfo=BEIJING)
+        trade = self._trade("E_MISS", ["C_MISS1", "C_MISS2"], "10.00", pay_time, upd_time, [
+            {"oid": "E-MISS1", "tid": "C_MISS1", "itemSysId": "P_A", "num": "1",
+             "payAmount": "10.00"},
+        ])
+        with self.conn.transaction():
+            apply_trade(self.conn, trade, batch_id="merge-missing")
+            rows = self.conn.execute(
+                "SELECT commercial_id, amount, verified, basis FROM bi.order_payments "
+                "WHERE shop_id='S1' AND commercial_id LIKE 'C_MISS%' ORDER BY 1").fetchall()
+
+        self.assertEqual({r[3] for r in rows}, {"undetermined"},
+                         "缺兄弟行仍要回到不岻证的本位")
+        self.assertTrue(all(not r[2] for r in rows), rows)
+
+    def test_merged_order_with_unpaid_line_stays_undetermined(self):
+        """有一行不带金额：存在未归属余额，不能声称行级合计就是已付。"""
+        from bi_agent.sync import apply_trade
+
+        self._seed_shop()
+        pay_time = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
+        upd_time = datetime(2026, 9, 3, 10, 0, tzinfo=BEIJING)
+        trade = self._trade("E_NOPAY", ["C_N1", "C_N2"], "10.00", pay_time, upd_time, [
+            {"oid": "E-N1", "tid": "C_N1", "itemSysId": "P_A", "num": "1",
+             "payAmount": "10.00"},
+            {"oid": "E-N2", "tid": "C_N2", "itemSysId": "P_B", "num": "1"},
+        ])
+        with self.conn.transaction():
+            apply_trade(self.conn, trade, batch_id="merge-nopay")
+            bases = self.conn.execute(
+                "SELECT DISTINCT basis FROM bi.order_payments "
+                "WHERE shop_id='S1' AND commercial_id LIKE 'C_N%'").fetchall()
+
+        self.assertEqual([r[0] for r in bases], ["undetermined"])
+
+    def test_split_docs_with_mismatched_totals_stay_undetermined(self):
+        """D 的牙齿：不是合单就不能走行级取证。
+
+        拆单（两个单都只挂同一个商业号）时单头合计 100 与行级合计 90 对不上，
+        这既不是合单也解释不了差额，必须继续不发证而不是“宽容一下”。
+        """
+        from bi_agent.sync import apply_trade
+
+        self._seed_shop()
+        pay_time = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
+        upd_time = datetime(2026, 9, 3, 10, 0, tzinfo=BEIJING)
+        batch = "split-mismatch"
+        first = self._trade("E_A", ["C_SP1"], "40.00", pay_time, upd_time, [
+            {"oid": "E-A1", "tid": "C_SP1", "itemSysId": "P_A", "num": "1",
+             "payAmount": "40.00"},
+        ])
+        second = self._trade("E_B", ["C_SP1"], "60.00", pay_time,
+                             datetime(2026, 9, 3, 12, 0, tzinfo=BEIJING), [
+                                 {"oid": "E-B1", "tid": "C_SP1", "itemSysId": "P_B",
+                                  "num": "1", "payAmount": "50.00"},
+                             ])
+        with self.conn.transaction():
+            apply_trade(self.conn, first, batch_id=batch)
+            apply_trade(self.conn, second, batch_id=batch)
+            row = self.conn.execute(
+                "SELECT amount, verified, basis FROM bi.order_payments "
+                "WHERE shop_id='S1' AND commercial_id='C_SP1'").fetchone()
+
+        self.assertEqual((row[0], row[2]), (None, "undetermined"))
+        self.assertFalse(row[1])
+
+    def test_single_commercial_document_prefers_the_head(self):
+        """回新用为凭：只有一个商业号时单头直接取证，不走合单宽容。
+
+        单头 300 / 行级 250 的差额不是 D 要解决的问题，而是“行未完全归属”
+        （与窗内无行的已核验支付同族），已在发现记录里单独列出。
+        """
+        from bi_agent.sync import apply_trade
+
+        self._seed_shop()
+        pay_time = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
+        trade = self._trade("E_ONE", ["C_ONE"], "300.00", pay_time,
+                            datetime(2026, 9, 3, 10, 0, tzinfo=BEIJING), [
+                                {"oid": "E-O1", "tid": "C_ONE", "itemSysId": "P_A",
+                                 "num": "1", "payAmount": "250.00"},
+                            ])
+        with self.conn.transaction():
+            apply_trade(self.conn, trade, batch_id="single-head")
+            row = self.conn.execute(
+                "SELECT amount, verified, basis FROM bi.order_payments "
+                "WHERE shop_id='S1' AND commercial_id='C_ONE'").fetchone()
+
+        self.assertEqual((row[0], row[1], row[2]),
+                         (Decimal("300.00"), True, "head"),
+                         "D 不得改变单头路径的现有行为")
+
     def test_replay_old_version_does_not_regress(self):
         from bi_agent.sync import apply_trade
 

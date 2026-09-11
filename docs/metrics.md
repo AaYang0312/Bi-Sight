@@ -34,6 +34,8 @@
 | `orders[].itemSysId/skuSysId` | 显式映射为商品查询的 `sysItemId/sysSkuId`；不按名字模糊匹配 |
 | 订单 `grossProfit` | ERP毛利参考；实际运费/包材/平台扣费缺失，不得称净利润 |
 | 拼多多 `payAmount/payment/modified` | 样本全部缺失；不得纳入支付指标，也不用其他字段反推 |
+| 合单（一张 ERP 单多个 `tid`/`tids`）的单头 `payAmount` | **只等于其中一个子单的金额**，不是整张合计（实测 287 张合单：单头 14.25 / 行级合计 386.05）。因此合单不得用单头与行级交叉咬合判核验：改按行级 `payAmount` 的 `tid` 归属取证（`basis='items_merged'`），且要求行全部带金额、行 tid 均在单头声明列表内、兄弟子单均有行，否则仍为 `undetermined` |
+| `verified` / `allocation_verified` | 均为**本系统派生的交叉咬合结论，不是 ERP 字段**；含义、三态与升级规则见第 6 节 |
 
 ## 3. 指标口径（任务5实现后与人工答案对账）
 

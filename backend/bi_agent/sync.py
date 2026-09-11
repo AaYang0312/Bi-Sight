@@ -280,6 +280,33 @@ def _load_orders(conn, shop_id: str, commercial_id: str) -> list[tuple]:
     ).fetchall()
 
 
+def _merged_certifiable(conn, shop_id: str, all_orders: list[tuple]) -> bool:
+    """快麦合单专项取证的成立条件。
+
+    实测合单（一张 ERP 单挂多个 tid）的单头 payAmount 只等于其中**一个**子单
+    （真实样本：单头 14.25，行级合计 386.05），所以单头永远与行对不上，
+    行级金额反而才是完整证据。但只有三条全成立才能发证：
+
+    1. 涉及的单据里确实有“一单多商业号”（否则就是拆单或真异常，不走这条路）；
+    2. 这些单据的有效行全部带金额：存在无金额行就有未归属余额，不能声称行合计等于已付；
+    3. 每行归属的商业号都在所属单据声明的 tid 列表内：不承认来路不明的行。
+    """
+    if not any(len(order[1] or []) >= 2 for order in all_orders):
+        return False
+    erp_ids = [order[0] for order in all_orders]
+    if not erp_ids:
+        return False
+    row = conn.execute(
+        "SELECT count(*) FILTER (WHERE i.allocated_paid_amount IS NULL), "
+        "       count(*) FILTER (WHERE NOT (i.commercial_id = ANY(o.commercial_ids))) "
+        "FROM bi.order_items i JOIN bi.orders o "
+        "  ON o.shop_id = i.shop_id AND o.erp_id = i.erp_id "
+        "WHERE i.shop_id=%s AND i.active AND i.erp_id = ANY(%s)",
+        (shop_id, erp_ids),
+    ).fetchone()
+    return row[0] == 0 and row[1] == 0
+
+
 def _determine_payment(conn, shop_id: str, commercial_id: str,
                        orders: list[tuple]) -> tuple[Decimal | None, datetime | None, str, bool, datetime | None]:
     """返回 (amount, paid_at, basis, verified, source_updated_at)。"""
@@ -323,15 +350,19 @@ def _determine_payment(conn, shop_id: str, commercial_id: str,
         if not item_rows[cid]:
             return None, None, "undetermined", False, source_updated_at
     total_items = sum((amount for rows in item_rows.values() for amount, _ in rows), Decimal(0))
+    basis = "items"
     if total_head is None or total_head != total_items:
-        return None, None, "undetermined", False, source_updated_at
+        # 单头与行对不上：只有“完整合单”才能改用行级取证，否则继续不发证。
+        if not _merged_certifiable(conn, shop_id, all_orders):
+            return None, None, "undetermined", False, source_updated_at
+        basis = "items_merged"
     target = item_rows[commercial_id]
     amount = sum((row[0] for row in target), Decimal(0))
     pay_times = {row[1] for row in target if row[1] is not None}
     paid_at = pay_times.pop() if len(pay_times) == 1 else None
     # 行级路径与单头路径同口径：负数分摊不能拿核验章（单头路径有 head >= 0 守卫）。
     verified = paid_at is not None and amount is not None and amount >= 0
-    return amount, paid_at, "items", verified, source_updated_at
+    return amount, paid_at, basis, verified, source_updated_at
 
 
 # 支付事实降级守卫：已核验的行只能被“不更弱”的证据覆盖。
