@@ -42,24 +42,10 @@ METRIC_DEFINITIONS: dict[str, str] = {
     "product_paid_amount": "已核验的非赠品父项行级分摊支付金额（按line_kind标注）",
 }
 
-ENTITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
-    "paid_amount": ("orders",),
-    "paid_orders": ("orders",),
-    "erp_documents": ("orders",),
-    "aov": ("orders",),
-    "quantity": ("orders",),
-    "product_paid_amount": ("orders",),
-    "refund_amount": ("orders", "aftersales_occurrence"),
-    "cash_difference": ("orders", "aftersales_occurrence"),
-    "cohort_refund_rate": ("orders", "aftersales_cohort"),
-}
-
-# 同一覆盖来源名：同步状态按数据来源记录
-_ENTITY_SOURCES = {
-    "orders": "erp.trade.list.query",
-    "aftersales_occurrence": "erp.aftersale.list.query",
-    "aftersales_cohort": "erp.aftersale.list.query",
-}
+# 指标→实体依赖与覆盖来源定义在 data_quality（覆盖门禁的唯一真源）；
+# 本模块只引用，不再存第二份，避免门禁与指标两边口径漂移。
+from bi_agent.data_quality import (
+    ENTITY_REQUIREMENTS, UNMATCHED_REFUNDS_SQL, assess_query_coverage)
 
 
 class QueryRequest(BaseModel):
@@ -99,6 +85,8 @@ class Coverage(BaseModel):
     start: date | None
     end: date | None
     gaps: list[str] = Field(default_factory=list)
+    # 建议窗口只是建议：原请求窗口始终按 start/end 原样返回，不被悄悄裁剪。
+    suggested_window: tuple[str, str] | None = None
 
 
 class ToolResult(BaseModel):
@@ -207,54 +195,19 @@ def _window_range(start: date, end: date) -> tuple[datetime, datetime]:
             datetime(end.year, end.month, end.day, tzinfo=BEIJING))
 
 
-def _coverage_for(conn, *, entity: str, shop_id: str,
-                  start_ts: datetime, end_ts: datetime) -> tuple[str, list[str], datetime | None]:
-    """返回 (状态, 缺口列表, data_as_of)。覆盖与请求范围用多区间运算。"""
-    row = conn.execute(
-        "SELECT covered, data_as_of FROM reporting.v_coverage "
-        "WHERE source=%s AND entity=%s AND shop_id=%s",
-        (_ENTITY_SOURCES[entity], entity, shop_id),
-    ).fetchone()
-    full = f"{start_ts.date()}~{end_ts.date()}"
-    if row is None:
-        return "missing", [full], None
-    covered, data_as_of = row
-    if not covered:
-        return "missing", [full], data_as_of
-    requested = conn.execute(
-        "SELECT tstzmultirange(tstzrange(%s, %s, '[)')) - %s",
-        (start_ts, end_ts, covered),
-    ).fetchone()[0]
-    gaps = [f"{rng.lower.date()}~{rng.upper.date()}"
-            for rng in requested if rng.lower is not None and rng.upper is not None]
-    if not gaps:
-        return "complete", [], data_as_of
-    overlaps = conn.execute(
-        "SELECT %s && tstzmultirange(tstzrange(%s, %s, '[)'))",
-        (covered, start_ts, end_ts),
-    ).fetchone()[0]
-    return ("partial" if overlaps else "missing"), gaps, data_as_of
+def _coverage_of(assessment) -> Coverage:
+    """把就绪判定结果换成对外契约的覆盖形状。
 
-
-def _merge_coverage(statuses: list[tuple[str, list[str], datetime | None]],
-                    start: date, end: date) -> tuple[Coverage, datetime | None]:
-    """多实体覆盖合并：最弱状态胜出；data_as_of取共同截止。"""
-    gaps: list[str] = []
-    cutoffs = []
-    if any(status == "missing" for status, _, _ in statuses):
-        overall = "missing"
-    elif any(status == "partial" for status, _, _ in statuses):
-        overall = "partial"
-    else:
-        overall = "complete"
-    for _, gap_list, _ in statuses:
-        gaps.extend(gap_list)
-    for _, _, data_as_of in statuses:
-        if data_as_of is None:
-            return Coverage(status="partial", start=start, end=end, gaps=sorted(set(gaps))), None
-        cutoffs.append(data_as_of)
-    return (Coverage(status=overall, start=start, end=end, gaps=sorted(set(gaps))),
-            min(cutoffs))
+    缺口只给日期段：实体与店铺归因留在服务端 assessment.gaps，
+    ERP 店铺主键不能经由 limitations / coverage 混进模型载荷。
+    """
+    return Coverage(
+        status=assessment.status,
+        start=date.fromisoformat(assessment.requested_window[0]),
+        end=date.fromisoformat(assessment.requested_window[1]),
+        gaps=[f"{gap_start}~{gap_end}" for gap_start, gap_end in assessment.missing_windows],
+        suggested_window=assessment.suggested_window,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -317,13 +270,6 @@ WITH cohort AS (
 SELECT sum(c.amount) AS cohort_paid,
        sum(coalesce(r.refunded, 0)) AS cohort_refunded
 FROM cohort c LEFT JOIN refunds r USING (shop_id, commercial_id)
-"""
-
-_UNMATCHED_SQL = """
-SELECT count(*) FROM reporting.v_refunds
-WHERE shop_id = ANY(%s) AND platform_success AND refund_canonical
-  AND platform_completed_at >= %s AND platform_completed_at < %s
-  AND (commercial_id IS NULL OR NOT matched)
 """
 
 _SHOPS_SQL = """
@@ -451,17 +397,22 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
         filters = _filters(request)
         filters["requested_shop_ids"] = requested_shop_ids
 
-    # 覆盖门禁：当前期
-    statuses = []
-    for entity in sorted({e for m in request.metrics for e in ENTITY_REQUIREMENTS[m]}):
-        if not _set_query_budget(conn, deadline):
-            return ToolResult(status="unavailable",
-                              coverage=Coverage(status="missing", start=None, end=None),
-                              filters=filters, limitations=limitations + ["本次查询时间预算已耗尽"])
-        for shop_id in sorted(request.shop_ids):
-            statuses.append(_coverage_for(conn, entity=entity, shop_id=shop_id,
-                                          start_ts=start_ts, end_ts=end_ts))
-    coverage, data_as_of = _merge_coverage(statuses, request.start, request.end)
+    # 覆盖与质量门禁：先判定再跑指标 SQL，缺哪段说哪段，不先聚合再掩饰。
+    if not _set_query_budget(conn, deadline):
+        return ToolResult(status="unavailable",
+                          coverage=Coverage(status="missing", start=None, end=None),
+                          filters=filters, limitations=limitations + ["本次查询时间预算已耗尽"])
+    assessment = assess_query_coverage(conn, request)
+    coverage = _coverage_of(assessment)
+    data_as_of = assessment.data_as_of
+
+    if assessment.quality_status == "failed":
+        # 对账已知失败：不能用“覆盖完整”盖住口径问题，直接拒绝出数。
+        return ToolResult(
+            status="unavailable", coverage=coverage,
+            metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
+            filters=filters, data_as_of=data_as_of,
+            limitations=limitations + ["来源质量核验未通过，拒绝出数"])
     if coverage.status != "complete" or data_as_of is None:
         limitations.append("覆盖未完成，拒绝部分汇总；缺口见coverage.gaps")
         if data_as_of is None:
@@ -469,12 +420,15 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
         return ToolResult(status="missing_data", coverage=coverage,
                           metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
                           filters=filters, data_as_of=data_as_of, limitations=limitations)
+    if assessment.quality_status == "unknown":
+        # 从未对账不等于数据有错：可以出数，但必须把未核验这件事说明白。
+        limitations.append("来源质量未核验（尚无对账记录）")
 
     # 未匹配成功退款影响退款归属
     refund_metrics = {"refund_amount", "cash_difference", "cohort_refund_rate"}
     if set(request.metrics) & refund_metrics:
         unmatched = conn.execute(
-            _UNMATCHED_SQL, (request.shop_ids, start_ts, end_ts)).fetchone()[0]
+            UNMATCHED_REFUNDS_SQL, (request.shop_ids, start_ts, end_ts)).fetchone()[0]
         if unmatched:
             limitations.append(f"存在{unmatched}条未匹配的平台成功退款，退款归属未确认")
             return ToolResult(status="missing_data", coverage=coverage,
@@ -499,13 +453,10 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
         prev_start = request.start - span
         prev_end = request.start
         prev_ts = _window_range(prev_start, prev_end)
-        prev_statuses = []
-        for entity in sorted({e for m in request.metrics for e in ENTITY_REQUIREMENTS[m]}):
-            for shop_id in sorted(request.shop_ids):
-                prev_statuses.append(_coverage_for(conn, entity=entity, shop_id=shop_id,
-                                                   start_ts=prev_ts[0], end_ts=prev_ts[1]))
-        prev_coverage, _ = _merge_coverage(prev_statuses, prev_start, prev_end)
-        if prev_coverage.status != "complete":
+        prev_assessment = assess_query_coverage(conn, request.model_copy(update={
+            "start": prev_start, "end": prev_end}))
+        if (prev_assessment.status != "complete"
+                or prev_assessment.data_as_of is None):
             compare = False
             limitations.append("上期覆盖不足，无法比较，仅返回绝对值")
 

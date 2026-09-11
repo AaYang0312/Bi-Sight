@@ -93,3 +93,50 @@
 ### 真实店铺对账（待任务4.7执行）
 
 （待试点一店一天真实 probe 与后台报表核对后填写：差异表与口径确认。）
+
+## 6. 覆盖、业务截止与质量状态
+
+三者是三个不同的事实，任何一个都不能拿另一个替代（`bi_agent/data_quality.py`）：
+
+| 概念 | 存在哪 | 不能用什么替代 |
+| --- | --- | --- |
+| 覆盖 `covered` | `bi.sync_state.covered`（tstzmultirange） | 不能拿“同步任务成功”宣布已覆盖 |
+| 业务截止 `data_as_of` | `bi.sync_state.data_as_of` | 禁止用 `last_success_at` 顶替 |
+| 来源质量 `quality_status` | `bi.sync_state.quality_status` + `quality_rule` + `quality_checked_at` | 不能因请求成功自动置 passed |
+
+质量三态的口径：
+
+- `unknown`：从未对账。仍可以出数，但结果必须带「来源质量未核验（尚无对账记录）」。
+- `passed`：本窗口内确有 `mode='reconcile'` 且 `window_kind='business'` 的批次凭证，
+  且无归属未确认的平台成功退款。凭证只来自 `bi.sync_batches`，不看“任务成功过”。
+- `failed`：对账发现差异（当前规则是 `unmatched_success_refunds`）。**禁止出数**。
+- 历史数据的 `quality_ok=false` 在 008 迁移中统一记为 `unknown`，不是 `failed`：
+  “没查过”不等于“已查出问题”。
+- 口径版本 `quality_rule` 变更后，旧 `passed` 自动降级为 `unknown`，必须重跑对账才能恢复。
+
+查询前的结构化缺口：`assess_query_coverage(conn, request)` 返回
+`requested_window` / `covered_windows` / `missing_windows` / `data_as_of` /
+`quality_status` / `source_batches` / `gaps` / `suggested_window`。
+原请求窗口在此冻结；`suggested_window` 只是给用户的下一步建议，
+系统不得代用户缩短日期。缺口的实体与店铺归因只留在服务端，
+对外 `coverage.gaps` 仍只是日期段，避免缺口反成主键泄露面。
+
+批次口径：`bi.sync_batches.window_kind` 区分 `business`（回填/重放/对账）与
+`modified`（增量的修改时间窗口）。只有 business 凭证参与覆盖与质量判定；
+`row_count` 为 NULL 表示当时未统计，与“确实 0 行”不同，不得合并解释。
+
+### 多平台来源就绪清单
+
+原则：没有实测的接口不填“可用”。本轮只完成代码与测试库验证，
+**五个平台的来源取证均未执行**，因此不声称任一平台已就绪。
+
+| 平台 | 订单 | 成本 | 上架实际价 | 实物库存 | 渠道库存 |
+| --- | --- | --- | --- | --- | --- |
+| 抖音 | 已同步单店试点；未对账（quality=unknown） | 未执行 | 未执行 | 未执行 | 未执行 |
+| 淘宝 | 未执行 | 未执行 | 未执行 | 未执行 | 未执行 |
+| 拼多多 | 未执行 | 未执行 | 未执行 | 未执行 | 未执行 |
+| 京东 | 未执行 | 未执行 | 未执行 | 未执行 | 未执行 |
+| 快手 | 未执行 | 未执行 | 未执行 | 未执行 | 未执行 |
+
+库存与上架价、跨渠道 SKU 映射属计划 Task 6 / 9 / 10；
+本表只记录取证结果，不因代码存在而改为“可用”。

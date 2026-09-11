@@ -15,6 +15,7 @@ import httpx
 from bi_agent.llm import ToolCall
 from bi_agent.metrics import Coverage, ToolResult
 from bi_agent.catalog import ref_for_key
+from bi_agent.data_quality import QUALITY_RULE
 from tests.fakeconn import S1_REF, ShopCatalogConn, catalog_rows
 
 
@@ -905,7 +906,7 @@ class _NullTransaction:
         return False
 
 
-_COVERED = ("covered",)   # 只要非空即“已覆盖”；缺口由下面的减法查询判为空
+from psycopg.types.range import Range   # 替身要返回带 lower/upper 的真区间对象
 
 
 class FakeWarehouse:
@@ -916,7 +917,8 @@ class FakeWarehouse:
     """
 
     def __init__(self, *, daily_rows=(), product_rows=(), shops=(), data_as_of=None,
-                 cohort=(None, None), unmatched=0, shop_profiles=(), catalog_version=7):
+                 cohort=(None, None), unmatched=0, shop_profiles=(), catalog_version=7,
+                 quality_status="passed", quality_rule=QUALITY_RULE):
         self.daily_rows = [tuple(row) for row in daily_rows]
         # 视图列形以 tests.dbfixtures.PRODUCT_DAILY_COLUMNS 为单一真源，这里不再手抄列数：
         # 测试行没给末尾的名称 / 成交快照 / 规格列就按契约补上。
@@ -931,6 +933,9 @@ class FakeWarehouse:
         self.catalog_version = catalog_version
         self.shops = [tuple(row) for row in shops]
         self.data_as_of = data_as_of
+        # 替身默认代表“已对账通过的健康库”；真实库默认是 unknown，两边不同。
+        self.quality_status = quality_status
+        self.quality_rule = quality_rule
         self.cohort = tuple(cohort)
         self.unmatched = unmatched
         self.statements: list[tuple[str, tuple]] = []
@@ -963,13 +968,16 @@ class FakeWarehouse:
         if "FROM reporting.v_shops" in text:
             return _FakeResult([row for row in self.shops if row[0] in params[0]])
         if "FROM reporting.v_coverage" in text:
+            # 生产代码一条 SQL 判完整覆盖：(店铺, 已覆盖段, 缺口段, 截止, 质量)。
             if self.data_as_of is None:
-                return _FakeResult([])
-            return _FakeResult([(_COVERED, self.data_as_of)])
-        if "'[)')) - " in text:            # 请求范围 - 已覆盖 = 缺口；空列表即 complete
-            return _FakeResult([([],)])
-        if text.startswith("SELECT %s && tstzmultirange"):
-            return _FakeResult([True])
+                return _FakeResult([])                    # 没有状态行 = 未知
+            start_ts, end_ts = params[0], params[1]
+            covered = [Range(start_ts, end_ts, "[)")]
+            return _FakeResult([(shop_id, covered, [], self.data_as_of,
+                                self.quality_status, self.quality_rule)
+                                for shop_id in params[6]])
+        if "FROM reporting.v_source_batches" in text:
+            return _FakeResult([])                        # 离线用例不伪造批次血缘
         if text.startswith("SELECT count(*) FROM reporting.v_refunds"):
             return _FakeResult([(self.unmatched,)])
         if text.startswith("WITH cohort"):

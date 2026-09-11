@@ -81,6 +81,8 @@ _LIMITATION_CODES = frozenset({
     "coverage_incomplete", "data_as_of_unknown", "shop_not_synced", "shops_inactive",
     "comparison_coverage_incomplete", "deadline_exceeded", "query_timeout", "forbidden",
     "result_too_large", "cohort_rate_not_computable",
+    # 覆盖与质量是两件事：缺数据与对账未通过必须分开归因。
+    "source_quality_failed", "source_quality_unverified",
 })
 _PUBLIC_LIMITATIONS = frozenset({
     "店铺不在授权范围",
@@ -91,6 +93,8 @@ _PUBLIC_LIMITATIONS = frozenset({
     "所选店铺均已停用，无法查询",
     "覆盖未完成，拒绝部分汇总；缺口见coverage.gaps",
     "数据截止未知（回填未完成）",
+    "来源质量核验未通过，拒绝出数",
+    "来源质量未核验（尚无对账记录）",
     "上期覆盖不足，无法比较，仅返回绝对值",
     "比较仅支持total/shop分组",
     "同批支付额为0或无支付，同批退款率不可计算",
@@ -255,9 +259,10 @@ def _string_list(value: object, validator) -> None:
 
 
 def _coverage(value: object) -> dict[str, object]:
+    # suggested_window 不在 required 里：旧 Artifact 没这个字段，必须继续可读。
     coverage = _mapping(
         value,
-        allowed=frozenset({"status", "start", "end", "gaps"}),
+        allowed=frozenset({"status", "start", "end", "gaps", "suggested_window"}),
         required=frozenset({"status", "start", "end", "gaps"}),
     )
     _string_in(coverage["status"], _COVERAGE_STATUSES)
@@ -269,6 +274,14 @@ def _coverage(value: object) -> dict[str, object]:
     for gap in coverage["gaps"]:
         if not isinstance(gap, str) or not _GAP_RE.fullmatch(gap):
             _unsafe_payload()
+    suggested = coverage.get("suggested_window")
+    if suggested is not None:
+        # 建议窗口只能是两个 ISO 日期；它是建议，不是被改写过的原请求。
+        if (not isinstance(suggested, (list, tuple)) or len(suggested) != 2
+                or any(not isinstance(item, str) for item in suggested)):
+            _unsafe_payload()
+        for item in suggested:
+            _date_string(item)
     return coverage
 
 

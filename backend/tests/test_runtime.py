@@ -245,6 +245,48 @@ class RuntimeModelTests(unittest.TestCase):
         self.assertEqual(store.runs[run_id]["status"], "succeeded")
 
 
+class CoverageContractTests(unittest.TestCase):
+    """覆盖契约加 suggested_window 时，旧 Artifact 必须继续可读。"""
+
+    def _payload(self, coverage):
+        return {
+            "status": "ok",
+            "metric_definition": {},
+            "coverage": coverage,
+            "limitations": [],
+            "data_as_of": None,
+            "filters": {},
+            "data": [],
+        }
+
+    def test_legacy_coverage_without_suggested_window_still_validates(self):
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        validate_artifact_payload(self._payload(
+            {"status": "partial", "start": "2026-09-01", "end": "2026-09-08",
+             "gaps": ["2026-09-05~2026-09-08"]}))
+
+    def test_suggested_window_is_accepted_as_two_dates(self):
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        validate_artifact_payload(self._payload(
+            {"status": "partial", "start": "2026-09-01", "end": "2026-09-08",
+             "gaps": ["2026-09-05~2026-09-08"],
+             "suggested_window": ["2026-09-01", "2026-09-05"]}))
+
+    def test_suggested_window_rejects_a_rewritten_request_range(self):
+        """建议只能是两个日期，不能塞进被改写过的窗口或主键。"""
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        for bad in (["2026-09-01"], ["2026-09-01", "S1"], ["2026-09-01", "not-a-date"],
+                    "2026-09-01"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    validate_artifact_payload(self._payload(
+                        {"status": "partial", "start": "2026-09-01", "end": "2026-09-08",
+                         "gaps": [], "suggested_window": bad}))
+
+
 class MemoryQueryRunStoreTests(unittest.TestCase):
     def setUp(self):
         self.store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})

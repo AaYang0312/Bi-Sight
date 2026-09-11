@@ -1050,6 +1050,100 @@ class DatabaseTests(unittest.TestCase):
         count = self.conn.execute(
             "SELECT count(*) FROM bi.orders WHERE shop_id='S1'").fetchone()[0]
         self.assertEqual(count, 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.sync_batches WHERE shop_id='S1'").fetchone()[0], 0,
+            "分页中断不得留下批次凭证")
+
+    def test_sync_window_persists_batch_evidence_for_its_window(self):
+        """成功窗口要留下批次凭证，而且必须标清自己是哪个时间口径。
+
+        增量窗口是修改时间，回填/重放/对账才是业务时间；两者混在一列
+        就会被当成“这段时间已覆盖”的假凭证。
+        """
+        from bi_agent.sync import Window, sync_window
+
+        self._seed_shop()
+        base = datetime(2026, 9, 5, 0, 0, tzinfo=BEIJING)
+        records = [
+            {"sid": "E1", "userId": "S1", "updTime": _ms(base + timedelta(hours=2)),
+             "tid": "C1", "payAmount": "100.00",
+             "payTime": _ms(base + timedelta(hours=1)),
+             "orders": [{"oid": "E1-1", "tid": "C1", "itemSysId": "P_A",
+                          "num": "1", "payAmount": "100.00"}]},
+        ]
+        window = Window(base, base + timedelta(days=1))
+
+        def full_fetch(*args, **kwargs):
+            yield from records
+
+        with patch("bi_agent.sync.fetch_window", side_effect=full_fetch):
+            accepted = sync_window(self.conn, self._client(), entity="orders",
+                                   shop_id="S1", window=window, mode="incremental")
+        self.assertEqual(accepted, 1)
+
+        row = self.conn.execute(
+            "SELECT mode, window_kind, row_count, lower(business_window), "
+            "upper(business_window) FROM bi.sync_batches "
+            "WHERE shop_id='S1' AND entity='orders'").fetchone()
+        self.assertEqual((row[0], row[1], row[2]), ("incremental", "modified", 1))
+        self.assertEqual((row[3], row[4]), (window.start, window.end))
+
+    def test_backfill_batch_evidence_is_marked_business_time(self):
+        from bi_agent.sync import Window, sync_window
+
+        self._seed_shop()
+        base = datetime(2026, 9, 5, 0, 0, tzinfo=BEIJING)
+        records = [
+            {"sid": "E1", "userId": "S1", "updTime": _ms(base + timedelta(hours=2)),
+             "tid": "C1", "payAmount": "100.00",
+             "payTime": _ms(base + timedelta(hours=1)),
+             "orders": [{"oid": "E1-1", "tid": "C1", "itemSysId": "P_A",
+                          "num": "1", "payAmount": "100.00"}]},
+        ]
+        window = Window(base, base + timedelta(days=1))
+
+        def full_fetch(*args, **kwargs):
+            yield from records
+
+        with patch("bi_agent.sync.fetch_window", side_effect=full_fetch):
+            sync_window(self.conn, self._client(), entity="orders",
+                        shop_id="S1", window=window, mode="backfill")
+
+        kind = self.conn.execute(
+            "SELECT window_kind FROM bi.sync_batches "
+            "WHERE shop_id='S1' AND entity='orders'").fetchone()[0]
+        self.assertEqual(kind, "business", "回填窗口是业务时间口径")
+
+    def test_reconcile_window_evidence_enables_quality_promotion(self):
+        """完整链路：reconcile 先落业务凭证，质量才有资格升 passed。"""
+        from bi_agent.data_quality import reconcile_source_quality
+        from bi_agent.sync import Window, sync_window
+
+        self._seed_shop()
+        base = datetime(2026, 9, 5, 0, 0, tzinfo=BEIJING)
+        records = [
+            {"sid": "E1", "userId": "S1", "updTime": _ms(base + timedelta(hours=2)),
+             "tid": "C1", "payAmount": "100.00",
+             "payTime": _ms(base + timedelta(hours=1)),
+             "orders": [{"oid": "E1-1", "tid": "C1", "itemSysId": "P_A",
+                          "num": "1", "payAmount": "100.00"}]},
+        ]
+        window = Window(base, base + timedelta(days=1))
+
+        def full_fetch(*args, **kwargs):
+            yield from records
+
+        with patch("bi_agent.sync.fetch_window", side_effect=full_fetch):
+            sync_window(self.conn, self._client(), entity="orders",
+                        shop_id="S1", window=window, mode="reconcile")
+
+        self.assertEqual(reconcile_source_quality(
+            self.conn, shop_id="S1", entity="orders",
+            start=base, end=base + timedelta(days=1)), "passed")
+        # 凭证必须在同一窗口内，否则整段窗口都要维持 unknown。
+        self.assertEqual(reconcile_source_quality(
+            self.conn, shop_id="S1", entity="orders",
+            start=base + timedelta(days=3), end=base + timedelta(days=4)), "unknown")
 
     def test_successful_incremental_advances_watermark_and_covers(self):
         """4.6：补跑→覆盖缺口闭合；连续增量扩展业务覆盖终点。"""
@@ -1425,13 +1519,19 @@ def seed_business_case(conn) -> None:
     for entity, source in (("orders", "erp.trade.list.query"),
                            ("aftersales_occurrence", "erp.aftersale.list.query"),
                            ("aftersales_cohort", "erp.aftersale.list.query")):
+        # 种子代表“已核验的参考场景”，所质状态显式写成 passed；
+        # 旧 quality_ok 列已由 008 退役，不得再写。
         conn.execute(
             "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered, "
-            "data_as_of, quality_ok) VALUES (%s, %s, 'S1', %s, "
-            "tstzmultirange(tstzrange(%s, %s, '[)')), %s, true) "
+            "data_as_of, quality_status, quality_checked_at, quality_rule) "
+            "VALUES (%s, %s, 'S1', %s, "
+            "tstzmultirange(tstzrange(%s, %s, '[)')), %s, 'passed', %s, 'test-seed') "
             "ON CONFLICT (source, entity, shop_id) DO UPDATE SET covered = "
-            "EXCLUDED.covered, data_as_of = EXCLUDED.data_as_of, quality_ok = true",
-            (source, entity, COVERAGE_END, COVERAGE_START, COVERAGE_END, FROZEN_CUTOFF))
+            "EXCLUDED.covered, data_as_of = EXCLUDED.data_as_of, "
+            "quality_status = 'passed', quality_checked_at = EXCLUDED.quality_checked_at, "
+            "quality_rule = EXCLUDED.quality_rule",
+            (source, entity, COVERAGE_END, COVERAGE_START, COVERAGE_END, FROZEN_CUTOFF,
+             FROZEN_CUTOFF))
 
 
 class MetricsTests(unittest.TestCase):
@@ -1455,6 +1555,51 @@ class MetricsTests(unittest.TestCase):
         request = QueryRequest(**defaults)
         return query_business(self.conn, request, allowed_shop_ids=frozenset({"S1"}),
                               now=FROZEN_NOW, deadline=time_module.monotonic() + 30)
+
+    def _as_admin(self, sql: str, params: tuple = ()) -> None:
+        """本类默认以 bi_reader 跑查询，改预置数据时必须临时切回属主再切回。"""
+        self.conn.execute("RESET ROLE")
+        self.conn.execute(sql, params)
+        self.conn.execute("SET LOCAL ROLE bi_reader")
+
+    def _quality(self, status: str, *, entity: str = "orders") -> None:
+        self._as_admin(
+            "UPDATE bi.sync_state SET quality_status=%s WHERE entity=%s AND shop_id='S1'",
+            (status, entity))
+
+    def test_unverified_source_answers_but_discloses_quality(self):
+        """从未对账不等于数据有错：可以出数，但必须把未核验说出来。"""
+        self._quality("unknown")
+        result = self._query()
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertTrue(any("未核验" in item for item in result.limitations),
+                        result.limitations)
+
+    def test_failed_reconciliation_refuses_to_emit_numbers(self):
+        """对账失败的范围禁止出数：不能拿已知有错的数据继续给金额。"""
+        self._quality("failed")
+        result = self._query()
+
+        self.assertNotEqual(result.status, "ok")
+        self.assertEqual(result.data, [])
+        self.assertTrue(any("质量核验未通过" in item for item in result.limitations),
+                        result.limitations)
+
+    def test_coverage_gap_returns_suggestion_and_keeps_the_requested_window(self):
+        """缺覆盖时只给建议，原窗口必须原封不动返回。"""
+        self._as_admin(
+            "UPDATE bi.sync_state SET covered = tstzmultirange(tstzrange(%s, %s, '[)')), "
+            "data_as_of=%s WHERE entity='orders' AND shop_id='S1'",
+            (datetime(2026, 9, 1, tzinfo=BEIJING), datetime(2026, 9, 6, tzinfo=BEIJING),
+             datetime(2026, 9, 6, tzinfo=BEIJING)))
+        result = self._query(metrics=["paid_amount", "paid_orders"])
+
+        self.assertEqual(result.status, "missing_data", result.limitations)
+        self.assertEqual(result.filters["start"], "2026-09-01")
+        self.assertEqual(result.filters["end"], "2026-09-08")
+        self.assertEqual(result.coverage.gaps, ["2026-09-06~2026-09-08"])
+        self.assertEqual(result.coverage.suggested_window, ("2026-09-01", "2026-09-06"))
 
     def test_period_totals_match_manual_answers(self):
         result = self._query(metrics=["paid_amount", "paid_orders", "refund_amount",

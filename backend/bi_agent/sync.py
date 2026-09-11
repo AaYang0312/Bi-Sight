@@ -23,6 +23,7 @@ import httpx
 
 from .catalog import EntityKind, bump_catalog_version, ensure_refs
 from .config import load_sync_settings
+from .data_quality import reconcile_source_quality
 from .kuaimai import KuaimaiClient, KuaimaiError, parse_page
 
 logger = logging.getLogger(__name__)
@@ -924,8 +925,27 @@ def _extend_incremental_coverage(conn, *, source: str, entity: str, shop_id: str
 
 
 
+def _record_batch(conn, *, source: str, entity: str, shop_id: str, window: Window,
+                  mode: str, batch_id: str, row_count: int) -> None:
+    """落批次凭证：回答"这些数字是哪几批同步出来的"。
+
+    窗口口径必须标清楚：增量/扫描扫的是修改时间，回填/重放/对账才是业务时间。
+    两者混成一列，一次增量就会被当成"该业务窗口已覆盖"的假凭证。
+    row_count 是本次真实写入数，0 表示确实没有数据，与"没统计"不是一回事。
+    """
+    conn.execute(
+        "INSERT INTO bi.sync_batches(source, entity, shop_id, batch_id, business_window, "
+        "window_kind, mode, row_count) VALUES (%s, %s, %s, %s, tstzrange(%s, %s, '[)'), "
+        "%s, %s, %s) ON CONFLICT (source, entity, shop_id, batch_id) DO NOTHING",
+        (source, entity, shop_id, batch_id, window.start, window.end,
+         "modified" if mode in ("incremental", "scan") else "business",
+         mode, row_count),
+    )
+
+
 def _record_window_success(conn, *, source: str, entity: str, shop_id: str,
-                           window: Window, mode: str, batch_id: str) -> None:
+                           window: Window, mode: str, batch_id: str,
+                           row_count: int) -> None:
     _ensure_state(conn, source, entity, shop_id)
     if mode in ("incremental", "scan"):
         conn.execute(
@@ -945,6 +965,9 @@ def _record_window_success(conn, *, source: str, entity: str, shop_id: str,
             "WHERE source=%s AND entity=%s AND shop_id=%s",
             (window.start, window.end, source, entity, shop_id),
         )
+    # 两条分支都要留凭证；窗口口径由 _record_batch 按 mode 标清。
+    _record_batch(conn, source=source, entity=entity, shop_id=shop_id, window=window,
+                  mode=mode, batch_id=batch_id, row_count=row_count)
 
 
 def record_failure(conn, *, source: str, entity: str, shop_id: str, code: str) -> None:
@@ -986,7 +1009,8 @@ def sync_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
             refresh_aftersale_matched(conn, shop_id, touched_commercials)
         mark_refund_canonical(conn, shop_id, refund_ids)
         _record_window_success(conn, source=source, entity=entity, shop_id=shop_id,
-                               window=window, mode=mode, batch_id=batch_id)
+                               window=window, mode=mode, batch_id=batch_id,
+                               row_count=accepted)
     return accepted
 
 
@@ -1368,12 +1392,12 @@ def _incremental_shop(conn, client: KuaimaiClient, *, shop_id: str,
 
 
 def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
-                    run_end: datetime) -> dict[str, int]:
-    """按支付日/退款完成日重核最近N天，并刷新cohort覆盖与data_as_of。"""
+                    run_end: datetime) -> dict[str, object]:
+    """按支付日/退款完成日重核最近N天，刷新cohort覆盖与data_as_of，并按凭证推进质量状态。"""
     if days > MAX_QUERY_DAYS:
         raise SystemExit(f"重核跨度最多{MAX_QUERY_DAYS}天")
     start = run_end - timedelta(days=days)
-    stats = {"orders": 0, "aftersales_occurrence": 0, "cohort_windows": 0}
+    stats: dict[str, object] = {"orders": 0, "aftersales_occurrence": 0, "cohort_windows": 0}
     for window in day_windows(start, run_end):
         stats["orders"] += _run_window(conn, client, entity="orders", shop_id=shop_id,
                                        window=window, mode="reconcile")
@@ -1385,6 +1409,13 @@ def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
     missing = unmatched_commercials(conn, shop_id)
     if missing:
         refetch_orders_for_commercials(conn, client, shop_id=shop_id, commercial_ids=missing)
+    # 补拉完成后才判质量：没有落在本窗口的 reconcile 凭证就维持 unknown，
+    # 有凭证但存在归属未确认的成功退款则降为 failed（该范围之后禁止出数）。
+    stats["quality"] = {
+        entity: reconcile_source_quality(conn, shop_id=shop_id, entity=entity,
+                                         start=start, end=run_end)
+        for entity in ("orders", "aftersales_occurrence", "aftersales_cohort")
+    }
     return stats
 
 

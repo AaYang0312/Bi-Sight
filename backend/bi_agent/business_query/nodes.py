@@ -186,6 +186,8 @@ def authorize_scope(
 _LIMITATION_CODES = {
     "覆盖未完成，拒绝部分汇总；缺口见coverage.gaps": "coverage_incomplete",
     "数据截止未知（回填未完成）": "data_as_of_unknown",
+    "来源质量核验未通过，拒绝出数": "source_quality_failed",
+    "来源质量未核验（尚无对账记录）": "source_quality_unverified",
     "店铺尚未同步，无法查询": "shop_not_synced",
     "部分店铺已停用，仅返回剩余范围": "shops_inactive",
     "所选店铺均已停用，无法查询": "shops_inactive",

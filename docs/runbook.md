@@ -16,7 +16,7 @@
 
 ## 本地开发
 
-先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行 `001 → 002 → 003 → 004 → 005 → 007`，不可跳过运行追踪迁移。当前没有 `006`（编号留给数据覆盖迁移），但 005 与 007 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列，指标查询会直接报列不存在。
+先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行 `001 → 002 → 003 → 004 → 005 → 007 → 008`，不可跳过运行追踪迁移。编号 006 己作废（不补旧序号迁移），数据就绪能力落在 008。005 / 007 / 008 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，指标查询会直接报列或表不存在。
 
 ```powershell
 psql -d bi_agent -f backend/sql/001_init.sql
@@ -25,6 +25,7 @@ psql -d bi_agent -f backend/sql/003_kuaimai_metric_semantics.sql
 psql -d bi_agent -f backend/sql/004_query_runtime.sql
 psql -d bi_agent -f backend/sql/005_product_dimension.sql
 psql -d bi_agent -f backend/sql/007_catalog_identity.sql
+psql -d bi_agent -f backend/sql/008_data_readiness.sql
 ```
 
 分别启动后端和前端：
@@ -56,6 +57,7 @@ psql -d bi_agent -f sql/003_kuaimai_metric_semantics.sql
 psql -d bi_agent -f sql/004_query_runtime.sql
 psql -d bi_agent -f sql/005_product_dimension.sql
 psql -d bi_agent -f sql/007_catalog_identity.sql
+psql -d bi_agent -f sql/008_data_readiness.sql
 uv run --env-file ../.env.sync python -m bi_agent.sync shops
 uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity orders --start <保留历史起日> --end <截止日的下一日>
 uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity aftersales_occurrence --start <保留历史起日> --end <截止日的下一日>
@@ -89,6 +91,36 @@ Register-ScheduledTask -TaskName 'BI Agent Hourly Sync' -Action $syncAction -Tri
 ```
 
 另建每日低峰的 `reconcile --days 7` 任务。运行账户只读取同步配置；命令参数不含密码。
+
+## 数据就绪与质量核对
+
+覆盖、业务截止与质量是三件事（口径见 `docs/metrics.md` 第 6 节）。核对与推进：
+
+```powershell
+# 看当前就绪情况：覆盖区间、业务截止、质量状态与所用口径
+psql -d bi_agent -c "SELECT entity, shop_id, data_as_of, quality_status, quality_rule, "
+                "       last_error_code FROM reporting.v_coverage ORDER BY entity, shop_id;"
+# 看某段时间是哪几批同步出来的（window_kind='business' 才能当覆盖凭证）
+psql -d bi_agent -c "SELECT shop_id, entity, batch_id, window_kind, mode, row_count "
+                "FROM reporting.v_source_batches ORDER BY recorded_at DESC LIMIT 20;"
+# 对账：只有本窗口确有 reconcile 批次，才能把 unknown 升为 passed
+uv run --env-file ../.env.sync python -m bi_agent.sync reconcile --days 7
+```
+
+推进规则与限制：
+
+- 历史遗留的“从未核验”统一是 `unknown`，仍可出数但会带「来源质量未核验」说明；不得直接当数据有错。
+- 对账发现归属未确认的平台成功退款时，该范围降为 `failed` 并**停止出数**，修复后重跑 `reconcile` 才能恢复。
+- `quality_rule` 变更后旧 `passed` 自动失效，必须重跑对账。
+- `row_count` 为 NULL 是“当时未统计”，不等于 0 行；分页中断的窗口不会留下批次凭证，覆盖也不会推进。
+
+执行历史回填、增量或核对时，按下表逐格记录实际结果，**没跑过就写未执行**，
+不得拿代码存在或店铺档案数当完成：
+
+| 平台 / 店铺 | 实体 | 回填 | 增量 | 核对 | 质量状态 | 未完成或失败原因 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 抖音 166754 | orders | 已完成至 2026-09-09 | 未部署定时 | 未执行 | unknown | 未跑过 reconcile，无凭证可升 passed |
+| 其余 41 家店铺 | 全部 | 未执行 | 未执行 | 未执行 | unknown | 未进入授权范围，不能拿档案数当覆盖 |
 
 ## 同源部署
 
