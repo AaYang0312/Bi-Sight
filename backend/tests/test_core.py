@@ -653,7 +653,15 @@ class PageCompletionEvidenceTests(unittest.TestCase):
         self.assertEqual(page.rows, [{"sid": "E1"}])
 
     def test_no_sync_call_site_opens_the_allowance(self):
-        """同步链在用的三个接口都实测返回 list → 不得再传 allow_omitted_list=True。"""
+        """C-6：宽容只允许给“不承载覆盖证据”的归档通道，在线通道永远严格。
+
+        2026-09-11 真实账号实测推翻旧前提：`erp.trade.list.query` 的归档通道
+        （queryType=1）在窗口内无归档单时既不回 `list` 也不回 `total`，
+        只会回 `{"success": true, "traceId": ...}`。
+        但“省略 list 永远不是完成证据”依旧成立，所以约束改成：
+        允许位只能出现在归档分页调用上，并且全库只出现一次；
+        在线游标通道（建立覆盖的那一条）不得拿它当退路。
+        """
         import inspect
 
         from bi_agent import sync
@@ -661,7 +669,59 @@ class PageCompletionEvidenceTests(unittest.TestCase):
         source = inspect.getsource(sync)
 
         self.assertIn("C-6", source)
-        self.assertNotIn("allow_omitted_list=True", source)
+        self.assertEqual(source.count("allow_omitted_list=True"), 1,
+                         "宽容位不得扩散到其他调用点")
+        cursor_calls = [line for line in source.splitlines()
+                        if "_fetch_orders_cursor(" in line or "time_type=\"pay_time\"" in line]
+        self.assertTrue(any("query_type=\"0\"" in line for line in cursor_calls),
+                        "在线通道调用应存在且保持严格解析")
+        for line in source.splitlines():
+            if "_fetch_orders_cursor(" in line and "allow_omitted_list" in line:
+                self.fail("在线订单通道不得省略不可信空")
+
+    def test_backfill_accepts_archive_channel_omitting_list(self):
+        """真实形状回放：在线通道给出 total，归档通道只回 success 空信封。"""
+        from bi_agent import sync
+
+        class Client:
+            def call(self, method, params):
+                if params.get("useCursor") == "true":
+                    # 在线通道：实测带 total，空集时是 total=0
+                    return {"success": True, "total": 1,
+                            "list": [{"sid": "E1", "userId": "S1", "tid": "C1",
+                                       "payAmount": "10.00",
+                                       "orders": [{"oid": "L1", "itemSysId": "P1",
+                                                    "num": "1", "payAmount": "10.00"}]}],
+                            "hasNext": False}
+                # 归档通道（queryType=1）：实测省略 list 与 total
+                return {"success": True, "traceId": "t-1"}
+
+        rows = list(sync.fetch_window(Client(), entity="orders", shop_id="S1",
+                                      window=sync.Window(
+                                          datetime(2026, 9, 9, tzinfo=self.TZ),
+                                          datetime(2026, 9, 10, tzinfo=self.TZ)),
+                                      mode="backfill"))
+
+        self.assertEqual([row["sid"] for row in rows], ["E1"],
+                         "在线通道数据必须拉到，归档空页不得抛不可信空")
+
+    def test_backfill_still_raises_when_online_channel_gives_no_evidence(self):
+        """归档宽容不得变成覆盖退路：在线通道无证据仍要报错。"""
+        from bi_agent import sync
+        from bi_agent.kuaimai import KuaimaiError
+
+        class Client:
+            def call(self, method, params):
+                return {"success": True, "traceId": "t-1"}
+
+        with self.assertRaises(KuaimaiError) as ctx:
+            list(sync.fetch_window(Client(), entity="orders", shop_id="S1",
+                                   window=sync.Window(
+                                       datetime(2026, 9, 9, tzinfo=self.TZ),
+                                       datetime(2026, 9, 10, tzinfo=self.TZ)),
+                                   mode="backfill"))
+
+        self.assertEqual(ctx.exception.code, "unknown_empty")
 
     class _Connection:
         def __init__(self):

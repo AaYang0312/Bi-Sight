@@ -734,8 +734,12 @@ def mark_refund_canonical(conn, shop_id: str, platform_refund_ids: set[str]) -> 
 # erp.item.sku.list.get、stock.api.status.query、erp.item.warehouse.list.get、
 # erp.wave.logistics.order.query、erp.aftersale.refund.warehouse.query、
 # purchase.order.query（初查 status=unexpected_list_shape，复查 success_no_records）。
-# 同步链在用的 erp.trade.list.query / erp.aftersale.list.query / erp.shop.list.query
-# 全部实测返回 list（空集时带 total=0），所以一处也不传 allow_omitted_list（C-6）。
+# 同步链在用的 erp.aftersale.list.query / erp.shop.list.query 与订单的**在线通道**
+# （queryType=0，空集时带 total=0）都返回 list，依旧不传宽容位（C-6）。
+# 例外是订单**归档通道**（queryType=1）：2026-09-11 真实账号实测，窗口内没有归档单时
+# 它既不回 list 也不回 total，只回 {"success": true, "traceId": ...}，所以该调用点
+# 单独开宽容位。省略仍不构成完成证据：覆盖证据只由在线通道的 total/hasNext 提供，
+# 在线通道拿不到证据时仍抛 unknown_empty。
 
 
 @dataclass(frozen=True)
@@ -793,8 +797,13 @@ def _fetch_orders_cursor(client: KuaimaiClient, *, shop_id: str, window: Window,
 
 
 def _fetch_orders_paged(client: KuaimaiClient, *, shop_id: str, window: Window,
-                        time_type: str | None, query_type: str) -> Iterator[dict[str, Any]]:
-    """归档通道：页码分页；按total判断末页并检查计数一致性。"""
+                        time_type: str | None, query_type: str,
+                        allow_omitted_list: bool = False) -> Iterator[dict[str, Any]]:
+    """归档通道：页码分页；按total判断末页并检查计数一致性。
+
+    allow_omitted_list 只为归档通道开（实测它无数据时省略 list/total）。
+    省略 list 永远不等于完成证据（C-6）：调用方依旧需要 total 或 hasNext。
+    """
     page_no = 1
     collected = 0
     total: int | None = None
@@ -809,7 +818,8 @@ def _fetch_orders_paged(client: KuaimaiClient, *, shop_id: str, window: Window,
         }
         if time_type:
             params["timeType"] = time_type
-        page = parse_page(client.call(ORDER_SOURCE, params))
+        page = parse_page(client.call(ORDER_SOURCE, params),
+                          allow_omitted_list=allow_omitted_list)
         if page.verified_empty:
             return
         if total is None and page.total is not None:
@@ -880,8 +890,11 @@ def fetch_window(client: KuaimaiClient, *, entity: str, shop_id: str,
         elif mode in ("backfill", "replay", "reconcile", "probe"):
             yield from _fetch_orders_cursor(client, shop_id=shop_id, window=window,
                                             time_type="pay_time", query_type="0")
+            # 归档通道实测会省略 list/total（见上方 C-6 例外说明）：按空页解析，
+            # 但不得拿它当完成证据；整窗证据仍由上面的在线通道负责。
             yield from _fetch_orders_paged(client, shop_id=shop_id, window=window,
-                                           time_type="pay_time", query_type="1")
+                                           time_type="pay_time", query_type="1",
+                                           allow_omitted_list=True)
         else:
             raise ValueError(f"未知模式 {mode}")
     elif entity == "aftersales_occurrence":
