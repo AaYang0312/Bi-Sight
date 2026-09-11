@@ -132,6 +132,22 @@ def pick_display_name(archive: object, snapshot: object) -> tuple[str | None, Na
     return None, "unresolved"
 
 
+def pick_sku_label(labels: Iterable[object]) -> str | None:
+    """规格取用规则只这一处：每一行都指同一个非空规格才展示。
+
+    任一行为空或与其他行不一致，一律返回 None：多规格商品任选一个展示就是编造。
+    与 pick_display_name 不同，这里不能“先拿到的算”。
+    """
+    values: list[str] = []
+    for label in labels:
+        if not is_safe_display_name(label):
+            return None
+        values.append(str(label).strip())
+    if len(set(values)) == 1:
+        return values[0]
+    return None
+
+
 def render_display_text(text: str, display_by_ref: Mapping[str, str | None]) -> str:
     """把正文里的引用换成展示名；未知引用与无名称引用原样保留。
 

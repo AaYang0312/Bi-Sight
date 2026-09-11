@@ -16,6 +16,7 @@ from .models import (
     EntityKind,
     is_safe_display_name,
     pick_display_name,
+    pick_sku_label,
     ref_for_key,
     shop_display_labels,
 )
@@ -108,8 +109,10 @@ def build_catalog(conn, result, *, allowed_shop_ids: frozenset[str]) -> Catalog:
         snapshot = next((row.get("product_name_snapshot") for row in rows
                          if is_safe_display_name(row.get("product_name_snapshot"))), None)
         name, source = pick_display_name(archive, snapshot)
+        # 规格走另一条规则：多行不一致或任一缺规格就置空，不沿用名称的“先拿到的算”。
         entities.append(DisplayEntity(
-            ref=ref, kind=EntityKind.PRODUCT, display_name=name, name_source=source))
+            ref=ref, kind=EntityKind.PRODUCT, display_name=name, name_source=source,
+            sku_label=pick_sku_label([row.get("sku_label") for row in rows])))
 
     return Catalog(
         shop_refs=MappingProxyType(shop_refs),

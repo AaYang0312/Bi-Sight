@@ -18,6 +18,17 @@ import psycopg
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
+# reporting.v_product_daily 的列序是契约（视图带名称列，列序一变投影就可能错装）。
+# 三处断言共用这一份，避免基线 / 005 / 007 形状各抄一遍后互相漂移。
+PRODUCT_DAILY_BASE_COLUMNS = [
+    "shop_id", "day", "product_id", "quantity", "gift_quantity",
+    "product_paid_amount", "allocation_verified", "line_kind",
+]
+PRODUCT_DAILY_COLUMNS_AFTER_005 = PRODUCT_DAILY_BASE_COLUMNS + ["product_name"]
+PRODUCT_DAILY_COLUMNS = PRODUCT_DAILY_BASE_COLUMNS + [
+    "product_name", "product_name_snapshot", "sku_label",
+]
+
 
 def connect_test_db(case: Any, dsn_env: str = "BI_TEST_ADMIN_DSN") -> psycopg.Connection:
     """连测试库并开启外层回滚事务；不在 *_test 或不在本机就直接失败。"""

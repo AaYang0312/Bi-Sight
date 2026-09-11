@@ -15,7 +15,8 @@ from zoneinfo import ZoneInfo
 import httpx
 import psycopg
 
-from .dbfixtures import connect_test_db
+from .dbfixtures import (PRODUCT_DAILY_COLUMNS, PRODUCT_DAILY_COLUMNS_AFTER_005,
+                       connect_test_db)
 
 from .dbfixtures import connect_test_db
 
@@ -325,17 +326,90 @@ class DatabaseTests(unittest.TestCase):
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema='reporting' AND table_name='v_product_daily' "
             "ORDER BY ordinal_position").fetchall()]
-        self.assertEqual(columns, [
-            "shop_id", "day", "product_id", "quantity", "gift_quantity",
-            "product_paid_amount", "allocation_verified", "line_kind",
-            "product_name", "product_name_snapshot",
-        ])
+        self.assertEqual(columns, PRODUCT_DAILY_COLUMNS)
         exposed = self.conn.execute(
             "SELECT table_name, view_definition FROM information_schema.views "
             "WHERE table_schema='reporting'").fetchall()
         self.assertTrue(exposed)
         for name, definition in exposed:
             self.assertNotIn("purchase_price", definition, f"{name} 暴露了成本列")
+
+    def test_product_daily_marks_several_skus_instead_of_choosing_one(self):
+        """同一天同商品多 SKU：视图只给空规格，不能任选一个规格当展示名。"""
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self._seed_shop()
+        paid_at = datetime(2026, 9, 2, 12, tzinfo=BEIJING)
+        trade = normalise_trade({
+            "sid": "E_SKU", "userId": "S1", "tid": "C_SKU", "payAmount": "150",
+            "updTime": _ms(paid_at), "payTime": _ms(paid_at),
+            "orders": [
+                {"oid": "L_M1", "tid": "C_SKU", "itemSysId": "P_MULTI", "type": 0,
+                 "num": "1", "payAmount": "50", "sysTitle": "直钉枪",
+                 "sysSkuPropertiesName": "30mm"},
+                {"oid": "L_M2", "tid": "C_SKU", "itemSysId": "P_MULTI", "type": 0,
+                 "num": "2", "payAmount": "50", "sysTitle": "直钉枪",
+                 "sysSkuPropertiesName": "50mm"},
+                {"oid": "L_S1", "tid": "C_SKU", "itemSysId": "P_SINGLE", "type": 0,
+                 "num": "4", "payAmount": "50", "sysTitle": "撞针",
+                 "sysSkuPropertiesName": "成套"},
+            ],
+        })
+        with self.conn.transaction():
+            self.assertTrue(apply_trade(self.conn, trade, batch_id="sku"))
+            rows = self.conn.execute(
+                "SELECT product_id, sku_label, quantity, "
+                "product_paid_amount FROM reporting.v_product_daily "
+                "WHERE shop_id='S1' ORDER BY product_id").fetchall()
+
+        self.assertEqual([(str(row[0]), row[1]) for row in rows],
+                         [("P_MULTI", None), ("P_SINGLE", "成套")],
+                         "多 SKU 只能置空，不得挑一个规格展示")
+        self.assertEqual([Decimal(str(row[2])) for row in rows],
+                         [Decimal("3"), Decimal("4")], "规格列不得改变销量")
+        self.assertEqual([Decimal(str(row[3])) for row in rows],
+                         [Decimal("100"), Decimal("50")], "规格列不得改变支付额")
+
+    def test_product_rows_drop_spec_when_skus_differ_across_days(self):
+        """跨天聚合同样不得任选规格：任一成交行规格缺失或不一致就只留商品名。"""
+        import time as time_module
+
+        from bi_agent import metrics
+        from bi_agent.metrics import QueryRequest
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self._seed_shop()
+
+        def line(order_id: str, product: str, spec: str) -> dict:
+            return {"oid": order_id, "tid": f"C_{product}", "itemSysId": product,
+                    "type": 0, "num": "1", "payAmount": "50", "sysTitle": product,
+                    "sysSkuPropertiesName": spec}
+
+        for day, spec in ((2, "30mm"), (3, "50mm")):
+            paid_at = datetime(2026, 9, day, 12, tzinfo=BEIJING)
+            trade = normalise_trade({
+                "sid": f"E_{day}", "userId": "S1", "tid": f"CT_{day}",
+                "payAmount": "100", "updTime": _ms(paid_at), "payTime": _ms(paid_at),
+                "orders": [line(f"L_DIFF_{day}", "P_DIFF", spec),
+                           line(f"L_SAME_{day}", "P_SAME", "成套")],
+            })
+            with self.conn.transaction():
+                self.assertTrue(apply_trade(self.conn, trade, batch_id="days"))
+
+        request = QueryRequest(start="2026-09-01", end="2026-09-08", shop_ids=["S1"],
+                               metrics=["product_paid_amount"], group_by="product")
+        rows = metrics._product_rows(
+            self.conn, request, start_ts=datetime(2026, 9, 1, tzinfo=BEIJING),
+            end_ts=datetime(2026, 9, 8, tzinfo=BEIJING),
+            deadline=time_module.monotonic() + 30)
+
+        by_product = {row["product_id"]: row for row in rows if "product_id" in row}
+        self.assertEqual(by_product["P_SAME"]["sku_label"], "成套",
+                         "跨天规格一致时仍应展示")
+        self.assertIsNone(by_product["P_DIFF"]["sku_label"],
+                          "跨天规格不同时不得任选一个")
+        self.assertEqual(Decimal(str(by_product["P_DIFF"]["product_paid_amount"])),
+                         Decimal("100"), "规格列不得改变支付额")
 
     def test_migration_chain_005_then_007_is_forward_only(self):
         """005 → 007 必须能按顺序执行，且各自可重复执行。"""
@@ -350,19 +424,12 @@ class DatabaseTests(unittest.TestCase):
         fifth = (sql_dir / "005_product_dimension.sql").read_text(encoding="utf-8")
         self.conn.execute(fifth)
         self.conn.execute(fifth)
-        self.assertEqual(self._view_columns("v_product_daily"), [
-            "shop_id", "day", "product_id", "quantity", "gift_quantity",
-            "product_paid_amount", "allocation_verified", "line_kind", "product_name",
-        ])
+        self.assertEqual(self._view_columns("v_product_daily"), PRODUCT_DAILY_COLUMNS_AFTER_005)
 
         seventh = (sql_dir / "007_catalog_identity.sql").read_text(encoding="utf-8")
         self.conn.execute(seventh)
         self.conn.execute(seventh)
-        self.assertEqual(self._view_columns("v_product_daily"), [
-            "shop_id", "day", "product_id", "quantity", "gift_quantity",
-            "product_paid_amount", "allocation_verified", "line_kind",
-            "product_name", "product_name_snapshot",
-        ])
+        self.assertEqual(self._view_columns("v_product_daily"), PRODUCT_DAILY_COLUMNS)
         self.assertEqual(self.conn.execute(
             "SELECT count(*) FROM bi.catalog_state WHERE id = 1").fetchone()[0], 1)
 

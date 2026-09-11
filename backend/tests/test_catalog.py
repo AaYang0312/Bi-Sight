@@ -120,6 +120,28 @@ class AnswerRewriteTests(unittest.TestCase):
         self.assertEqual(text, "订单 548597548700160 异常")
 
 
+class SkuLabelTests(unittest.TestCase):
+    """规格取用规则只这一处：不一致、歧义或任一缺失就不展示，绝不任选一个。"""
+
+    def test_single_agreed_spec_is_used(self):
+        from bi_agent.catalog import pick_sku_label
+
+        self.assertEqual(pick_sku_label(["400支", " 400支 "]), "400支")
+
+    def test_any_disagreement_or_gap_drops_the_spec(self):
+        from bi_agent.catalog import pick_sku_label
+
+        cases = {
+            "一行无规格": ["400支", None],
+            "两行不一致": ["400支", "600支"],
+            "空字符串": ["400支", "  "],
+            "无行": [],
+        }
+        for name, labels in cases.items():
+            with self.subTest(name):
+                self.assertIsNone(pick_sku_label(labels))
+
+
 @unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
 class CatalogRepositoryTests(unittest.TestCase):
     def setUp(self):
@@ -246,15 +268,12 @@ class CatalogMigrationTests(unittest.TestCase):
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema='bi' AND table_name='order_items'").fetchall()}
         self.assertTrue({"product_name_snapshot", "sku_label_snapshot"} <= columns)
-        # 取用优先级只在 catalog 一处实现，视图只分别给出档案名与成交快照。
+        # 取用优先级只在 catalog 一处实现，视图只分别给出档案名、成交快照与规格聚合。
         view_columns = {row[0] for row in conn.execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema='reporting' AND table_name='v_product_daily'").fetchall()}
-        self.assertEqual(view_columns, {
-            "shop_id", "day", "product_id", "quantity", "gift_quantity",
-            "product_paid_amount", "allocation_verified", "line_kind",
-            "product_name", "product_name_snapshot",
-        })
+        from tests.dbfixtures import PRODUCT_DAILY_COLUMNS
+        self.assertEqual(view_columns, set(PRODUCT_DAILY_COLUMNS))
 
 
 @unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
@@ -333,6 +352,44 @@ class CatalogProjectionTests(unittest.TestCase):
         self.assertEqual((product["display_name"], product["name_source"]),
                          ("直钉枪-元发", "archive"))
         self.assertEqual(public["catalog_version"], catalog_version(self.conn))
+
+    def test_product_entity_shows_the_sku_spec_when_rows_agree(self):
+        _, _, public, _, _ = self._project(
+            [{"shop_id": "S_CAT_P", "product_id": "P_CAT", "quantity": "3",
+              "line_kind": "sale", "product_name": "直钉枪-元发",
+              "sku_label": "400支"},
+             {"shop_id": "S_CAT_P", "product_id": "P_CAT", "quantity": "1",
+              "line_kind": "suite", "product_name": "直钉枪-元发",
+              "sku_label": "400支"}])
+
+        product = [item for item in public["entities"] if item["kind"] == "product"][0]
+        self.assertEqual(product["sku_label"], "400支")
+
+    def test_product_entity_hides_the_spec_when_a_row_carries_none(self):
+        """名称可以“先拿到的算”，规格不行：任一行无规格就不能当成全局一致。"""
+        _, _, public, _, _ = self._project(
+            [{"shop_id": "S_CAT_P", "product_id": "P_CAT", "quantity": "3",
+              "line_kind": "sale", "product_name": "直钉枪-元发",
+              "sku_label": "400支"},
+             {"shop_id": "S_CAT_P", "product_id": "P_CAT", "quantity": "1",
+              "line_kind": "suite", "product_name": "直钉枪-元发"}])
+
+        product = [item for item in public["entities"] if item["kind"] == "product"][0]
+        self.assertIsNone(product["sku_label"])
+
+    def test_product_entity_hides_the_spec_when_rows_disagree(self):
+        _, _, public, model_json, public_json = self._project(
+            [{"shop_id": "S_CAT_P", "product_id": "P_CAT", "quantity": "3",
+              "line_kind": "sale", "product_name": "直钉枪-元发",
+              "sku_label": "400支"},
+             {"shop_id": "S_CAT_P", "product_id": "P_CAT", "quantity": "1",
+              "line_kind": "suite", "product_name": "直钉枪-元发",
+              "sku_label": "600支"}])
+
+        product = [item for item in public["entities"] if item["kind"] == "product"][0]
+        self.assertIsNone(product["sku_label"], "多规格商品任选一个就是编造")
+        self.assertNotIn("400支", model_json, "规格不得进模型载荷")
+        self.assertNotIn("600支", model_json, "规格不得进模型载荷")
 
     def test_snapshot_is_used_only_when_the_archive_has_no_name(self):
         from bi_agent.business_query.tool import to_public_artifact

@@ -918,9 +918,14 @@ class FakeWarehouse:
     def __init__(self, *, daily_rows=(), product_rows=(), shops=(), data_as_of=None,
                  cohort=(None, None), unmatched=0, shop_profiles=(), catalog_version=7):
         self.daily_rows = [tuple(row) for row in daily_rows]
-        # v_product_daily 末两列是档案名 / 成交快照；测试行没给就按视图形状补上。
-        self.product_rows = [tuple(row) if len(row) == 10
-                             else tuple(row) + (f"档案-{row[2]}", None)
+        # 视图列形以 tests.dbfixtures.PRODUCT_DAILY_COLUMNS 为单一真源，这里不再手抄列数：
+        # 测试行没给末尾的名称 / 成交快照 / 规格列就按契约补上。
+        from tests.dbfixtures import PRODUCT_DAILY_COLUMNS
+
+        width = len(PRODUCT_DAILY_COLUMNS)
+        self.product_rows = [tuple(row) if len(row) == width
+                             else tuple(row) + (f"档案-{row[2]}",)
+                             + (None,) * (width - len(row) - 1)
                              for row in product_rows]
         self.shop_profiles = [tuple(row) for row in shop_profiles]
         self.catalog_version = catalog_version

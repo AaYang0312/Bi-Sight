@@ -16,13 +16,15 @@
 
 ## 本地开发
 
-先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行 `001 → 002 → 003 → 004`，不可跳过运行追踪迁移：
+先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行 `001 → 002 → 003 → 004 → 005 → 007`，不可跳过运行追踪迁移。当前没有 `006`（编号留给数据覆盖迁移），但 005 与 007 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列，指标查询会直接报列不存在。
 
 ```powershell
 psql -d bi_agent -f backend/sql/001_init.sql
 psql -d bi_agent -f backend/sql/002_kuaimai_mapping_repair.sql
 psql -d bi_agent -f backend/sql/003_kuaimai_metric_semantics.sql
 psql -d bi_agent -f backend/sql/004_query_runtime.sql
+psql -d bi_agent -f backend/sql/005_product_dimension.sql
+psql -d bi_agent -f backend/sql/007_catalog_identity.sql
 ```
 
 分别启动后端和前端：
@@ -52,10 +54,14 @@ Set-Location backend
 psql -d bi_agent -f sql/002_kuaimai_mapping_repair.sql
 psql -d bi_agent -f sql/003_kuaimai_metric_semantics.sql
 psql -d bi_agent -f sql/004_query_runtime.sql
+psql -d bi_agent -f sql/005_product_dimension.sql
+psql -d bi_agent -f sql/007_catalog_identity.sql
 uv run --env-file ../.env.sync python -m bi_agent.sync shops
 uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity orders --start <保留历史起日> --end <截止日的下一日>
 uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity aftersales_occurrence --start <保留历史起日> --end <截止日的下一日>
 ```
+
+成交名称与规格快照（`product_name_snapshot` / `sku_label_snapshot`）只在新写入或显式重放时采集：执行完 007 的历史行仍是 NULL，名称回落到商品档案，规格则不展示，不从商品名猜。测试库实测：1488 行商品日数据全部有档案名、0 行有成交快照与规格，属预期而不是缺陷。
 
 ```powershell
 Set-Location backend

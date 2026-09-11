@@ -15,6 +15,8 @@ import psycopg
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from zoneinfo import ZoneInfo
 
+from bi_agent.catalog import pick_sku_label
+
 BEIJING = ZoneInfo("Asia/Shanghai")
 MAX_SPAN_DAYS = 366
 MAX_ROWS = 500
@@ -286,7 +288,8 @@ LIMIT %s
 
 _PRODUCT_SQL = """
 SELECT shop_id, day, product_id, quantity, gift_quantity, product_paid_amount,
-       allocation_verified, line_kind, product_name, product_name_snapshot
+       allocation_verified, line_kind, product_name, product_name_snapshot,
+       sku_label
 FROM reporting.v_product_daily
 WHERE shop_id = ANY(%s) AND day >= %s AND day < %s
 ORDER BY day, shop_id, product_id
@@ -643,8 +646,10 @@ def _product_rows(conn, request: QueryRequest, *, start_ts: datetime,
                    else "quantity")
     by_product: dict[tuple[str, str, str], dict[str, Decimal | int | bool | None]] = {}
     names: dict[tuple[str, str], dict[str, str | None]] = {}
+    sku_labels: dict[tuple[str, str, str], list[object]] = {}
     for row in raw:
-        entry = by_product.setdefault((row[0], row[2], row[7]), {
+        group_key = (row[0], row[2], row[7])
+        entry = by_product.setdefault(group_key, {
             "quantity": Decimal(0), "gift_quantity": Decimal(0),
             "product_paid_amount": Decimal(0), "allocation_verified": True})
         entry["quantity"] += row[3]
@@ -654,9 +659,11 @@ def _product_rows(conn, request: QueryRequest, *, start_ts: datetime,
         # 名称列只当内部输入：真实展示名由 catalog 投影层按一处优先级解析。
         kept = names.setdefault((row[0], row[2]), {"product_name": None,
                                                    "product_name_snapshot": None})
-        for index, key in ((8, "product_name"), (9, "product_name_snapshot")):
-            if kept[key] is None and row[index] is not None:
-                kept[key] = str(row[index])
+        for index, name_key in ((8, "product_name"), (9, "product_name_snapshot")):
+            if kept[name_key] is None and row[index] is not None:
+                kept[name_key] = str(row[index])
+        # 规格不能“先拿到的算”：每一天都先存下来，由 pick_sku_label 统一判定。
+        sku_labels.setdefault(group_key, []).append(row[10])
     ranked = sorted(by_product.items(),
                     key=lambda item: (item[1][rank_metric] or 0, item[0]),
                     reverse=True)
@@ -667,6 +674,7 @@ def _product_rows(conn, request: QueryRequest, *, start_ts: datetime,
             "shop_id": shop_id, "product_id": product_id, "line_kind": line_kind,
             "product_name": kept.get("product_name"),
             "product_name_snapshot": kept.get("product_name_snapshot"),
+            "sku_label": pick_sku_label(sku_labels.get((shop_id, product_id, line_kind), [])),
             "quantity": _render(entry["quantity"]),
             "gift_quantity": _render(entry["gift_quantity"]),
             "product_paid_amount": _render(entry["product_paid_amount"]),

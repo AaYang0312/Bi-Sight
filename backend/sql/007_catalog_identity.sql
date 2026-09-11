@@ -45,11 +45,14 @@ COMMENT ON COLUMN bi.order_items.sku_label_snapshot IS
 
 -- 商品日聚合：档案名称与成交快照都原样给出，列序写定当契约；
 -- 取用优先级只在 catalog 一处实现，避免 SQL 与 Python 两边漂移。
+-- 规格按同一粒度聚合：一个分组内只出现一个非空规格才给值，多规格就置空，
+-- 不让 SQL 任选一行当整个商品的规格。
 CREATE OR REPLACE VIEW reporting.v_product_daily AS
 SELECT daily.shop_id, daily.day, daily.product_id, daily.quantity, daily.gift_quantity,
        daily.product_paid_amount, daily.allocation_verified, daily.line_kind,
        product.title AS product_name,
-       daily.product_name_snapshot AS product_name_snapshot
+       daily.product_name_snapshot AS product_name_snapshot,
+       daily.sku_label AS sku_label
 FROM (
   SELECT shop_id,
          (paid_at AT TIME ZONE 'Asia/Shanghai')::date AS day,
@@ -59,7 +62,9 @@ FROM (
          sum(allocated_paid_amount) AS product_paid_amount,
          bool_and(allocation_verified) AS allocation_verified,
          line_kind,
-         max(product_name_snapshot) AS product_name_snapshot
+         max(product_name_snapshot) AS product_name_snapshot,
+         CASE WHEN count(DISTINCT NULLIF(sku_label_snapshot, '')) = 1
+              THEN max(NULLIF(sku_label_snapshot, '')) END AS sku_label
   FROM bi.order_items
   WHERE active AND line_kind <> 'gift' AND product_id IS NOT NULL
     AND allocated_paid_amount IS NOT NULL
