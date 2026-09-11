@@ -1,7 +1,16 @@
 import type { Artifact } from '../types'
+import { ClockIcon, GaugeIcon, TableIcon } from './icons'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/* 字号只随字符长度收缩，数值本身保持后端原样。 */
+function lengthClass(shown: string) {
+  if (shown.length > 22) return 'num-xs'
+  if (shown.length > 15) return 'num-sm'
+  if (shown.length > 10) return 'num-md'
+  return ''
 }
 
 function text(value: unknown) {
@@ -25,14 +34,23 @@ export function ArtifactView({ artifact }: { artifact: Artifact }) {
 
   return (
     <section className="artifact" aria-label="经营数据结果">
+      <header className="artifact-head">
+        <span className="artifact-title"><TableIcon size={15} />查询结果</span>
+        {rows.length > 0 && <span className="pill">{rows.length} 行</span>}
+      </header>
       {first && rows.length === 1 && (
         <div className="metric-grid">
-          {numericKeys.map((key) => (
-            <div className="metric-card" key={key}>
-              <span>{key}</span>
-              <strong>{text(first[key])}</strong>
-            </div>
-          ))}
+          {numericKeys.map((key) => {
+            const value = first[key]
+            const shown = text(value)
+            const tone = value === null || value === undefined ? 'missing' : lengthClass(shown)
+            return (
+              <div className={`metric-card ${tone}`} key={key}>
+                <span>{key}</span>
+                <strong>{shown}</strong>
+              </div>
+            )
+          })}
         </div>
       )}
       {rows.length > 1 && (
@@ -49,8 +67,8 @@ export function ArtifactView({ artifact }: { artifact: Artifact }) {
       )}
       <div className="artifact-meta">
         {rangeStart && rangeEnd && <span>期间：{rangeStart} 至 {rangeEnd}</span>}
-        {asOf && <span>数据截止：{asOf}</span>}
-        {coverage !== undefined && <span>覆盖：{text(coverage)}</span>}
+        {asOf && <span><ClockIcon size={13} />数据截止：{asOf}</span>}
+        {coverage !== undefined && <span><GaugeIcon size={13} />覆盖：{text(coverage)}</span>}
       </div>
       {limitations.length > 0 && <p className="limitations">{limitations.map(text).join('；')}</p>}
     </section>

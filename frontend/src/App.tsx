@@ -11,6 +11,21 @@ const stageText: Record<string, string> = {
   answering: '正在组织回答…',
 }
 
+// 抽屉断点：必须与 styles.css 里 @media (max-width: 767px) 保持一致。
+const DRAWER_QUERY = '(max-width: 767px)'
+
+function useNarrow() {
+  const [narrow, setNarrow] = useState(() => window.matchMedia(DRAWER_QUERY).matches)
+  useEffect(() => {
+    const query = window.matchMedia(DRAWER_QUERY)
+    const sync = () => setNarrow(query.matches)
+    sync()
+    query.addEventListener('change', sync)
+    return () => query.removeEventListener('change', sync)
+  }, [])
+  return narrow
+}
+
 export default function App() {
   const [chats, setChats] = useState<ChatSummary[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -19,8 +34,12 @@ export default function App() {
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [error, setError] = useState<string | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const narrow = useNarrow()
   const controller = useRef<AbortController | null>(null)
   const selectedRef = useRef<string | null>(null)
+  const menuToggleRef = useRef<HTMLButtonElement>(null)
+  const drawerRef = useRef<HTMLElement>(null)
+  const drawerWasOpen = useRef(false)
 
   useEffect(() => { selectedRef.current = selectedId }, [selectedId])
 
@@ -31,6 +50,17 @@ export default function App() {
     window.addEventListener('keydown', closeOnEscape)
     return () => window.removeEventListener('keydown', closeOnEscape)
   }, [])
+
+  // 窄屏抽屉的焦点交接：开时进入抽屉，收时回给触发按钮（inert 会把焦点丢给 body）。
+  useEffect(() => {
+    if (!narrow) {
+      drawerWasOpen.current = sidebarOpen
+      return
+    }
+    if (sidebarOpen) drawerRef.current?.querySelector<HTMLElement>('.mobile-close')?.focus()
+    else if (drawerWasOpen.current) menuToggleRef.current?.focus()
+    drawerWasOpen.current = sidebarOpen
+  }, [narrow, sidebarOpen])
 
   async function refreshChats() {
     const next = await listChats()
@@ -136,15 +166,22 @@ export default function App() {
     }
   }
 
+  const active = chats.find((chat) => chat.id === selectedId) ?? null
+
   return (
-    <div className="workspace">
-      <button className="menu-toggle" onClick={() => setSidebarOpen(true)} aria-label="打开会话列表">☰</button>
-      <Sidebar chats={chats} selectedId={selectedId} busy={controller.current !== null}
-        open={sidebarOpen} onClose={() => setSidebarOpen(false)} onCreate={makeChat}
-        onSelect={(chatId) => { setSidebarOpen(false); void selectChat(chatId) }}
-        onRename={rename} onDelete={remove} />
-      <ChatView messages={messages} status={status} artifacts={artifacts} error={error}
-        disabled={controller.current !== null || !selectedId} onSend={send} />
+    <div className="app-shell">
+      <div className="workspace">
+        <Sidebar chats={chats} selectedId={selectedId} busy={controller.current !== null}
+          open={sidebarOpen} narrow={narrow} drawerRef={drawerRef}
+          onClose={() => setSidebarOpen(false)} onCreate={makeChat}
+          onSelect={(chatId) => { setSidebarOpen(false); void selectChat(chatId) }}
+          onRename={rename} onDelete={remove} />
+        <ChatView messages={messages} status={status} artifacts={artifacts} error={error}
+          disabled={controller.current !== null || !selectedId}
+          title={active?.title ?? null} updatedAt={active?.updated_at ?? null} chatCount={chats.length}
+          narrow={narrow} drawerOpen={sidebarOpen} menuToggleRef={menuToggleRef}
+          onOpenSidebar={() => setSidebarOpen(true)} onSend={send} />
+      </div>
     </div>
   )
 }

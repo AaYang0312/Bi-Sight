@@ -4,6 +4,7 @@ import type { ChatMessage } from '../types'
 import type { Align, Block, Inline } from '../richText'
 import { ASCII_TABLE_LANGUAGE, parseRichText } from '../richText'
 import { ArtifactView } from './ArtifactView'
+import { BrandMark } from './icons'
 
 function renderInline(inline: Inline[], keyPrefix: string): ReactNode[] {
   return inline.map((part, index) => {
@@ -98,7 +99,10 @@ export function RichContent({ text }: { text: string }) {
 export function MessageView({ message }: { message: ChatMessage }) {
   return (
     <article className={`message ${message.role}`}>
-      <div className="message-label">{message.role === 'user' ? '你' : '经营助手'}</div>
+      <div className="message-label">
+        {message.role === 'assistant' && <span className="label-mark" aria-hidden="true"><BrandMark size={13} /></span>}
+        {message.role === 'user' ? '你' : '经营助手'}
+      </div>
       <div className="message-content">
         {message.role === 'assistant' ? <RichContent text={message.content} /> : message.content}
       </div>
