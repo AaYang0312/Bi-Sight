@@ -44,15 +44,19 @@ PersistenceNode = Literal[
 ErrorCode = Literal[
     "missing_parameters", "invalid_parameters", "forbidden", "deadline_exceeded",
     "unavailable", "result_contract_violation", "artifact_persistence_failed",
-    "invalid_transition",
+    "invalid_transition", "transient_source_failure",
 ]
 ProblemCode = Literal[
     "missing_parameters", "invalid_parameters", "invalid_date_range", "invalid_metric",
     "invalid_group_by", "invalid_compare", "invalid_top_n", "invalid_shop", "forbidden",
     "deadline_exceeded", "unavailable", "result_contract_violation",
-    "artifact_persistence_failed", "invalid_transition",
+    "artifact_persistence_failed", "invalid_transition", "transient_source_failure",
 ]
 PublicMessage = Literal[
+    "本次查询时间预算已耗尽，请缩小日期或店铺范围后重试。",
+    "所查时间段的数据覆盖不足，可按建议窗口查询或等待回填完成。",
+    "该店铺的数据来源尚未开通，调整日期范围不会补上这段数据。",
+    "来源质量核验未通过，暂时不能出数。",
     "查询参数无效",
     "查询参数无效，请调整后重试。",
     "缺少查询参数，请补充后重试。",
@@ -84,6 +88,7 @@ _PROBLEM_CODES = frozenset({
     "deadline_exceeded", "unavailable", "result_contract_violation",
     "artifact_persistence_failed", "invalid_transition",
 })
+# 009 的 SQL CHECK 必须同步这份码表；测试比对，不两边各写。
 _LIMITATION_CODES = frozenset({
     "coverage_incomplete", "data_as_of_unknown", "shop_not_synced", "shops_inactive",
     "comparison_coverage_incomplete", "deadline_exceeded", "query_timeout", "forbidden",

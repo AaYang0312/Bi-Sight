@@ -29,7 +29,7 @@ ALTER TABLE bi.query_runs ADD CONSTRAINT query_runs_termination_reason CHECK (
     'source_not_onboarded', 'revenue_not_attributed', 'result_too_large',
     'comparison_coverage_incomplete', 'deadline_exceeded', 'query_timeout',
     'persistence_failed', 'contract_violation', 'upstream_unavailable',
-    'recovery_exhausted')
+    'transient_source_failure', 'recovery_exhausted')
 );
 
 -- 2) 领域白名单扩展：仍然可枚举，未知领域继续被数据库拒。

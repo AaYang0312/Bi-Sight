@@ -122,6 +122,9 @@ class BusinessQueryRuntime:
     request: QueryRequest | None = None
     result: ToolResult | None = None
     catalog: Catalog | None = None
+    # 已识别的临时连接故障标记与已重试标记：只在本进程内使用，不入库。
+    transient_failure: bool = False
+    attempted_retry: bool = False
     # 血缘与请求身份：进程内持有，落库同时随 DomainResult 一起返回。
     provenance: object | None = None
     identity: object | None = None

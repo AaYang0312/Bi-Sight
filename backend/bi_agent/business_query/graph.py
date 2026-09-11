@@ -150,6 +150,9 @@ def _run_graph_nodes(
 
     execute_fixed_query(runtime, conn)
     _persist_transition(runtime, store, _event_payload(runtime))
+    # 已识别的临时连接故障：按确定性决策最多补一次，沿用同一 deadline，不重置预算。
+    if runtime.state.status is RunStatus.RUNNING or runtime.transient_failure:
+        _retry_transient_once(runtime, conn, store)
     if runtime.state.status is not RunStatus.RUNNING:
         _finish_early(runtime, store, _event_payload(runtime))
         return _execution_result(runtime)
@@ -167,6 +170,36 @@ def _run_graph_nodes(
     _persist_transition(runtime, store, _event_payload(runtime))
     finalize_run(runtime, store)
     return _execution_result(runtime)
+
+
+def _retry_transient_once(runtime: BusinessQueryRuntime, conn: object, store: object) -> None:
+    """只对已识别的临时故障补一次；其余原因一律不追加查询。
+
+    重试沿用 `context.deadline`，所以"重试不重置预算"是结构上成立的，
+    而不是靠调用方自觉。
+    """
+    import time
+
+    from .nodes import classify_result, execute_fixed_query
+    from .recovery import decide_recovery
+
+    if not runtime.transient_failure:
+        return
+    decision = decide_recovery(
+        None, None, runtime.identity,
+        runtime.context.deadline - time.monotonic(),
+        reason_code="transient_source_failure",
+        recovery_count=1 if runtime.attempted_retry else 0,
+    )
+    if decision.action != "retry_transient":
+        return
+    runtime.attempted_retry = True
+    runtime.transient_failure = False
+    execute_fixed_query(runtime, conn)
+    _persist_transition(runtime, store, _event_payload(runtime))
+    if runtime.state.status is RunStatus.RUNNING:
+        classify_result(runtime)
+        _persist_transition(runtime, store, _event_payload(runtime))
 
 
 def _record_run_versions(runtime: BusinessQueryRuntime, store: object) -> None:

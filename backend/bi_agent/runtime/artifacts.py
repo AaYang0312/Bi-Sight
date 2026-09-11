@@ -113,7 +113,7 @@ class RequestIdentity(BaseModel):
         "source_not_onboarded", "revenue_not_attributed", "result_too_large",
         "comparison_coverage_incomplete", "deadline_exceeded", "query_timeout",
         "persistence_failed", "contract_violation", "upstream_unavailable",
-        "recovery_exhausted",
+        "transient_source_failure", "recovery_exhausted",
     ] | None = None
 
 

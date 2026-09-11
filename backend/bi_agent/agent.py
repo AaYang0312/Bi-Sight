@@ -374,6 +374,20 @@ NO_TEXT_WITH_RESULTS = ("本轮已取得确定性查询结果（见下方数据�
 NO_TEXT_WITHOUT_RESULTS = "本轮没能给出回答，请重试或换个问法。"
 
 
+def _deterministic_summary(results: list[object]) -> str | None:
+    """从已持久化的领域结果生成兜底文本；没有任何成功结果时返回 None。"""
+    from .response_summary import render_result_summary
+
+    for outcome in reversed(results):
+        domain_result = getattr(outcome, "domain_result", outcome)
+        if getattr(domain_result, "status", None) not in ("success", "missing_data"):
+            continue
+        text = render_result_summary(domain_result)
+        if text:
+            return text
+    return None
+
+
 def _final_text_answer(model: ChatModel, messages: list[Message],
                        deadline: float) -> str | None:
     """补一次不挂工具的文本回合，让模型用已拿到的确定性结果作答。
@@ -582,6 +596,9 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
         # 已拿到工具结果但模型还没输出正文：补一次纯文本回合，而不是直接放弃。
         text_answer = (_final_text_answer(model, messages, deadline)
                        or fallback_text
+                       # 补答也失败时，用已存 Artifact 复述确定性摘要：
+                       # 只说指标、窗口、截止与限制，不重新计算任何金额。
+                       or _deterministic_summary(results)
                        or (NO_TEXT_WITH_RESULTS if results else NO_TEXT_WITHOUT_RESULTS))
 
     new_state = state.model_copy(update={

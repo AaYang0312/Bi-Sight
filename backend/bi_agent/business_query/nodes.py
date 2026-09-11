@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import psycopg
 from datetime import date
 from time import monotonic
 from typing import Literal
@@ -232,7 +233,18 @@ def execute_fixed_query(runtime: BusinessQueryRuntime, conn: object) -> Business
             now=runtime.context.now,
             deadline=runtime.context.deadline,
         )
+    except (psycopg.OperationalError, psycopg.InterfaceError, psycopg.TimeoutError) as error:
+        # 已识别的连接/超时故障：可以被恢复决策重试一次，预算不重置。
+        runtime.transient_failure = True
+        runtime.result = ToolResult(
+            status="unavailable",
+            coverage=Coverage(status="missing", start=None, end=None),
+            limitations=[],
+        )
+        del error
+        return runtime
     except Exception:  # noqa: BLE001 - provider diagnostics must not leave this boundary
+        # 未知错误保持 unavailable：不猜类型，因此也绝不自动重试。
         runtime.result = ToolResult(
             status="unavailable",
             coverage=Coverage(status="missing", start=None, end=None),
@@ -384,6 +396,7 @@ _TERMINATION_BY_CODE = {
     "artifact_persistence_failed": "persistence_failed",
     "result_contract_violation": "contract_violation",
     "unavailable": "upstream_unavailable",
+    "transient_source_failure": "transient_source_failure",
 }
 
 
@@ -401,6 +414,22 @@ def _termination_reason(runtime: BusinessQueryRuntime, *, status) -> str:
         if problem in _TERMINATION_BY_CODE:
             return _TERMINATION_BY_CODE[problem]
     return "recovery_exhausted"
+
+
+# 缺口类原因要说清是哪一种，不能一律"模型不可用"或一律"缩小范围"。
+_MESSAGE_BY_LIMITATION = {
+    "coverage_incomplete": "所查时间段的数据覆盖不足，可按建议窗口查询或等待回填完成。",
+    "data_as_of_unknown": "所查时间段的数据覆盖不足，可按建议窗口查询或等待回填完成。",
+    "source_not_onboarded": "该店铺的数据来源尚未开通，调整日期范围不会补上这段数据。",
+    "source_quality_failed": "来源质量核验未通过，暂时不能出数。",
+}
+
+
+def _gap_message(limitations: list[str]) -> str:
+    for limitation, message in _MESSAGE_BY_LIMITATION.items():
+        if limitation in _limitation_codes(limitations):
+            return message
+    return "所查时间段的数据覆盖不足，可按建议窗口查询或等待回填完成。"
 
 
 def _classify(result: ToolResult) -> tuple[DomainStatus, ErrorEnvelope | None]:
