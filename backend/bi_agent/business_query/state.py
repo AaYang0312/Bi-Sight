@@ -122,6 +122,9 @@ class BusinessQueryRuntime:
     request: QueryRequest | None = None
     result: ToolResult | None = None
     catalog: Catalog | None = None
+    # 血缘与请求身份：进程内持有，落库同时随 DomainResult 一起返回。
+    provenance: object | None = None
+    identity: object | None = None
 
 
 @dataclass

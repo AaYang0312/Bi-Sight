@@ -1,5 +1,9 @@
 import unittest
+from datetime import datetime
 from uuid import uuid4
+from zoneinfo import ZoneInfo
+
+BEIJING = ZoneInfo("Asia/Shanghai")
 
 from pydantic import ValidationError
 
@@ -414,6 +418,128 @@ class CoverageContractTests(unittest.TestCase):
                     validate_artifact_payload(self._payload(
                         {"status": "partial", "start": "2026-09-01", "end": "2026-09-08",
                          "gaps": [], "suggested_window": bad}))
+
+
+class ProvenanceContractTests(unittest.TestCase):
+    """Task 3：数据版本与请求身份必须可枚举、可复现、不可越权命中。"""
+
+    def _provenance(self, **overrides):
+        from bi_agent.runtime.artifacts import QueryProvenance
+
+        return QueryProvenance(**overrides)
+
+    def _fingerprint(self, *, shops=("S1",), provenance=None, request=None):
+        from bi_agent.runtime.artifacts import request_fingerprint
+
+        return request_fingerprint(
+            subject_id="subject-a", allowed_shop_ids=frozenset(shops),
+            normalized_request=(request if request is not None
+                                else {"start": "2026-09-01", "metrics": ["paid_amount"]}),
+            provenance=provenance or self._provenance())
+
+    def test_same_request_same_fingerprint(self):
+        self.assertEqual(self._fingerprint(), self._fingerprint())
+
+    def test_data_version_change_changes_the_fingerprint(self):
+        """回填推进 catalog_version / 截止时刻后，旧结果不允许再命中。
+
+        这正是 revision 不能兼任数据版本的原因：状态推进号不变而数据已经变了。
+        """
+        base = self._fingerprint()
+        changed_catalog = self._fingerprint(provenance=self._provenance(catalog_version=3))
+        changed_cutoff = self._fingerprint(provenance=self._provenance(
+            data_as_of=datetime(2026, 9, 9, tzinfo=BEIJING)))
+        changed_batches = self._fingerprint(provenance=self._provenance(
+            source_batches=("batch-1",)))
+
+        self.assertNotEqual(base, changed_catalog)
+        self.assertNotEqual(base, changed_cutoff)
+        self.assertNotEqual(base, changed_batches)
+
+    def test_authorization_scope_changes_the_fingerprint(self):
+        """同一条查询换一个授权范围就不是同一请求，命中即越权。"""
+        self.assertNotEqual(self._fingerprint(shops=("S1",)),
+                            self._fingerprint(shops=("S1", "S2")))
+
+    def test_metric_version_change_invalidates_previous_results(self):
+        from bi_agent.runtime.artifacts import METRIC_VERSION, QueryProvenance
+
+        self.assertNotEqual(self._fingerprint(), self._fingerprint(
+            provenance=QueryProvenance(metric_version="metrics/older")))
+        self.assertIsInstance(METRIC_VERSION, str)
+
+    def test_provenance_rejects_free_text_and_unknown_fields(self):
+        from pydantic import ValidationError
+
+        from bi_agent.runtime.artifacts import QueryProvenance
+
+        for bad in ({"metric_version": "metrics/1; DROP TABLE"},
+                   {"catalog_version": -1},
+                   {"source_batches": (" batch-padded ",)},
+                   {"sql_text": "SELECT 1"}):
+            with self.subTest(keys=tuple(bad)):
+                with self.assertRaises(ValidationError):
+                    QueryProvenance(**bad)
+
+    def test_identity_rejects_arbitrary_termination_text(self):
+        from pydantic import ValidationError
+
+        from bi_agent.runtime.artifacts import RequestIdentity
+        from uuid import uuid4
+
+        for bad in ("上游返回了很奇怪的一句话", "coverage_incomplete ", ""):
+            with self.subTest(value=bad[:12]):
+                with self.assertRaises(ValidationError):
+                    RequestIdentity(root_request_id=uuid4(),
+                                    request_fingerprint="0" * 64, attempt_no=1,
+                                    termination_reason=bad)
+
+    def test_domain_registry_refuses_unknown_domain_and_type(self):
+        from bi_agent.runtime.domain_registry import (
+            DomainUnknown, allows_artifact_type, spec_for)
+
+        self.assertTrue(allows_artifact_type("business_query", "metric_result"))
+        self.assertFalse(allows_artifact_type("business_query", "chart_spec"),
+                         "未登记给 business_query 的类型不能借既有领域写入")
+        self.assertFalse(allows_artifact_type("nope", "metric_result"))
+        with self.assertRaises(DomainUnknown):
+            spec_for("nope")
+
+    def test_chart_spec_must_point_at_a_dataset_version(self):
+        from pydantic import ValidationError
+
+        from bi_agent.runtime.artifacts import ArtifactEnvelope
+        from uuid import uuid4
+
+        chart = {"domain": "commerce_performance", "payload": {"kind": "bar"},
+                 "artifact_type": "chart_spec"}
+        with self.assertRaises(ValidationError):
+            ArtifactEnvelope(**chart)                        # 缺数据集引用
+        ArtifactEnvelope(**chart, dataset_ref=uuid4(), chart_version=1)
+        with self.assertRaises(ValidationError):
+            # 非图表类型不许带数据集引用；business_query 也不许产出图表。
+            ArtifactEnvelope(domain="commerce_performance", payload={},
+                             artifact_type="metric_result",
+                             dataset_ref=uuid4(), chart_version=1)
+        with self.assertRaises(ValidationError):
+            ArtifactEnvelope(domain="business_query", payload={},
+                             artifact_type="chart_spec",
+                             dataset_ref=uuid4(), chart_version=1)
+
+    def test_termination_reason_vocabulary_matches_database(self):
+        """SQL CHECK 与 Python 码表同源：两边各写一份必然漂移。"""
+        import pathlib
+        import re
+
+        from bi_agent.runtime.artifacts import TERMINATION_REASONS
+
+        sql = (pathlib.Path(__file__).parents[1] / "sql"
+               / "009_query_provenance.sql").read_text(encoding="utf-8")
+        block = sql.split("query_runs_termination_reason CHECK", 1)[1].split(");", 1)[0]
+        in_sql = set(re.findall(r"'([a-z_]+)'", block))
+
+        self.assertEqual(in_sql, set(TERMINATION_REASONS),
+                         "终止原因码表必须与 009 的 CHECK 一致")
 
 
 class MemoryQueryRunStoreTests(unittest.TestCase):

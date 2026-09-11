@@ -16,7 +16,7 @@
 
 ## 本地开发
 
-先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行 `001 → 002 → 003 → 004 → 005 → 007 → 008`，不可跳过运行追踪迁移。编号 006 己作废（不补旧序号迁移），数据就绪能力落在 008。005 / 007 / 008 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，指标查询会直接报列或表不存在。
+先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行 `001 → 002 → 003 → 004 → 005 → 007 → 008 → 009`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在。
 
 ```powershell
 psql -d bi_agent -f backend/sql/001_init.sql
@@ -26,6 +26,7 @@ psql -d bi_agent -f backend/sql/004_query_runtime.sql
 psql -d bi_agent -f backend/sql/005_product_dimension.sql
 psql -d bi_agent -f backend/sql/007_catalog_identity.sql
 psql -d bi_agent -f backend/sql/008_data_readiness.sql
+psql -d bi_agent -f backend/sql/009_query_provenance.sql
 ```
 
 分别启动后端和前端：

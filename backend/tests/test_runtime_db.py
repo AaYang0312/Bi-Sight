@@ -10,8 +10,12 @@ import os
 import traceback
 import unittest
 from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo
+
+BEIJING = ZoneInfo("Asia/Shanghai")
 
 import psycopg
 
@@ -430,6 +434,136 @@ class RuntimeDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
             "query_artifacts_run_idx", "query_runs_chat_started_idx",
             "query_runs_message_attempt_idx",
         ])
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ProvenanceDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
+    """Task 3 落库契约：版本、身份与诊断记录都走真实约束。"""
+
+    def _store(self):
+        from bi_agent.runtime.repository import PostgresQueryRunStore
+
+        return PostgresQueryRunStore(self.conn, forbidden_values={"S1", "ERP-P-9"})
+
+    def _run(self, store, chat_id, message_id, *, domain="business_query"):
+        from bi_agent.runtime.models import NewQueryRun
+
+        return store.create_run(NewQueryRun(
+            chat_id=chat_id, user_message_id=message_id, subject_id="u1",
+            tool_call_id="call_1", domain=domain, attempt_no=1,
+            normalized_request={"shop_refs": [S1_REF]}, state={"node": "received"},
+        ))
+
+    def test_provenance_and_identity_round_trip(self):
+        from bi_agent.runtime.artifacts import (
+            QueryProvenance, RequestIdentity, request_fingerprint)
+
+        chat_id, message_id = self._seed_user_message(subject="u1")
+        store = self._store()
+        run_id = self._run(store, chat_id, message_id)
+        provenance = QueryProvenance(catalog_version=4, source_batches=("b-2", "b-1"),
+                                     data_as_of=datetime(2026, 9, 9, tzinfo=BEIJING))
+        identity = RequestIdentity(
+            root_request_id=run_id, attempt_no=1,
+            request_fingerprint=request_fingerprint(
+                subject_id="u1", allowed_shop_ids=frozenset({"S1"}),
+                normalized_request={"metrics": ["paid_amount"]}, provenance=provenance))
+        store.record_provenance(run_id, provenance=provenance, identity=identity)
+
+        row = self.conn.execute(
+            """SELECT root_request_id, request_fingerprint, recovery_count
+               FROM bi.query_runs WHERE id=%s""", (run_id,)).fetchone()
+        self.assertEqual(row[0], run_id)
+        self.assertRegex(row[1], r"^[0-9a-f]{64}$")
+        self.assertEqual(row[2], 0)
+        stored = self.conn.execute(
+            """SELECT metric_version, catalog_version, source_batches, data_as_of
+               FROM bi.query_provenance WHERE run_id=%s""", (run_id,)).fetchone()
+        self.assertEqual(stored[1], 4)
+        self.assertEqual(sorted(stored[2]), ["b-1", "b-2"], "批次必须可按 run 反查")
+        self.assertEqual(stored[3], datetime(2026, 9, 9, tzinfo=BEIJING))
+
+    def test_same_fingerprint_not_reused_after_data_version_moves(self):
+        """回填推进目录版本后，同一问题不能命中旧运行。"""
+        from bi_agent.runtime.artifacts import QueryProvenance, request_fingerprint
+
+        chat_id, message_id = self._seed_user_message(subject="u1")
+        store = self._store()
+        run_id = self._run(store, chat_id, message_id)
+        request = {"metrics": ["paid_amount"], "start": "2026-09-01"}
+        old = request_fingerprint(subject_id="u1", allowed_shop_ids=frozenset({"S1"}),
+                                 normalized_request=request,
+                                 provenance=QueryProvenance(catalog_version=0))
+        store.record_provenance(run_id, provenance=QueryProvenance(catalog_version=0),
+                               identity=None)
+        self.conn.execute("UPDATE bi.query_runs SET request_fingerprint=%s, "
+                          "status='succeeded' WHERE id=%s", (old, run_id))
+
+        self.assertEqual(store.find_reusable_run(subject_id="u1", fingerprint=old), run_id)
+        moved = request_fingerprint(subject_id="u1", allowed_shop_ids=frozenset({"S1"}),
+                                    normalized_request=request,
+                                    provenance=QueryProvenance(catalog_version=7))
+        self.assertNotEqual(old, moved)
+        self.assertIsNone(store.find_reusable_run(subject_id="u1", fingerprint=moved),
+                          "目录版本一变就不许复用旧结果")
+
+    def test_other_subject_cannot_reuse_the_same_request(self):
+        from bi_agent.runtime.artifacts import QueryProvenance, request_fingerprint
+
+        chat_id, message_id = self._seed_user_message(subject="u1")
+        store = self._store()
+        run_id = self._run(store, chat_id, message_id)
+        fingerprint = request_fingerprint(
+            subject_id="u1", allowed_shop_ids=frozenset({"S1"}),
+            normalized_request={"metrics": ["paid_amount"]}, provenance=QueryProvenance())
+        self.conn.execute("UPDATE bi.query_runs SET request_fingerprint=%s, "
+                          "status='succeeded' WHERE id=%s", (fingerprint, run_id))
+
+        self.assertIsNone(store.find_reusable_run(subject_id="u2", fingerprint=fingerprint))
+
+    def test_database_still_refuses_unknown_domain_and_type(self):
+        """应用层白名单之外，数据库 CHECK 必须仍然独立拦得住。"""
+        chat_id, message_id = self._seed_user_message(subject="u1")
+        with self.assertRaises(Exception):
+            with self.conn.transaction():
+                self.conn.execute(
+                    """INSERT INTO bi.query_runs (id, chat_id, user_message_id, subject_id,
+                           tool_call_id, domain, attempt_no, normalized_request, state,
+                           status, revision)
+                       VALUES (%s, %s, %s, 'u1', 'c', 'not_a_domain', 1, '{}', '{}',
+                               'running', 0)""",
+                    (uuid4(), chat_id, message_id))
+
+    def test_termination_reason_rejects_free_text_and_accepts_code(self):
+        chat_id, message_id = self._seed_user_message(subject="u1")
+        store = self._store()
+        run_id = self._run(store, chat_id, message_id)
+        with self.assertRaises(Exception):
+            with self.conn.transaction():
+                self.conn.execute("UPDATE bi.query_runs SET termination_reason=%s WHERE id=%s",
+                                  ("上游返回了一句很奇怪的话", run_id))
+        self.conn.execute("UPDATE bi.query_runs SET termination_reason=%s WHERE id=%s",
+                          ("source_quality_failed", run_id))
+        self.assertEqual(self.conn.execute(
+            "SELECT termination_reason FROM bi.query_runs WHERE id=%s", (run_id,)).fetchone()[0],
+            "source_quality_failed")
+
+    def test_diagnostics_are_referenced_and_never_reach_reporting(self):
+        """诊断 SQL 只进受控记录：不得有 reporting 视图把它暴露出去。"""
+        chat_id, message_id = self._seed_user_message(subject="u1")
+        store = self._store()
+        run_id = self._run(store, chat_id, message_id)
+        diagnostic_id = store.record_diagnostic(
+            run_id, template_id="fixed_metric_query",
+            sql_text="SELECT sum(amount) FROM bi.order_payments WHERE shop_id = ANY(%s)",
+            parameters={"shop_ids": ["S1"]})
+        self.assertEqual(self.conn.execute(
+            "SELECT template_id FROM bi.query_diagnostics WHERE id=%s",
+            (diagnostic_id,)).fetchone()[0], "fixed_metric_query")
+        exposed = self.conn.execute(
+            "SELECT count(*) FROM information_schema.views WHERE table_schema='reporting' "
+            "AND view_definition LIKE '%query_diagnostics%'").fetchone()[0]
+        self.assertEqual(exposed, 0, "诊断记录不得经 reporting 暴露")
 
 
 @unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")

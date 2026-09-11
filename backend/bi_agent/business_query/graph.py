@@ -160,10 +160,51 @@ def _run_graph_nodes(
         _finish_early(runtime, store, _event_payload(runtime))
         return _execution_result(runtime)
 
+    # 血缘与请求身份：有规范化请求与结果之后才能算指纹。
+    _record_run_versions(runtime, store)
+
     persist_artifact(runtime, store)
     _persist_transition(runtime, store, _event_payload(runtime))
     finalize_run(runtime, store)
     return _execution_result(runtime)
+
+
+def _record_run_versions(runtime: BusinessQueryRuntime, store: object) -> None:
+    """把"哪一版口径、哪几批数据、哪个请求身份"落到运行记录上。
+
+    指纹包含授权范围与数据版本，所以回填推进数据之后，同一个问题不会命中旧结果。
+    记录失败不吞：宁可让这次运行显式失败，也不留下"看起来成功但没有血缘"的记录。
+    """
+    from bi_agent.runtime.artifacts import (
+        QueryProvenance,
+        RequestIdentity,
+        request_fingerprint,
+    )
+
+    state = runtime.state
+    context = runtime.context
+    provenance = QueryProvenance(
+        catalog_version=(runtime.catalog.catalog_version
+                         if runtime.catalog is not None else 0),
+        source_batches=(tuple(runtime.result.source_batches)
+                        if runtime.result is not None else ()),
+        data_as_of=runtime.result.data_as_of if runtime.result is not None else None,
+    )
+    identity = RequestIdentity(
+        # 一次业务查询就是一个根请求；恢复尝试沿用同一身份（Task 4 使用）。
+        root_request_id=state.run_id,
+        request_fingerprint=request_fingerprint(
+            subject_id=context.subject_id,
+            allowed_shop_ids=context.allowed_shop_ids,
+            normalized_request=dict(state.normalized_request),
+            provenance=provenance,
+        ),
+        attempt_no=context.attempt_no,
+    )
+    runtime.provenance = provenance
+    runtime.identity = identity
+    store.record_provenance(  # type: ignore[attr-defined]
+        state.run_id, provenance=provenance, identity=identity)
 
 
 def _finish_run_as_failed(
@@ -198,6 +239,7 @@ def _finish_run_as_failed(
                 },
                 payload={},
                 error_code="unavailable",
+                termination_reason="upstream_unavailable",
             ),
         )
 
@@ -286,6 +328,9 @@ def _execution_result(runtime: BusinessQueryRuntime) -> BusinessQueryExecution:
             data_as_of=state.data_as_of,
             coverage=state.coverage,
             error=state.error,
+            # v2：血缘与请求身份随结果一起返回，旧消费者不看这两个字段也不报错。
+            provenance=runtime.provenance,
+            identity=runtime.identity,
         ),
         tool_result=runtime.result if output_is_safe else None,
         session_filters=_session_filters(runtime) if output_is_safe else {},

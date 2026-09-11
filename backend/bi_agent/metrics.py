@@ -99,6 +99,8 @@ class ToolResult(BaseModel):
     data_as_of: datetime | None = None
     coverage: Coverage
     limitations: list[str] = Field(default_factory=list)
+    # 结果依赖了哪几批同步：血缘由门禁一次算出，运行层直接引用。
+    source_batches: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +517,7 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
         status="ok", data=rows,
         metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
         filters=filters, data_as_of=data_as_of, coverage=coverage,
-        limitations=limitations)
+        limitations=limitations, source_batches=assessment.source_batches)
 
 
 def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: datetime,

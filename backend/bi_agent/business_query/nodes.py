@@ -361,9 +361,46 @@ def finalize_run(runtime: BusinessQueryRuntime, store: object) -> BusinessQueryR
             state=runtime.state.model_dump(mode="json"),
             payload=_event_payload(runtime),
             error_code=runtime.state.error.code if runtime.state.error else None,
+            termination_reason=_termination_reason(runtime, status=status),
         ),
     )
     return runtime
+
+
+# 错误码/问题码 → 终止原因：取自 009 与 artifacts.TERMINATION_REASONS 同一词表。
+_TERMINATION_BY_CODE = {
+    "missing_parameters": "missing_parameters",
+    "invalid_parameters": "invalid_parameters",
+    "forbidden": "forbidden",
+    "coverage_incomplete": "coverage_incomplete",
+    "data_as_of_unknown": "data_as_of_unknown",
+    "source_quality_failed": "source_quality_failed",
+    "source_not_onboarded": "source_not_onboarded",
+    "revenue_not_attributed": "revenue_not_attributed",
+    "result_too_large": "result_too_large",
+    "comparison_coverage_incomplete": "comparison_coverage_incomplete",
+    "deadline_exceeded": "deadline_exceeded",
+    "query_timeout": "query_timeout",
+    "artifact_persistence_failed": "persistence_failed",
+    "result_contract_violation": "contract_violation",
+    "unavailable": "upstream_unavailable",
+}
+
+
+def _termination_reason(runtime: BusinessQueryRuntime, *, status) -> str:
+    if status is RunStatus.SUCCEEDED:
+        return "succeeded"
+    for limitation in _limitation_codes(list(runtime.state.limitations or [])):
+        if limitation in _TERMINATION_BY_CODE:
+            return _TERMINATION_BY_CODE[limitation]
+    if runtime.state.error is not None:
+        # 状态从 jsonb 读回时 code 是 str，新建时是枚举：两种都要能归因。
+        code = getattr(runtime.state.error.code, "value", runtime.state.error.code)
+        return _TERMINATION_BY_CODE.get(str(code), "contract_violation")
+    for problem in runtime.state.problems or []:
+        if problem in _TERMINATION_BY_CODE:
+            return _TERMINATION_BY_CODE[problem]
+    return "recovery_exhausted"
 
 
 def _classify(result: ToolResult) -> tuple[DomainStatus, ErrorEnvelope | None]:

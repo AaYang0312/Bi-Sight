@@ -61,6 +61,13 @@ class MemoryQueryRunStore:
             "normalized_request": deepcopy(record.normalized_request),
             "state": deepcopy(record.state),
             "error_code": None,
+            "root_request_id": (record.identity.root_request_id
+                               if record.identity else run_id),
+            "request_fingerprint": (record.identity.request_fingerprint
+                                    if record.identity else None),
+            "recovery_count": (record.identity.recovery_count if record.identity else 0),
+            "provenance": (record.provenance.model_copy(deep=True)
+                           if record.provenance is not None else None),
             "started_at": now,
             "updated_at": now,
             "completed_at": None,
@@ -117,6 +124,23 @@ class MemoryQueryRunStore:
         }
         return ArtifactRef(id=artifact_id, type=artifact.artifact_type)
 
+    def record_provenance(self, run_id: UUID, *, provenance, identity) -> None:
+        run = self._require_run(run_id)
+        if provenance is not None:
+            run["provenance"] = provenance.model_copy(deep=True)
+        if identity is not None:
+            run["root_request_id"] = identity.root_request_id
+            run["request_fingerprint"] = identity.request_fingerprint
+            run["recovery_count"] = identity.recovery_count
+
+    def find_reusable_run(self, *, subject_id: str, fingerprint: str):
+        for run in self.runs.values():
+            if (run.get("subject_id") == subject_id
+                    and run.get("request_fingerprint") == fingerprint
+                    and run.get("status") == RunStatus.SUCCEEDED.value):
+                return run["id"]
+        return None
+
     def finish(self, run_id: UUID, completion: RunCompletion) -> None:
         completion = self._revalidate_completion(completion)
         if completion.status is RunStatus.RUNNING:
@@ -132,6 +156,9 @@ class MemoryQueryRunStore:
             "revision": revision,
             "state": deepcopy(completion.state),
             "error_code": completion.error_code,
+            # 终止原因只在给出时覆盖，与 Postgres 的 coalesce 同语义。
+            "termination_reason": (completion.termination_reason
+                                   or run.get("termination_reason")),
             "updated_at": now,
             "completed_at": now,
         })

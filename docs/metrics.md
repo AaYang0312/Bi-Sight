@@ -160,3 +160,23 @@
 `docs/superpowers/research/2026-09-11-production-deploy-and-sync.md`）。
 所有店的 `aftersales_cohort` 仍为 `unknown`（同批 cohort 窗口不写批次凭证）；
 库存与上架价、跨渠道 SKU 映射属计划 Task 6 / 9 / 10，本表不因代码存在而改为“可用”。
+
+## 7. 版本化运行契约与复现等级
+
+`revision` 只表示状态推进，**不承担数据版本语义**（计划 Task 3）。哪一版口径、
+哪一版名称目录、哪几批来源数据支撑了这次结果，由 `bi.query_provenance` 显式记录：
+`template_id/template_version`、`metric_version`、`schema_version`、`catalog_version`、
+`mapping_version`、`policy_version`、`graph_version`、`source_batches`、`data_as_of`。
+
+请求身份落在 `bi.query_runs`：`root_request_id`、`request_fingerprint`、`recovery_count`、
+`termination_reason`。指纹 = 授权主体 + 授权店铺范围 + 规范化参数 + 上述版本的 sha256，
+因此**目录版本或数据截止一变，同一问题不会再命中旧结果**；换一个主体或授权范围也不会命中
+（否则等于越权读取他人结果）。
+
+需要留证的 SQL 与参数只进 `bi.query_diagnostics`，通过 `run_id` 引用；
+不写进模型消息，也不写进普通事件文本，且**不建 reporting 视图**。
+
+复现等级（如实声明）：本契约保证**已存 Artifact 可复现读取**——给定 run 与 artifact 引用，
+能取回当时发布的载荷及其版本与来源批次。在没有版本化事实库之前，
+**不承诺任意历史 SQL 重跑一致**：`source_batches` 只能指回当时的同步批次，
+不能重建当时的上游状态。

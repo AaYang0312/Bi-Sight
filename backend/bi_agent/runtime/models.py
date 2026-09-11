@@ -13,6 +13,7 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    field_validator,
     ValidationError,
     model_validator,
 )
@@ -30,6 +31,12 @@ from bi_agent.promotion import (
     PROMOTION_RESULT_COLUMNS,
 )
 
+from .artifacts import (
+    QueryProvenance,
+    RequestIdentity,
+    TERMINATION_REASONS,
+)
+from .domain_registry import ARTIFACT_TYPES, known_domain
 PersistenceNode = Literal[
     "received", "resolve_parameters", "validate_parameters", "authorize_scope",
     "execute_fixed_query", "classify_result", "persist_artifact", "finalize",
@@ -584,7 +591,14 @@ class ArtifactRef(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     id: UUID
-    type: Literal["metric_result"]
+    type: str
+
+    @field_validator("type")
+    @classmethod
+    def _known_type(cls, value: str) -> str:
+        if value not in ARTIFACT_TYPES:
+            raise ValueError("unknown_artifact_type")
+        return value
 
 
 class DomainArtifact(BaseModel):
@@ -604,6 +618,9 @@ class DomainResult(BaseModel):
     data_as_of: datetime | None = None
     coverage: Coverage | None = None
     error: ErrorEnvelope | None = None
+    # v2 追加：没有它们的结果仍合法（旧聊天空着读），有它们就必须合法。
+    provenance: QueryProvenance | None = None
+    identity: RequestIdentity | None = None
 
 
 class NewQueryRun(BaseModel):
@@ -613,10 +630,26 @@ class NewQueryRun(BaseModel):
     user_message_id: UUID
     subject_id: str
     tool_call_id: str
-    domain: Literal["business_query"] = "business_query"
+    domain: str = "business_query"
     attempt_no: int = Field(ge=1)
     normalized_request: NormalizedRequest = Field(default_factory=dict)
     state: PersistedState = Field(default_factory=dict)
+    provenance: QueryProvenance | None = None
+    identity: RequestIdentity | None = None
+
+    @field_validator("domain")
+    @classmethod
+    def _known_domain(cls, value: str) -> str:
+        # 未登记领域在写库之前就被拒，不依赖数据库 CHECK 兜底。
+        if not known_domain(value):
+            raise ValueError("unknown_domain")
+        return value
+
+    @model_validator(mode="after")
+    def _identity_matches_attempt(self) -> "NewQueryRun":
+        if self.identity is not None and self.identity.attempt_no != self.attempt_no:
+            raise ValueError("identity_attempt_mismatch")
+        return self
 
 
 class RunTransition(BaseModel):
@@ -659,10 +692,29 @@ def transition_normalized_request(
 class NewArtifact(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    artifact_type: Literal["metric_result"] = "metric_result"
+    artifact_type: str = "metric_result"
     payload: ArtifactPayload
     data_as_of: datetime | None = None
     coverage: CoveragePayload | None = None
+    # 只有 chart_spec 需要这两项；由数据库 CHECK 与本校验双重守住。
+    dataset_ref: UUID | None = None
+    chart_version: int | None = Field(default=None, ge=1)
+
+    @field_validator("artifact_type")
+    @classmethod
+    def _known_type(cls, value: str) -> str:
+        if value not in ARTIFACT_TYPES:
+            raise ValueError("unknown_artifact_type")
+        return value
+
+    @model_validator(mode="after")
+    def _chart_pairing(self) -> "NewArtifact":
+        if self.artifact_type == "chart_spec":
+            if self.dataset_ref is None or self.chart_version is None:
+                raise ValueError("chart_requires_dataset_version")
+        elif self.dataset_ref is not None or self.chart_version is not None:
+            raise ValueError("unexpected_dataset_reference")
+        return self
 
 
 class RunCompletion(BaseModel):
@@ -673,6 +725,15 @@ class RunCompletion(BaseModel):
     status: RunStatus
     state: PersistedState
     payload: EventPayload = Field(default_factory=dict)
+    termination_reason: str | None = None
+
+    @field_validator("termination_reason")
+    @classmethod
+    def _known_reason(cls, value: str | None) -> str | None:
+        # 码表与 009 的 SQL CHECK 同源，任意错误文本不许进运行记录。
+        if value is not None and value not in TERMINATION_REASONS:
+            raise ValueError("unknown_termination_reason")
+        return value
     error_code: ErrorCode | None = None
 
 

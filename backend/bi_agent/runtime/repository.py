@@ -49,9 +49,10 @@ class PostgresQueryRunStore:
             row = self.conn.execute(
                 """INSERT INTO bi.query_runs (
                        id, chat_id, user_message_id, subject_id, tool_call_id, domain,
-                       attempt_no, normalized_request, state
+                       attempt_no, normalized_request, state,
+                       root_request_id, request_fingerprint, recovery_count
                    )
-                   SELECT %s, c.id, m.id, c.subject_id, %s, %s, %s, %s, %s
+                   SELECT %s, c.id, m.id, c.subject_id, %s, %s, %s, %s, %s, %s, %s, %s
                    FROM bi.app_messages AS m
                    JOIN bi.app_chats AS c ON c.id = m.chat_id
                    WHERE m.id = %s AND c.id = %s AND m.role = 'user' AND c.subject_id = %s
@@ -63,6 +64,10 @@ class PostgresQueryRunStore:
                     record.attempt_no,
                     Jsonb(record.normalized_request),
                     Jsonb(record.state),
+                    # 身份缺失时退化成"本次运行就是根请求"，旧写入路径不受影响。
+                    (record.identity.root_request_id if record.identity else run_id),
+                    (record.identity.request_fingerprint if record.identity else None),
+                    (record.identity.recovery_count if record.identity else 0),
                     record.user_message_id,
                     record.chat_id,
                     record.subject_id,
@@ -72,7 +77,71 @@ class PostgresQueryRunStore:
             raise ValueError("duplicate_query_run") from error
         if row is None:
             raise RunContextNotFound()
+        if record.provenance is not None:
+            self._insert_provenance(row[0], record.provenance)
         return row[0]
+
+    def _insert_provenance(self, run_id: UUID, provenance) -> None:
+        """血缘单独一行：版本与来源批次不混进状态 jsonb，也不进模型载荷。"""
+        self.conn.execute(
+            """INSERT INTO bi.query_provenance (
+                   run_id, template_id, template_version, metric_version, schema_version,
+                   catalog_version, mapping_version, policy_version, graph_version,
+                   source_batches, data_as_of
+               ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (run_id) DO UPDATE SET
+                   template_id = EXCLUDED.template_id,
+                   template_version = EXCLUDED.template_version,
+                   metric_version = EXCLUDED.metric_version,
+                   schema_version = EXCLUDED.schema_version,
+                   catalog_version = EXCLUDED.catalog_version,
+                   mapping_version = EXCLUDED.mapping_version,
+                   policy_version = EXCLUDED.policy_version,
+                   graph_version = EXCLUDED.graph_version,
+                   source_batches = EXCLUDED.source_batches,
+                   data_as_of = EXCLUDED.data_as_of""",
+            (run_id, provenance.template_id, provenance.template_version,
+             provenance.metric_version, provenance.schema_version,
+             provenance.catalog_version, provenance.mapping_version,
+             provenance.policy_version, provenance.graph_version,
+             list(provenance.source_batches), provenance.data_as_of),
+        )
+
+    def record_diagnostic(self, run_id: UUID, *, template_id: str, sql_text: str,
+                          parameters: dict[str, object]) -> UUID:
+        """受控诊断记录：SQL 与参数只进这里，绝不写进模型消息或事件文本。"""
+        diagnostic_id = uuid4()
+        self.conn.execute(
+            "INSERT INTO bi.query_diagnostics (id, run_id, template_id, sql_text, parameters) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (diagnostic_id, run_id, template_id, sql_text, Jsonb(parameters)),
+        )
+        return diagnostic_id
+
+    def record_provenance(self, run_id: UUID, *, provenance, identity) -> None:
+        """请求解析完成后再落血缘与身份：创建时还没有规范化请求可指纹化。"""
+        if provenance is not None:
+            self._insert_provenance(run_id, provenance)
+        if identity is not None:
+            self.conn.execute(
+                """UPDATE bi.query_runs
+                   SET root_request_id = %s, request_fingerprint = %s,
+                       recovery_count = %s
+                   WHERE id = %s""",
+                (identity.root_request_id, identity.request_fingerprint,
+                 identity.recovery_count, run_id),
+            )
+
+    def find_reusable_run(self, *, subject_id: str, fingerprint: str) -> UUID | None:
+        """只有同一指纹的成功运行才可复用：指纹已含授权范围与数据版本。"""
+        row = self.conn.execute(
+            """SELECT id FROM bi.query_runs
+               WHERE subject_id = %s AND request_fingerprint = %s
+                 AND status = 'succeeded'
+               ORDER BY started_at DESC LIMIT 1""",
+            (subject_id, fingerprint),
+        ).fetchone()
+        return row[0] if row is not None else None
 
     def transition(self, run_id: UUID, transition: RunTransition) -> None:
         transition = self._revalidate_transition(transition)
@@ -146,7 +215,8 @@ class PostgresQueryRunStore:
             row = self.conn.execute(
                 """UPDATE bi.query_runs
                    SET status = %s, current_node = %s, revision = revision + 1,
-                       state = %s, error_code = %s, updated_at = now(), completed_at = now()
+                       state = %s, error_code = %s, updated_at = now(), completed_at = now(),
+                       termination_reason = coalesce(%s, termination_reason)
                    WHERE id = %s AND revision = %s
                    RETURNING revision""",
                 (
@@ -154,6 +224,7 @@ class PostgresQueryRunStore:
                     completion.node,
                     Jsonb(completion.state),
                     completion.error_code,
+                    completion.termination_reason,
                     run_id,
                     completion.expected_revision,
                 ),
