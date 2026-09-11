@@ -53,12 +53,16 @@ def sign(params: Mapping[str, str], secret: str) -> str:
     return hmac.new(secret.encode(), canonical.encode(), hashlib.sha256).hexdigest().upper()
 
 
-def parse_page(payload: dict[str, object], *, allow_omitted_list: bool = False) -> Page:
+def parse_page(payload: dict[str, object], *, allow_omitted_list: bool = False,
+               list_key: str = "list") -> Page:
     """校验分页响应形状；省略列表只是接口差异，永远不构成完成证据。
 
     verified_empty 只认正向完成证据（total=0 或 hasNext=false）。“没有 list 也没有
     任何完成证据”是**不可信空**：网关HTML页、错误信封、字段改名都可能长成这个样子，
     把它们当“确定没记录”发布，整窗口会被标成 covered（C-6）。
+
+    list_key 只改结果列表的键名，不改完成证据规则：交易/售后/店铺三个接口实测返回
+    `list`，而 `item.list.query` 实测返回 `items`（2026-09-11 只读核验）。
 
     allow_omitted_list 仅给实测确实会省略 list 的接口预留（见
     docs/superpowers/research/2026-09-06-kuaimai-data-recheck.json 中
@@ -70,7 +74,7 @@ def parse_page(payload: dict[str, object], *, allow_omitted_list: bool = False) 
     """
     if payload.get("success") is False:
         raise KuaimaiError("upstream")
-    rows = payload.get("list")
+    rows = payload.get(list_key)
     total = payload.get("total")
     # total 只有是整数时才可参与“总数为0”判断（字符串 "0" 不算，bool 不算 int）
     total_count = (total if isinstance(total, int) and not isinstance(total, bool)

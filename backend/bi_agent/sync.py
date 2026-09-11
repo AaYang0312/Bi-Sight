@@ -30,6 +30,7 @@ BEIJING = ZoneInfo("Asia/Shanghai")
 
 ORDER_SOURCE = "erp.trade.list.query"
 AFTERSALE_SOURCE = "erp.aftersale.list.query"
+ITEM_SOURCE = "item.list.query"
 
 # 单实例同步锁；锁放在整个CLI运行入口，sync_window内部仅负责单窗口事务
 LOCK_ID = 7319041
@@ -43,6 +44,7 @@ MAX_QUERY_DAYS = 366
 _REQUIRED_SYNC_COLUMNS = {
     "orders": frozenset({"unified_status", "system_status"}),
     "order_items": frozenset({"source_type"}),
+    "products": frozenset({"title", "source_modified_at"}),
 }
 
 
@@ -1137,6 +1139,103 @@ def sync_shops(conn, client: KuaimaiClient) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 商品档案同步：把订单行里的 itemSysId 对应到可读名称
+# ---------------------------------------------------------------------------
+
+# 版本守卫 + 变更判定：较旧的档案修改时间不覆盖较新的，内容全同则不写行。
+# synced_at 不参与比较，否则每次都算“有变更”。
+_PRODUCT_UPSERT_SQL = """
+INSERT INTO bi.products(product_id, title, outer_id, item_type, category, active,
+                        purchase_price, normalization_status, source_modified_at, synced_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+ON CONFLICT (product_id) DO UPDATE SET
+    title = EXCLUDED.title, outer_id = EXCLUDED.outer_id, item_type = EXCLUDED.item_type,
+    category = EXCLUDED.category, active = EXCLUDED.active,
+    purchase_price = EXCLUDED.purchase_price,
+    normalization_status = EXCLUDED.normalization_status,
+    source_modified_at = EXCLUDED.source_modified_at, synced_at = EXCLUDED.synced_at
+WHERE (bi.products.source_modified_at IS NULL
+       OR EXCLUDED.source_modified_at IS NULL
+       OR bi.products.source_modified_at <= EXCLUDED.source_modified_at)
+  AND ROW(bi.products.title, bi.products.outer_id, bi.products.item_type,
+          bi.products.category, bi.products.active, bi.products.purchase_price,
+          bi.products.normalization_status, bi.products.source_modified_at)
+      IS DISTINCT FROM
+      ROW(EXCLUDED.title, EXCLUDED.outer_id, EXCLUDED.item_type,
+          EXCLUDED.category, EXCLUDED.active, EXCLUDED.purchase_price,
+          EXCLUDED.normalization_status, EXCLUDED.source_modified_at)
+RETURNING bi.products.product_id
+"""
+
+
+def normalise_item_master(raw: dict[str, Any]) -> dict[str, Any]:
+    """白名单规范化一条商品档案；无 sysItemId 不猜主键，无名称不拼展示名。"""
+    product_id = (str(raw.get("sysItemId") or "").strip() or None)
+    title = str(raw.get("title") or "").strip()
+    status = "normal"
+    if not product_id:
+        status = "invalid"
+    elif not title:
+        status = "needs_review"
+    item_type = raw.get("type")
+    return {
+        "product_id": product_id,
+        "title": title,
+        "outer_id": (str(raw.get("outerId") or "").strip() or None),
+        "item_type": (str(item_type).strip()
+                      if item_type not in (None, "") else None),
+        "category": (str(raw.get("itemCategoryNames") or "").strip() or None),
+        "active": _source_int(raw.get("activeStatus")) == 1,
+        "purchase_price": to_decimal(raw.get("purchasePrice")),
+        "normalization_status": status,
+        "source_modified_at": parse_timestamp(raw.get("modified")),
+    }
+
+
+def sync_products(conn, client: KuaimaiClient) -> dict[str, int]:
+    """全量翻页拉商品档案（实测 435 条/3 页）。
+
+    接口实测忽略 sysItemIds/sysItemId 过滤参数（带与不带都返回同一 total），
+    所以只能整表取回后在 reporting 层 JOIN，不能按成交商品点查。
+    完成证据只认 total：不足一页却没拉满视为上游不一致，不发布成功。
+    """
+    stats = {"fetched": 0, "upserted": 0, "skipped": 0, "invalid": 0}
+    page_no = 1
+    total: int | None = None
+    with conn.transaction():
+        while True:
+            page = parse_page(client.call(ITEM_SOURCE, {
+                "pageNo": str(page_no), "pageSize": str(PAGE_SIZE)}), list_key="items")
+            if page.total is None:
+                raise KuaimaiError("invalid_response")
+            if total is None:
+                total = page.total
+            elif page.total != total:
+                raise KuaimaiError("upstream")
+            stats["fetched"] += len(page.rows)
+            for raw in page.rows:
+                item = normalise_item_master(raw)
+                if item["normalization_status"] == "invalid":
+                    stats["invalid"] += 1
+                    continue
+                written = conn.execute(
+                    _PRODUCT_UPSERT_SQL,
+                    (item["product_id"], item["title"], item["outer_id"],
+                     item["item_type"], item["category"], item["active"],
+                     item["purchase_price"], item["normalization_status"],
+                     item["source_modified_at"]),
+                ).fetchone()
+                stats["upserted" if written else "skipped"] += 1
+            assert total is not None
+            if stats["fetched"] >= total:
+                break
+            if len(page.rows) < PAGE_SIZE:
+                raise KuaimaiError("invalid_response")
+            page_no += 1
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1395,6 +1494,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="bi_agent.sync")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("shops")
+    sub.add_parser("products", help="全量拉商品档案，为订单行补可读名称")
     probe = sub.add_parser("probe")
     probe.add_argument("--start", required=True, help="含，YYYY-MM-DD（北京时间）")
     probe.add_argument("--end", required=True, help="排他，YYYY-MM-DD（北京时间）")
@@ -1428,6 +1528,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "shops":
                 count = sync_shops(conn, client)
                 print(json.dumps({"action": "shops", "updated": count}))
+            elif args.command == "products":
+                stats = sync_products(conn, client)
+                print(json.dumps({"action": "products", "stats": stats}))
             elif args.command == "probe":
                 shop_id = _require_single_shop(settings)
                 summary = _probe(client, shop_id=shop_id,

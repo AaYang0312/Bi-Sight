@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import psycopg
 
+from .dbfixtures import connect_test_db
 from bi_agent.runtime import PostgresQueryRunStore
 from bi_agent.runtime.models import (
     ArtifactPersistenceError,
@@ -223,15 +224,7 @@ class RuntimeStoreValidationTests(unittest.TestCase):
 
 class RuntimeDatabaseFixture:
     def setUp(self):
-        self.conn = psycopg.connect(os.environ["BI_TEST_ADMIN_DSN"])
-        if not self.conn.info.dbname.endswith("_test"):
-            self.fail(f"测试必须连接 *_test 数据库，实际 {self.conn.info.dbname}")
-        if (self.conn.info.host or "") not in LOCAL_HOSTS:
-            self.fail(f"测试必须连接本地测试实例，实际 {self.conn.info.host}")
-
-    def tearDown(self):
-        self.conn.rollback()
-        self.conn.close()
+        self.conn = connect_test_db(self)
 
     def _seed_user_message(self, subject: str = "u1"):
         chat_id = uuid4()

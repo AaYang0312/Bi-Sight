@@ -15,6 +15,10 @@ from zoneinfo import ZoneInfo
 import httpx
 import psycopg
 
+from .dbfixtures import connect_test_db
+
+from .dbfixtures import connect_test_db
+
 BEIJING = ZoneInfo("Asia/Shanghai")
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
@@ -27,15 +31,8 @@ def _ms(moment: datetime) -> int:
 @unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
 class DatabaseTests(unittest.TestCase):
     def setUp(self):
-        self.conn = psycopg.connect(os.environ["BI_TEST_ADMIN_DSN"])
-        if not self.conn.info.dbname.endswith("_test"):
-            self.fail(f"测试必须连接 *_test 数据库，实际 {self.conn.info.dbname}")
-        if (self.conn.info.host or "") not in LOCAL_HOSTS:
-            self.fail(f"测试必须连接本地测试实例，实际 {self.conn.info.host}")
-
-    def tearDown(self):
-        self.conn.rollback()
-        self.conn.close()
+        # 外层事务必须在这儿开：被测同步函数自己开 transaction()，否则它们会提交假数据。
+        self.conn = connect_test_db(self)
 
     def _seed_shop(self, shop_id: str = "S1"):
         self.conn.execute(
@@ -136,6 +133,116 @@ class DatabaseTests(unittest.TestCase):
             "SELECT shop_id, enabled FROM bi.shops "
             "WHERE shop_id IN ('S_DISABLED', 'S_ACTIVE') ORDER BY shop_id").fetchall()
         self.assertEqual(rows, [("S_ACTIVE", True), ("S_DISABLED", False)])
+
+    # -- 测试事务边界 ---------------------------------------------------
+
+    def test_sync_helper_writes_are_not_committed(self):
+        """sync_shops/sync_products 内部的 conn.transaction() 不得提交。
+
+        假档案带着未来的 source_modified_at 一旦落库，版本守卫会永久拒收接口回来的
+        真档案，测试库就再也刷不成真数据。
+        """
+        from bi_agent.sync import sync_shops
+
+        class Client:
+            def call(self, method, parameters):
+                return {"success": True, "total": 1, "hasNext": False,
+                        "list": [{"userId": "S_TX_GUARD", "state": 4, "active": 1}]}
+
+        dsn = os.environ["BI_TEST_ADMIN_DSN"]
+        try:
+            self.assertEqual(sync_shops(self.conn, Client()), 1)
+            with psycopg.connect(dsn) as other:
+                visible = other.execute(
+                    "SELECT count(*) FROM bi.shops WHERE shop_id='S_TX_GUARD'").fetchone()[0]
+            self.assertEqual(visible, 0, "同步写入逃出了测试事务，已提交进共享测试库")
+        finally:
+            with psycopg.connect(dsn, autocommit=True) as cleaner:
+                cleaner.execute("DELETE FROM bi.shops WHERE shop_id='S_TX_GUARD'")
+
+    # -- 商品档案维表 -------------------------------------------------------
+
+    @staticmethod
+    def _goods_client(rows, *, total):
+        class Client:
+            def call(self, method, parameters):
+                assert method == "item.list.query", method
+                assert parameters["pageSize"] == "200", parameters
+                return {"success": True, "total": total, "items": rows}
+        return Client()
+
+    # 合成商品号：不会与实测 435 条真档案相撞（真号是 15~16 位）。
+    GOODS_ID = "900000000000000001"
+
+    def _goods_row(self, **overrides):
+        row = {"sysItemId": self.GOODS_ID, "title": "接头-元发", "outerId": "JT-01",
+               "type": 0, "activeStatus": 1, "itemCategoryNames": "气动配件",
+               "purchasePrice": 3.5, "modified": 1788166354000}
+        row.update(overrides)
+        return row
+
+    def _product(self, columns="*"):
+        return self.conn.execute(
+            f"SELECT {columns} FROM bi.products WHERE product_id=%s",
+            (self.GOODS_ID,)).fetchone()
+
+    def test_product_sync_writes_archive_and_reports_the_change_kind(self):
+        from bi_agent.sync import sync_products
+
+        archive = [self._goods_row()]
+        stats = sync_products(self.conn, self._goods_client(archive, total=1))
+        self.assertEqual((stats["fetched"], stats["upserted"]), (1, 1))
+        row = self._product("product_id, title, outer_id, item_type, category, active, "
+                            "purchase_price, source_modified_at")
+        self.assertEqual(row[0], self.GOODS_ID)
+        self.assertEqual(row[1:6], ("接头-元发", "JT-01", "0", "气动配件", True))
+        self.assertEqual(row[6], Decimal("3.5"))
+
+        # 同一版本再跑一次：不写行，计入 skipped
+        again = sync_products(self.conn, self._goods_client(archive, total=1))
+        self.assertEqual((again["upserted"], again["skipped"]), (0, 1))
+
+    def test_product_sync_keeps_the_newer_archive_version(self):
+        """较旧的 source_modified_at 不得覆盖较新的档案（与 replay 同规则）。"""
+        from bi_agent.sync import sync_products
+
+        sync_products(self.conn, self._goods_client(
+            [self._goods_row(title="接头-元发(新)")], total=1))
+        sync_products(self.conn, self._goods_client(
+            [self._goods_row(title="接头-元发(旧)", modified=1700000000000)], total=1))
+        self.assertEqual(self._product("title")[0], "接头-元发(新)")
+        self.assertEqual(self._product("source_modified_at")[0],
+                         datetime.fromtimestamp(1788166354, tz=BEIJING))
+
+    def test_product_daily_view_gives_the_archive_name_without_the_cost(self):
+        """成本价只能留在 bi.products，不能随商品名进任何 reporting 视图。"""
+        columns = [row[0] for row in self.conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='reporting' AND table_name='v_product_daily' "
+            "ORDER BY ordinal_position").fetchall()]
+        self.assertEqual(columns, [
+            "shop_id", "day", "product_id", "quantity", "gift_quantity",
+            "product_paid_amount", "allocation_verified", "line_kind",
+            "product_name",
+        ])
+        exposed = self.conn.execute(
+            "SELECT table_name, view_definition FROM information_schema.views "
+            "WHERE table_schema='reporting'").fetchall()
+        self.assertTrue(exposed)
+        for name, definition in exposed:
+            self.assertNotIn("purchase_price", definition, f"{name} 暴露了成本列")
+
+    def test_product_dimension_migration_is_forward_only_and_idempotent(self):
+        from pathlib import Path
+
+        migration = Path(__file__).parents[1] / "sql" / "005_product_dimension.sql"
+        self.assertTrue(migration.exists(), "缺少 005 商品维表迁移")
+        sql = migration.read_text(encoding="utf-8")
+        self.conn.execute(sql)
+        self.conn.execute(sql)   # 可重复执行
+        self.assertEqual(
+            self.conn.execute("SELECT count(*) FROM information_schema.tables "
+                              "WHERE table_schema='bi' AND table_name='products'").fetchone()[0], 1)
 
     # -- 交易规范化与支付重建 -------------------------------------------------
 
@@ -1138,15 +1245,9 @@ class MetricsTests(unittest.TestCase):
     def setUp(self):
         if not os.getenv("BI_TEST_ADMIN_DSN"):
             self.skipTest("未配置独立测试数据库")
-        self.conn = psycopg.connect(os.environ["BI_TEST_ADMIN_DSN"])
-        if not self.conn.info.dbname.endswith("_test"):
-            self.fail(f"测试必须连接 *_test 数据库，实际 {self.conn.info.dbname}")
+        self.conn = connect_test_db(self)
         seed_business_case(self.conn)
         self.conn.execute("SET LOCAL ROLE bi_reader")
-
-    def tearDown(self):
-        self.conn.rollback()
-        self.conn.close()
 
     def _query(self, **overrides):
         import time as time_module

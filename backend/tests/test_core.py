@@ -352,9 +352,16 @@ class SyncSchemaTests(unittest.TestCase):
         assert_sync_schema(Connection([
             ("orders", "unified_status"), ("orders", "system_status"),
             ("order_items", "source_type"),
+            ("products", "title"), ("products", "source_modified_at"),
         ]))
         with self.assertRaisesRegex(KuaimaiError, "schema_outdated"):
             assert_sync_schema(Connection([("orders", "unified_status")]))
+        # 005 未执行时同步必须整体拒写，不能让商品名默默一直缺失。
+        with self.assertRaisesRegex(KuaimaiError, "schema_outdated"):
+            assert_sync_schema(Connection([
+                ("orders", "unified_status"), ("orders", "system_status"),
+                ("order_items", "source_type"),
+            ]))
 
 
 class SyncBackfillTests(unittest.TestCase):
@@ -442,6 +449,76 @@ class SyncBackfillTests(unittest.TestCase):
         self.assertIn("now", parameters)
 
 
+class ProductMasterNormalisationTests(unittest.TestCase):
+    """商品档案只读入库：名称用于展示，不能臆造；成本只当内部参考列。"""
+
+    TZ = ZoneInfo("Asia/Shanghai")
+
+    @staticmethod
+    def _raw(**overrides):
+        raw = {"sysItemId": 548597548708352, "title": "接头-元发", "outerId": "JT-01",
+               "type": 0, "activeStatus": 1, "itemCategoryNames": "气动配件",
+               "purchasePrice": 3.5, "modified": 1788166354000}
+        raw.update(overrides)
+        return raw
+
+    def test_documented_fields_are_mapped_by_explicit_name(self):
+        from bi_agent.sync import normalise_item_master
+
+        item = normalise_item_master(self._raw())
+
+        self.assertEqual(item["normalization_status"], "normal")
+        self.assertEqual(item["product_id"], "548597548708352")
+        self.assertEqual(item["title"], "接头-元发")
+        self.assertEqual(item["outer_id"], "JT-01")
+        self.assertEqual(item["item_type"], "0")
+        self.assertEqual(item["category"], "气动配件")
+        self.assertTrue(item["active"])
+        self.assertEqual(item["purchase_price"], Decimal("3.5"))
+        self.assertEqual(item["source_modified_at"].tzinfo, self.TZ)
+
+    def test_missing_sys_item_id_is_invalid_and_never_guessed(self):
+        from bi_agent.sync import normalise_item_master
+
+        for raw in ({"title": "无号商品"}, self._raw(sysItemId=None), self._raw(sysItemId=" ")):
+            with self.subTest(raw=raw):
+                item = normalise_item_master(raw)
+                self.assertEqual(item["normalization_status"], "invalid")
+                self.assertIsNone(item["product_id"])
+
+    def test_blank_title_stays_blank_but_needs_review(self):
+        """档案没名字就是没名字：不得拿 outerId 拼一个看起来像名字的值。"""
+        from bi_agent.sync import normalise_item_master
+
+        item = normalise_item_master(self._raw(title="  "))
+
+        self.assertEqual(item["title"], "")
+        self.assertEqual(item["normalization_status"], "needs_review")
+
+    def test_disabled_archive_is_marked_inactive(self):
+        from bi_agent.sync import normalise_item_master
+
+        for raw in (self._raw(activeStatus=0), self._raw(activeStatus=None)):
+            with self.subTest(raw=raw):
+                self.assertFalse(normalise_item_master(raw)["active"])
+
+    def test_non_numeric_cost_becomes_null_instead_of_zero(self):
+        """成本缺失不能当 0 入库，否则后续毛利会把无成本当成零成本。"""
+        from bi_agent.sync import normalise_item_master
+
+        for raw in (self._raw(purchasePrice=""), self._raw(purchasePrice="abc"),
+                    self._raw(purchasePrice=True), self._raw(purchasePrice=None)):
+            with self.subTest(raw=raw):
+                self.assertIsNone(normalise_item_master(raw)["purchase_price"])
+
+    def test_unparseable_modified_is_null_not_now(self):
+        from bi_agent.sync import normalise_item_master
+
+        item = normalise_item_master(self._raw(modified="不是时间"))
+
+        self.assertIsNone(item["source_modified_at"])
+
+
 class PageCompletionEvidenceTests(unittest.TestCase):
     """C-6：“没拿到 list”不等于“确定没有记录”；covered 只能由正向完成证据支撑。"""
 
@@ -495,6 +572,42 @@ class PageCompletionEvidenceTests(unittest.TestCase):
 
         with self.assertRaises(KuaimaiError):
             parse_page({"success": True, "total": "0"})
+
+    def test_goods_envelope_rows_are_read_from_the_items_key(self):
+        """实测 `item.list.query` 返回 `{"items": [...], "total": 435}`，不是 `list`。"""
+        from bi_agent.kuaimai import parse_page
+
+        page = parse_page(
+            {"success": True, "total": 2,
+             "items": [{"sysItemId": 548597548708352}, {"sysItemId": 548597548708353}]},
+            list_key="items")
+
+        self.assertEqual(len(page.rows), 2)
+        self.assertEqual(page.total, 2)
+        self.assertFalse(page.verified_empty)
+
+    def test_goods_envelope_empty_list_with_total_zero_is_verified(self):
+        from bi_agent.kuaimai import parse_page
+
+        page = parse_page({"success": True, "total": 0, "items": []}, list_key="items")
+
+        self.assertEqual(page.rows, [])
+        self.assertTrue(page.verified_empty)
+
+    def test_alternate_list_key_never_weakens_completion_evidence(self):
+        """换分页键不得把「有总数却没列表」读成空页。"""
+        from bi_agent.kuaimai import KuaimaiError, parse_page
+
+        with self.assertRaises(KuaimaiError) as ctx:
+            parse_page({"success": True, "total": 3}, list_key="items")
+        self.assertEqual(ctx.exception.code, "invalid_response")
+
+    def test_default_list_key_stays_list_for_the_trade_channel(self):
+        from bi_agent.kuaimai import parse_page
+
+        page = parse_page({"success": True, "total": 1, "list": [{"sid": "E1"}]})
+
+        self.assertEqual(page.rows, [{"sid": "E1"}])
 
     def test_no_sync_call_site_opens_the_allowance(self):
         """同步链在用的三个接口都实测返回 list → 不得再传 allow_omitted_list=True。"""
