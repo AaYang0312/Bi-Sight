@@ -9,6 +9,7 @@
 3. **口径限制（必须向使用者声明）**：淘系订单是 **ERP 销售出库口径，不是平台账单口径**。收件人姓名/手机/地址/省市区/街道/邮编、`buyerNick`、`buyerMessage`、发票、`taobaoId`、`platformPaymentAmount`、`ptConsignTime` 均不返回或为敏感字段；出库响应携带的 `shopName/sellerNick/openUid/mobileTail` **一律不入库**。实付、成本、毛利、佣金、邮费、状态、商品行齐全，可支撑经营分析；不宣称财务对账完成。
 4. 平台→源路由为模块常量 `ORDER_SOURCE_BY_PLATFORM = {"tb": OUTSTOCK_SOURCE, "tm": OUTSTOCK_SOURCE}`（`_shop_order_source` 查 `bi.shops.platform` 解析，缺档案直接报错防假覆盖），其余平台（含未知）回退 `erp.trade.list.query`；同步前先跑 `sync shops`。
 5. **重要口径后果（需口径负责人决策，§1.3/§5.1）**：出库通道会返回 `status=TRADE_CLOSED` 的已付款单，按任务书判定为 `active=false` 后，这批单（608 张、单头实付 ¥89,669.39）的支付事实退化为 orphan、664 笔 ¥91,290.42 成功退款无法回溯原单，淘系“退款匹配率 8.1%”对抖音同指标 95.8%。本轮未改判（属任务书规定的口径），但**淘系净支付/GMV 目现阶段不可与抖音直接相加比较**；同时它令 619 个商业单的售后补拉集合永不收敛（§1.5）。
+6. **但“可用”尚未达成**：metrics 层的 `_ENTITY_SOURCES` 仍只登记 `erp.trade.list.query`，实测 12 家淘系店任何指标查询都返回 `missing_data`，与抖音店混合查询时还会连带拖死抖音部分（§1.6）。同步侧接入已完成，查询侧多源登记是下一步的第一优先。
 
 ## 1. 实测结果（测试库 bi_agent_test@127.0.0.1:54329）
 
@@ -66,7 +67,7 @@
 | 成功+canonical 退款匹配率 | **59/729 = 8.1%**（未匹配 670 条，¥98,711.51） | 881/920 = **95.8%** |
 | 未匹配退款归因 | 664 条（¥91,290.42）原单存在但只有不活跃出库单；6 条（¥7,421.09）窗口内查无出库单 | — |
 
-口径后果：对"付款后退款成功→交易自动关闭"这批单，现状是**支付事实被排除、退款事实照常计入** `v_shop_daily.refund_amount`，于是 `cash_difference = 净支付 − 退款` 对该批订单做了单向扣减（少计 ¥89,669.39 支付、多扣 ¥91,290.42 退款）。抖音通道因不产生不活跃行，历史上从未暴露此问题（09-06 复核亦未覆盖）。
+口径后果（分三层，已实测，详见 §1.6）：对"付款后退款成功→交易自动关闭"这批单，现状是**支付事实被排除、退款事实照常计入** `reporting.v_shop_daily.refund_amount`（该 CTE 只过 `platform_success AND refund_canonical`，**不要求 `matched`**），于是 `cash_difference = 净支付 − 退款` 对该批订单单向扣减（少计 ¥89,669.39 支付、多计 ¥91,290.42 退款）。metrics 层则不会给出这个错数，而是直接拒答（未匹配退款硬门禁）。抖音通道因不产生不活跃行，历史上从未暴露此问题（09-06 复核亦未覆盖）。
 
 同时：`verified` 比例 88.7%（淘系）对 92.9%（抖音）的差距中，约 10 个百分点由上述 621 条 orphan 造成；剩余为 348 条 `undetermined`——实测 162 张活跃出库单的行级 `raw_paid_amount` 合计**大于**单头 `raw_pay_amount`（无一例小于），按"禁止猜测"规则不写金额，属既有设计（抖音同口径 690 条）。
 
@@ -95,6 +96,22 @@
 
 机制：补拉能查到该单（服务端按 `upd_time` 命中），但 `apply_trade` 版本守卫严格 `>` → 同版本不写（`accepted` 不计数，jsonl 里看不出来）→ `refresh_aftersale_matched` 因 `o.active` 仍算出 `matched=false` → 下一轮再次入选。该集合**单调增长、永不排空**：每轮 incremental、每轮 reconcile 各至少 625 次单 tid 分页调用；淘系店越多、历史越长成本越高。抖音通道无此现象（45 个全部是“单未到”型，原单到达即收敛）。注：该集合含全部售后状态，不仅 §1.3 的 670 条成功退款（对应售后行：淘系 678 / 抖音 52）。
 
+### 1.6 metrics 层实测：淘系店当前完全不可查，修好后还有两道门禁
+
+用真实 reader 角色 + `query_business` 直查测试库（`logs/probe_metrics_taoxi.py`，窗口 08-13→09-06）：
+
+| 查询（指标 paid/refund/cash） | 结果 |
+|---|---|
+| 对照：抖音店 166754 | **status=ok**，cov=complete，paid ¥138,089.05，refund ¥27,511.53 |
+| 12 家淘系店 | **missing_data**，cov=partial，limitations：覆盖未完成 + 数据截止未知（回填未完成） |
+| 混合（166754 + 12 家淘系） | **missing_data** —— 抖音那部分也被连带拖死 |
+
+原因（代码定位）：`metrics.py` L56-60 `_ENTITY_SOURCES["orders"] = "erp.trade.list.query"` 是**单源常量**，而淘系店只有 `erp.trade.outstock.simple.query` 的 `sync_state` 行（`logs/q12.sql`：12 店 has_tradelist_state 全为 f）→ `_coverage_for` 查不到行 → status=missing、data_as_of=None。因此：
+
+1. **前置必做（否则本轮接入对 Agent/页面零收益）**：`_ENTITY_SOURCES` 需改为每实体可多源（按平台解析，或取各源 covered 交集），并处理混合查询语义。本轮红线为"不改 metrics"，未动。
+2. **第二道门禁（第 1 点修好后才暴露）**：`_UNMATCHED_SQL`（L302-307）对 `refund_amount` / `cash_difference` / `cohort_refund_rate` 是**硬拒答**——窗口内只要存在 1 条未匹配的平台成功退款就整体 missing_data。实测同口径计数：淘系 **659/717 未匹配**，抖音 **0/255** → 不先解 §1.3 的口径，淘系退款类指标几乎必然不可查。
+3. **`paid_amount` 不在门禁清单里** → 它是唯一会**静默给出偏小数字**的指标（621 条 orphan 对应 ¥89,669.39 不计入）；直接查 `reporting.v_shop_daily` 的下游同理，视图本身不要求 `matched`。
+
 ## 2. 实施要点与踩坑记录
 
 1. **分页复用**：出库通道直接复用 `_fetch_orders_cursor` / `_fetch_orders_paged`，仅把 method 参数化；响应形状 `{pageNo, pageSize, total, list}` 与交易查询一致。
@@ -117,11 +134,11 @@
 ## 4. 证据与追溯
 
 - 代码：`bi_agent/sync.py`（`ORDER_SOURCE_BY_PLATFORM`、`_shop_order_source`、`normalise_trade(..., source=)`、`_fetch_orders_cursor/_fetch_orders_paged(method=)`、PII_FORBIDDEN_FIELDS 红线、回填水位修正），提交 `1e2b119` / `03d7713` / `161b3aa`。
-- 测试：`tests/test_core.py`（源路由、出库规范化、PII 守护）、`tests/test_db.py`（出库落库 + 双通道状态隔离），`uv run --env-file .env.test python -m pytest tests/ -x -q` 全绿（104 passed, 12 subtests passed）。
+- 测试：`tests/test_core.py`（源路由、出库规范化、PII 守护）、`tests/test_db.py`（出库落库 + 双通道状态隔离），`uv run --with pytest --env-file .env.test python -m pytest tests/ -q` 全绿（104 passed, 12 subtests passed）。已知空白：`unmatched_commercials` / `refetch_orders_for_commercials` 无任何用例（§1.5 因此长期未被发现）。
 - 官方文档快照：`D:\Projects\bi-agent\logs\kuaimai-llms-full-fresh.txt` §销售出库查询（L11182 起）、§售后工单查询（L15575 起）。
 - 只读探针（2026-09-12）：`D:\Projects\bi-agent\logs\probe_tb.py` / `probe_tb2.py` / `probe_tb3.py`；PII 白名单探针 `logs/probe_taoxi_pii.py` → `logs/pii_probe_taoxi.out`。
 - 运行日志（本 worktree `logs/`，git 忽略）：`backfill_taoxi_30d.jsonl`（12 店逐店 orders/aftersales/cohort 计数与 `order_source` 路由证据）、`incr_taoxi.jsonl`、`recon_taoxi.jsonl`、`sync.log`（4356 次上游调用）。注：`backfill_taoxi_30d.err` 记录的是一次 `BI_SHOP_IDS` 缺失导致的启动失败（未配置环境，立即退出、未写库），成功重跑即上述 jsonl。
-- 验证 SQL：`logs/verify_taoxi.sql`、`logs/taoxi_v1.sql`（§1.1～§1.2 与覆盖/断层）、`logs/taoxi_v2.sql`（§1.4 完整性）、`logs/taoxi_v3.sql`（§1.3/§1.4 归因与覆盖分段）、`logs/taoxi_v4.sql`（§1.5 补拉集合），输出同名 `.out`。
+- 验证 SQL：`logs/verify_taoxi.sql`、`logs/taoxi_v1.sql`（§1.1～§1.2 与覆盖/断层）、`logs/taoxi_v2.sql`（§1.4 完整性）、`logs/taoxi_v3.sql`（§1.3/§1.4 归因与覆盖分段）、`logs/taoxi_v4.sql`（§1.5 补拉集合）、`logs/q10.sql`（timeType 通道对照）、`logs/q12.sql`（source 行存在性与未匹配计数）、`logs/q13.sql`（对照店覆盖区间），输出同名 `.out`；`logs/probe_metrics_taoxi.py` 为 §1.6 的 metrics 只读探针。
 
 ## 5. 未尽事项 / 人工复核点
 
@@ -133,7 +150,8 @@
    另：§1.5 的补拉集合与此决策绑定——B/C 任选一项都会使 619 个 cid 自动收敛（matched 可算出 true）；**选项 A 不修复该集合**，需额外给 `unmatched_commercials` 加终止条件（例如“已存在同 cid 行即视为已解析”），否则每轮白跑 ≥625 次上游调用。
 2. **淘系 `verified` 88.7% 的剩余缺口**：348 条 `undetermined` 源于 162 张单"行级实付合计 > 单头实付"（优惠/运费分摊口径差），需与业务确认应以单头还是行级为准。
 3. **`timeType=pay_time` 在两个通道语义不一致（§3）**：回填/对账用 `timeType=pay_time` 分片。抖音通道严格（0/9414 行越界），出库通道不严格（83/8367 行 `paid_at` 早于 `covered` 起点，最早 2026-07-02，早 42 天）。后果：这些行的支付事实落在 `covered` 外，查询该更早区间时 metrics 会按覆盖率返回 partial/missing（设计行为，非数据丢失），但回填行数预估不能按窗口天数线性推。需确认是否补一段 `covered_from = min(paid_at)` 的存量重述（同类：需重述通道）。
-4. 拼多多订单需方舟 appkey，未接。1688（`1688`/`alibabac2b`→`alibabac2m`）本次范围外。
-- 页面/Agent 侧对 12 家淘系店的开放与否是后续人工决定（metrics 层 source 过滤尚未纳入 outstock 源，见分支待办）。
+4. **【前置必做】metrics 层不识别出库通道，12 家淘系店当前完整不可查（§1.6）**：`_ENTITY_SOURCES` 单源常量使所有淘系查询返回 missing_data，且与抖音店混合查询时**连带拖死抖音部分**。需改为每实体多源（按平台解析或取 covered 交集）并补测；同时注意修好后第二道门禁会立刻把淘系退款类指标打成 missing_data（现窗 659 条），所以这一项必须与 §5.1 的口径决策同批排期。另：`tests/test_db.py` 对 `unmatched_commercials` / `refetch_orders_for_commercials` **零覆盖**（只有 `mark_refund_canonical` 有独立用例），改该路径时需一并补收敛用例（`_seed_shop(platform="tb")` 可直接复用）。
+5. 拼多多订单需方舟 appkey，未接。1688（`1688`/`alibabac2b`→`alibabac2m`）本次范围外。
+- 页面/Agent 侧对 12 家淘系店的开放与否是后续人工决定（前提：先完成 §5.4 的 metrics 多源登记）。
 - 长尾回填：出库 queryType=0 仅覆盖近 3 个月，更早订单需要 queryType=1 归档窗口回填（本次 30 天范围内未受影响）。
 - 建议排期：每日 `incremental`（orders×2 通道 + aftersales occurrence/cohort），每周 `reconcile --days 3`，每月 `replay --start <月末-40d> --end <月末>` 清理退款迟到/补发/换货。
