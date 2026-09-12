@@ -8,6 +8,7 @@
 2. **淘系售后走既有 `erp.aftersale.list.query` 通道直接可用**，无需改动路由（实测见下表；`tid/sid/rawRefundMoney/refundMoney/platformCompleteTime` 非空率高）。
 3. **口径限制（必须向使用者声明）**：淘系订单是 **ERP 销售出库口径，不是平台账单口径**。收件人姓名/手机/地址/省市区/街道/邮编、`buyerNick`、`buyerMessage`、发票、`taobaoId`、`platformPaymentAmount`、`ptConsignTime` 均不返回或为敏感字段；出库响应携带的 `shopName/sellerNick/openUid/mobileTail` **一律不入库**。实付、成本、毛利、佣金、邮费、状态、商品行齐全，可支撑经营分析；不宣称财务对账完成。
 4. 平台→源路由为模块常量 `ORDER_SOURCE_BY_PLATFORM = {"tb": OUTSTOCK_SOURCE, "tm": OUTSTOCK_SOURCE}`（`_shop_order_source` 查 `bi.shops.platform` 解析，缺档案直接报错防假覆盖），其余平台（含未知）回退 `erp.trade.list.query`；同步前先跑 `sync shops`。
+5. **重要口径后果（需口径负责人决策，§1.3/§5.1）**：出库通道会返回 `status=TRADE_CLOSED` 的已付款单，按任务书判定为 `active=false` 后，这批单（608 张、单头实付 ¥89,669.39）的支付事实退化为 orphan、664 笔 ¥91,290.42 成功退款无法回溯原单，淘系“退款匹配率 8.1%”对抖音同指标 95.8%。本轮未改判（属任务书规定的口径），但**淘系净支付/GMV 目现阶段不可与抖音直接相加比较**。
 
 ## 1. 实测结果（测试库 bi_agent_test@127.0.0.1:54329）
 
@@ -36,7 +37,7 @@
 | 900453539 | tm | 元发旗舰店 | 187 | 187 | 155 | 82.9% | 39 | 6 | 34 | 7576.94 |
 | **合计** | | | **8367** | **8566** | **7597** | **88.7%**（¥810,511.40） | **821** | **143** | **729** | **¥106,228.50** |
 
-注：`paid_at` 最小值早于窗口起点（如 166647 至 2026-07-02）——出库接口按修改时间命中近 30 天窗口、回传更早付款的历史在途/完结单，属正常（记录本身完整，`data_as_of` 与 `covered` 仍按窗口口径）。
+注：`paid_at` 最小值早于窗口起点（166647 至 2026-07-02）——实测两个通道对 `timeType=pay_time` 的语义不一致：出库通道有 **83/8367（1.0%）** 行的 `paid_at` 早于 `lower(covered)`（最早早 42 天），而抖音 `erp.trade.list.query` 同口径为 **0 行**（见 §3、§5.3）。记录本身完整，但它们的支付事实落在 `covered` 之外。
 
 ### 1.2 状态与规范化分布
 
@@ -45,9 +46,43 @@
 | normalization_status | 全部 `normal`（8367/8367）；`needs_review`=0，`invalid`=0 |
 | active | 7759（92.7%）；非活跃（TRADE_CLOSED 等）608（7.3%） |
 | split_parent_id | 本窗口 0 行（实测该批无拆单命中；逻辑已由单测覆盖） |
-| 逐日断层（08-15→09-12） | 11/12 店零订单天数 = 0；900007148 沃金数码商城 21 天无单（全窗口仅 15 单的小店，非断档） |
+| 逐日断层（08-14→09-11，29 天） | 11/12 店零订单天数 = 0（29/29 天有单）；900007148 沃金数码商城 9/29 天有单（全窗口仅 15 单的小店，最大相邻间隔 222.9h，非断档） |
+| 其余 11 店最大相邻出库间隔 | 3.6h～26.0h（166517 3.6h / 166520 8.5h / 167166 26.0h 为最大值） |
 | 抽查 5 单（166520，08-15） | 金额链路 payAmount=payment、cost、grossProfit=payment−cost−postFee 自洽；closed→active=false ✓ |
 | quality_ok | 全部 false —— 与存量抖音店一致，`sync_state.quality_ok` 为人工质检占位列，同步代码从不写入，非新通道缺陷 |
+
+注：§1.1 的「售后matched」列为**全部状态的 matched**（143）；若只看"退款成功且金额口径可用"（`platform_success AND refund_canonical`，729 条）中已匹配的子集，只有 **59 条（8.1%）**，详见 §1.3。
+
+### 1.3 不活跃单（TRADE_CLOSED）对支付归集与退款匹配的实测影响
+
+任务书假设 4 与 E 节要求 `status=TRADE_CLOSED → active=false`（已由 `tests/test_core.py` 固化）；本轮**未改判**，但实测出该判定在出库通道上的下游后果，必须留档：
+
+| 项 | 淘系（出库通道，30 天窗口） | 抖音（`erp.trade.list.query`，同库对照） |
+|---|---|---|
+| 订单行 / 不活跃行 | 8367 / **608（7.27%）** | 9414 / **0（0.00%）** |
+| 不活跃单的单头实付合计 | **¥89,669.39**（608 单全部 `paid_at` 非空且 `raw_pay_amount>0`） | — |
+| 支付事实 | 8566 条：head+verified 7597（¥810,511.40）、**orphan 621（金额 NULL）**、undetermined 348 | 9787 条：head 9097（92.9%）、**orphan 0**、undetermined 690 |
+| orphan 归因 | **621/621 全部**是"该商业单只存在于不活跃出库单中"（`_load_orders`/`refresh_aftersale_matched` 均带 `AND active`） | 0 |
+| 成功+canonical 退款匹配率 | **59/729 = 8.1%**（未匹配 670 条，¥98,711.51） | 881/920 = **95.8%** |
+| 未匹配退款归因 | 664 条（¥91,290.42）原单存在但只有不活跃出库单；6 条（¥7,421.09）窗口内查无出库单 | — |
+
+口径后果：对"付款后退款成功→交易自动关闭"这批单，现状是**支付事实被排除、退款事实照常计入** `v_shop_daily.refund_amount`，于是 `cash_difference = 净支付 − 退款` 对该批订单做了单向扣减（少计 ¥89,669.39 支付、多扣 ¥91,290.42 退款）。抖音通道因不产生不活跃行，历史上从未暴露此问题（09-06 复核亦未覆盖）。
+
+同时：`verified` 比例 88.7%（淘系）对 92.9%（抖音）的差距中，约 10 个百分点由上述 621 条 orphan 造成；剩余为 348 条 `undetermined`——实测 162 张活跃出库单的行级 `raw_paid_amount` 合计**大于**单头 `raw_pay_amount`（无一例小于），按"禁止猜测"规则不写金额，属既有设计（抖音同口径 690 条）。
+
+### 1.4 完整性与一致性检查（全 0 为通过）
+
+| 检查 | 结果 |
+|---|---|
+| 淘系店被 `erp.trade.list.query` 双写（同店两通道） | 0 行（源路由隔离生效） |
+| `bi.order_items` 淘系行数 / 无主明细行 | 9177 / 0 |
+| 支付行无任何订单 `commercial_ids` 引用 | 0 |
+| 同一 `commercial_id` 跨店重复 | 0 |
+| 负金额支付 / `paid_at` 为空的订单 / 成功退款金额为空 / 退款缺 `commercial_id` | 0 / 0 / 0 / 0 |
+| `split_parent_id` 非空行 | 0（本窗口无拆单命中） |
+| `sync_state.covered` 分段数（38 行：12 店出库 orders + 13 店×2 售后实体） | **全部 1 段**（回填→增量→对账首尾相接，无破碎区间） |
+| `last_error_code` | 全空 |
+| PII 只读探针（166520，08-20→08-21，31 单/8 售后） | 原始出库响应非空 PII 键 5 个（`buyerNick/mobileTail/openUid/sellerNick/shopName`）、售后原始响应 3 个（`buyerName/buyerPhone/shopName`）；规范化结果与商品行、售后行中命中数**均为 0**，键集无漂移（`logs/pii_probe_taoxi.out`） |
 
 ## 2. 实施要点与踩坑记录
 
@@ -64,20 +99,29 @@
 ## 3. 与 09-06 复核的差异/冲突
 
 - 09-06 快照中出库响应 `list[]` 仅示例性列了 8 个头字段；本次实测单头 82 键，`status/sysStatus/userId/shopName/orders[]` 均非空，以实测为准。
+- **假设 4「TRADE_CLOSED→active=false 已兼容」实测不成立**：判定本身按任务书实现且有单测，但在出库通道上它使 608 张已付款出库单的支付事实退化为 orphan、并使 664 笔成功退款无法回溯原单（见 §1.3）。属口径决策而非缺陷，故本轮不改判，转为人工复核点（§5）。
+- **`timeType=pay_time` 语义两通道不一致（实测）**：回填/对账同一段代码、同一参数，抖音通道返回行的 `paid_at` 全部落在 `covered` 内（0/9414）；出库通道有 83/8367（1.0%）行 `paid_at` 早于 `covered` 起点（最早 2026-07-02，早 42 天），即该接口对付款时间参数实际按其自身时间字段（出库/发货）裁剪，文档声称的“按付款时间”不成立。未改代码（无法从响应内证明哪条时间字段主导，猜口径会污染覆盖区间），只在 §5.3 标出口径后果。抽样时预期行数应按 `paid_at` 分布而非窗口天数估计。
 - 其余（淘系敏感字段缺失、售后可用、店铺/商品/库存不分平台）与 09-06 结论一致。
-- **新发现（文档 vs 实测冲突，以实测为准）**：出库接口回填窗口 `timeType=pay_time` 声称按付款时间过滤，但实测命中了付款时间早于窗口起点近 6 周的记录（如 166647 店 2026-07-02 付款）——疑似对未完结/近期修改的订单服务端同时按修改时间匹配。影响：入库记录自身字段完整、无脏数据（幂等 upsert 兼容），仅回填窗口语义偏宽；已在 §1.1 注明，建议 reconcile/probe 抽样时按 `paid_at` 而非窗口判断预期行数。
 
 ## 4. 证据与追溯
 
 - 代码：`bi_agent/sync.py`（`ORDER_SOURCE_BY_PLATFORM`、`_shop_order_source`、`normalise_trade(..., source=)`、`_fetch_orders_cursor/_fetch_orders_paged(method=)`、PII_FORBIDDEN_FIELDS 红线、回填水位修正），提交 `1e2b119` / `03d7713` / `161b3aa`。
 - 测试：`tests/test_core.py`（源路由、出库规范化、PII 守护）、`tests/test_db.py`（出库落库 + 双通道状态隔离），`uv run --env-file .env.test python -m pytest tests/ -x -q` 全绿（104 passed, 12 subtests passed）。
 - 官方文档快照：`D:\Projects\bi-agent\logs\kuaimai-llms-full-fresh.txt` §销售出库查询（L11182 起）、§售后工单查询（L15575 起）。
-- 只读探针（2026-09-12）：`D:\Projects\bi-agent\logs\probe_tb.py` / `probe_tb2.py` / `probe_tb3.py`。
-- 验证 SQL：`logs/verify_taoxi.sql`（本 worktree，git 忽略目录内）。
+- 只读探针（2026-09-12）：`D:\Projects\bi-agent\logs\probe_tb.py` / `probe_tb2.py` / `probe_tb3.py`；PII 白名单探针 `logs/probe_taoxi_pii.py` → `logs/pii_probe_taoxi.out`。
+- 运行日志（本 worktree `logs/`，git 忽略）：`backfill_taoxi_30d.jsonl`（12 店逐店 orders/aftersales/cohort 计数与 `order_source` 路由证据）、`incr_taoxi.jsonl`、`recon_taoxi.jsonl`、`sync.log`（4356 次上游调用）。注：`backfill_taoxi_30d.err` 记录的是一次 `BI_SHOP_IDS` 缺失导致的启动失败（未配置环境，立即退出、未写库），成功重跑即上述 jsonl。
+- 验证 SQL：`logs/verify_taoxi.sql`、`logs/taoxi_v1.sql`（§1.1～§1.2 与覆盖/断层）、`logs/taoxi_v2.sql`（§1.4 完整性）、`logs/taoxi_v3.sql`（§1.3/§1.4 归因与覆盖分段），输出同名 `.out`。
 
 ## 5. 未尽事项 / 人工复核点
 
-- 拼多多订单需方舟 appkey，未接。1688（`1688`/`alibabac2b`→`alibabac2m`）本次范围外。
+1. **【需决策】出库通道 `TRADE_CLOSED` 的活动性口径（§1.3）**：现口径使 ¥89,669.39 支付事实退化为 orphan、670 笔 ¥98,711.51 成功退款不可回溯，淘系净支付被单向扣减。三个候选：
+   - A 保持现状，在视图/页面口径说明中声明"淘系净支付不含付款后退款关闭单，且退款仍全额扣减"（零改动，但指标有系统性偏差）；
+   - B 出库通道改判"`paid_at` 非空且 `raw_pay_amount>0` 即活跃"（`sysStatus=CANCEL` 仍不活跃），抖音通道不变；
+   - C 保留 `active=false`，但让 `refresh_aftersale_matched`（及支付归集）允许关联不活跃单——只修匹配率，不改 GMV。
+   **任一改动都需要历史重述通道**：`apply_trade` 的版本守卫是严格 `>`（`test_replay_same_version_is_idempotent` 固化），CLI 幂等重放/`replay` 都不会重写同版本行，故改判后既有 608 行不会自愈，而 `DELETE`/手工 `UPDATE` 均越出本轮红线。建议由口径负责人决定后再排"同版本重述"专项。
+2. **淘系 `verified` 88.7% 的剩余缺口**：348 条 `undetermined` 源于 162 张单"行级实付合计 > 单头实付"（优惠/运费分摊口径差），需与业务确认应以单头还是行级为准。
+3. **`timeType=pay_time` 在两个通道语义不一致（§3）**：回填/对账用 `timeType=pay_time` 分片。抖音通道严格（0/9414 行越界），出库通道不严格（83/8367 行 `paid_at` 早于 `covered` 起点，最早 2026-07-02，早 42 天）。后果：这些行的支付事实落在 `covered` 外，查询该更早区间时 metrics 会按覆盖率返回 partial/missing（设计行为，非数据丢失），但回填行数预估不能按窗口天数线性推。需确认是否补一段 `covered_from = min(paid_at)` 的存量重述（同类：需重述通道）。
+4. 拼多多订单需方舟 appkey，未接。1688（`1688`/`alibabac2b`→`alibabac2m`）本次范围外。
 - 页面/Agent 侧对 12 家淘系店的开放与否是后续人工决定（metrics 层 source 过滤尚未纳入 outstock 源，见分支待办）。
 - 长尾回填：出库 queryType=0 仅覆盖近 3 个月，更早订单需要 queryType=1 归档窗口回填（本次 30 天范围内未受影响）。
 - 建议排期：每日 `incremental`（orders×2 通道 + aftersales occurrence/cohort），每周 `reconcile --days 3`，每月 `replay --start <月末-40d> --end <月末>` 清理退款迟到/补发/换货。
