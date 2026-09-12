@@ -28,7 +28,33 @@ logger = logging.getLogger(__name__)
 BEIJING = ZoneInfo("Asia/Shanghai")
 
 ORDER_SOURCE = "erp.trade.list.query"
+# 官方 erp.trade.list.query 明确排除淘系、拼多多订单；淘系（淘宝/天猫）改走
+# 交易模块销售出库通道，只有非敏感字段（收件人/买家昵称/平台支付金额等不返回）。
+OUTSTOCK_SOURCE = "erp.trade.outstock.simple.query"
 AFTERSALE_SOURCE = "erp.aftersale.list.query"
+
+# 平台→订单源路由：键为 bi.shops.platform（小写），未命中回退默认源。
+# sync_state 主键含 source，淘系出库通道的覆盖/水位与抖音通道互不干扰。
+ORDER_SOURCE_BY_PLATFORM = {
+    "tb": OUTSTOCK_SOURCE,
+    "tm": OUTSTOCK_SOURCE,
+}
+
+# ---------------------------------------------------------------------------
+# PII 红线（2026-09-12 淘系接入约定）：下列字段在出库/售后响应中出现（部分
+# 平台值已脱敏但仍非空），一律不规范化、不入库、不写日志。入库字段集维持
+# sql/001_init.sql 现有列，一个都不加；未来扩列评审必须先复核本清单，
+# tests/test_core.py 以本清单断言规范化键集与列白名单不漂移。
+# 注意：platformPaymentAmount 不属于 PII，只是淘系不返回（现有列自然为 NULL）。
+# ---------------------------------------------------------------------------
+PII_FORBIDDEN_FIELDS = frozenset({
+    "buyerNick", "buyerMessage", "buyerName", "buyerPhone",
+    "receiverName", "receiverPhone", "receiverMobile", "receiverAddress",
+    "receiverState", "receiverCity", "receiverDistrict", "receiverStreet",
+    "receiverZip", "receiverCountry", "taobaoId", "ptConsignTime",
+    "invoiceName", "invoiceRemark", "invoiceKind", "tradeInvoice",
+    "shopName", "sellerNick", "openUid", "mobileTail",
+})
 
 # 单实例同步锁；锁放在整个CLI运行入口，sync_window内部仅负责单窗口事务
 LOCK_ID = 7319041
@@ -142,6 +168,16 @@ def _normalise_item(raw_item: dict[str, Any], erp_id: str, index: int,
     }
 
 
+def _split_parent_id(raw: dict[str, Any]) -> str | None:
+    """拆单父单映射：交易查询用 splitParentId；出库通道为 splitSid
+    （官方文档：splitType=1 时为拆单主单 sid，否则 -1）。-1/空视为无拆单。"""
+    for key in ("splitParentId", "splitSid"):
+        text = str(raw.get(key) or "").strip()
+        if text and text != "-1":
+            return text
+    return None
+
+
 def normalise_trade(raw: dict[str, Any], *, source: str = ORDER_SOURCE) -> dict[str, Any]:
     """白名单规范化一单ERP交易；缺少orders字段与合法空列表不同。"""
     erp_id = str(raw.get("sid") or "").strip()
@@ -158,7 +194,7 @@ def normalise_trade(raw: dict[str, Any], *, source: str = ORDER_SOURCE) -> dict[
     raw_items = raw.get("orders") if isinstance(raw.get("orders"), list) else []
     items = [_normalise_item(item, erp_id, index, paid_at)
              for index, item in enumerate(raw_items) if isinstance(item, dict)]
-    split_parent = str(raw.get("splitParentId") or "").strip() or None
+    split_parent = _split_parent_id(raw)
     trade: dict[str, Any] = {
         "shop_id": shop_id,
         "erp_id": erp_id,
@@ -560,8 +596,11 @@ def _fmt(moment: datetime) -> str:
 
 
 def _fetch_orders_cursor(client: KuaimaiClient, *, shop_id: str, window: Window,
-                         time_type: str, query_type: str) -> Iterator[dict[str, Any]]:
-    """非归档订单：官方cursor+hasNext分页；不能用'本页少于200'作为唯一结束条件。"""
+                         time_type: str, query_type: str,
+                         method: str = ORDER_SOURCE) -> Iterator[dict[str, Any]]:
+    """非归档订单：官方cursor+hasNext分页；不能用'本页少于200'作为唯一结束条件。
+
+    method 参数化订单源：交易查询与出库通道的 cursor/queryType 参数形状一致，复用同一实现。"""
     cursor: str | None = None
     while True:
         params: dict[str, str] = {
@@ -577,7 +616,7 @@ def _fetch_orders_cursor(client: KuaimaiClient, *, shop_id: str, window: Window,
         if cursor is not None:
             params["cursor"] = cursor
         page = parse_page(
-            client.call(ORDER_SOURCE, params), allow_omitted_list=True)
+            client.call(method, params), allow_omitted_list=True)
         if not page.rows:
             return
         yield from page.rows
@@ -594,7 +633,8 @@ def _fetch_orders_cursor(client: KuaimaiClient, *, shop_id: str, window: Window,
 
 
 def _fetch_orders_paged(client: KuaimaiClient, *, shop_id: str, window: Window,
-                        time_type: str | None, query_type: str) -> Iterator[dict[str, Any]]:
+                        time_type: str | None, query_type: str,
+                        method: str = ORDER_SOURCE) -> Iterator[dict[str, Any]]:
     """归档通道：页码分页；按total判断末页并检查计数一致性。"""
     page_no = 1
     collected = 0
@@ -611,7 +651,7 @@ def _fetch_orders_paged(client: KuaimaiClient, *, shop_id: str, window: Window,
         if time_type:
             params["timeType"] = time_type
         page = parse_page(
-            client.call(ORDER_SOURCE, params), allow_omitted_list=True)
+            client.call(method, params), allow_omitted_list=True)
         if page.verified_empty:
             return
         if total is None and page.total is not None:
@@ -670,21 +710,26 @@ def _fetch_aftersales_paged(client: KuaimaiClient, *, shop_id: str, window: Wind
 
 
 def fetch_window(client: KuaimaiClient, *, entity: str, shop_id: str,
-                 window: Window, mode: str) -> Iterator[dict[str, Any]]:
+                 window: Window, mode: str,
+                 order_source: str = ORDER_SOURCE) -> Iterator[dict[str, Any]]:
     """拉取一个窗口；结束前必须证明分页完整，否则抛KuaimaiError。
 
     初始订单回填按pay_time建立支付业务覆盖；归档边界附近分别核对
     queryType=0/1，使用两通道覆盖且依主键幂等去重。
+    order_source 决定订单实体请求的接口方法（淘系走出库通道）；售后不分平台。
     """
     if entity == "orders":
         if mode in ("incremental", "scan"):
             yield from _fetch_orders_cursor(client, shop_id=shop_id, window=window,
-                                            time_type="upd_time", query_type="0")
+                                            time_type="upd_time", query_type="0",
+                                            method=order_source)
         elif mode in ("backfill", "replay", "reconcile", "probe"):
             yield from _fetch_orders_cursor(client, shop_id=shop_id, window=window,
-                                            time_type="pay_time", query_type="0")
+                                            time_type="pay_time", query_type="0",
+                                            method=order_source)
             yield from _fetch_orders_paged(client, shop_id=shop_id, window=window,
-                                           time_type="pay_time", query_type="1")
+                                           time_type="pay_time", query_type="1",
+                                           method=order_source)
         else:
             raise ValueError(f"未知模式 {mode}")
     elif entity == "aftersales_occurrence":
@@ -793,17 +838,19 @@ def record_failure(conn, *, source: str, entity: str, shop_id: str, code: str) -
 
 
 def sync_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
-                window: Window, mode: str) -> int:
+                window: Window, mode: str,
+                order_source: str = ORDER_SOURCE) -> int:
     """单个窗口事务：拉取、规范化、入库、去重；成功后推进状态。成功返回写入记录数。"""
     batch_id = uuid.uuid4().hex
-    source = ORDER_SOURCE if entity == "orders" else AFTERSALE_SOURCE
+    source = order_source if entity == "orders" else AFTERSALE_SOURCE
     accepted = 0
     refund_ids: set[str] = set()
     touched_commercials: set[str] = set()
     with conn.transaction():
-        for raw in fetch_window(client, entity=entity, shop_id=shop_id, window=window, mode=mode):
+        for raw in fetch_window(client, entity=entity, shop_id=shop_id, window=window,
+                                mode=mode, order_source=order_source):
             if entity == "orders":
-                trade = normalise_trade(raw)
+                trade = normalise_trade(raw, source=order_source)
                 if trade["normalization_status"] == "invalid":
                     continue
                 apply_trade(conn, trade, batch_id=batch_id)
@@ -892,7 +939,8 @@ def check_cohort_window(conn, client: KuaimaiClient, *, shop_id: str,
 
 
 def refetch_orders_for_commercials(conn, client: KuaimaiClient, *, shop_id: str,
-                                   commercial_ids: set[str]) -> int:
+                                   commercial_ids: set[str],
+                                   order_source: str = ORDER_SOURCE) -> int:
     """增量收到更早商业单退款时按已发布的tid条件补拉原单。
 
     单次tid查询参数及数量上限需在4.7真实核验后固定；当前按单tid逐个补拉。
@@ -917,11 +965,11 @@ def refetch_orders_for_commercials(conn, client: KuaimaiClient, *, shop_id: str,
             if cursor is not None:
                 params["cursor"] = cursor
             page = parse_page(
-                client.call(ORDER_SOURCE, params), allow_omitted_list=True)
+                client.call(order_source, params), allow_omitted_list=True)
             batch_id = uuid.uuid4().hex
             with conn.transaction():
                 for raw in page.rows:
-                    trade = normalise_trade(raw)
+                    trade = normalise_trade(raw, source=order_source)
                     if trade["normalization_status"] == "invalid":
                         continue
                     if apply_trade(conn, trade, batch_id=batch_id):
@@ -1003,28 +1051,56 @@ def _require_single_shop(settings) -> str:
     return next(iter(settings.shop_ids))
 
 
+def _shop_order_source(conn, shop_id: str) -> str:
+    """按 bi.shops.platform 路由订单源；tb/tm→出库通道，其余平台回退默认源。
+
+    店铺档案缺失时报错退出：若静默回退默认源，淘系店会被 trade.list.query
+    “验证为空”造成假覆盖，必须先运行 shops 同步。
+    """
+    row = conn.execute(
+        "SELECT platform FROM bi.shops WHERE shop_id=%s", (shop_id,)).fetchone()
+    if row is None:
+        raise SystemExit(f"店铺 {shop_id} 不在 bi.shops，请先运行 shops 同步")
+    platform = (row[0] or "").strip().lower()
+    return ORDER_SOURCE_BY_PLATFORM.get(platform, ORDER_SOURCE)
+
+
+def _shop_error(exc: BaseException) -> str:
+    """CLI 逐店隔离时输出的脱敏错误标识：KuaimaiError 取 code，其余取消息文本。"""
+    if isinstance(exc, KuaimaiError):
+        return exc.code
+    return str(exc) or exc.__class__.__name__
+
+
 def _run_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
-                window: Window, mode: str) -> int:
+                window: Window, mode: str,
+                order_source: str = ORDER_SOURCE) -> int:
     try:
         return sync_window(conn, client, entity=entity, shop_id=shop_id,
-                           window=window, mode=mode)
+                           window=window, mode=mode, order_source=order_source)
     except KuaimaiError as exc:
-        record_failure(conn, source=ORDER_SOURCE if entity == "orders" else AFTERSALE_SOURCE,
+        record_failure(conn,
+                       source=order_source if entity == "orders" else AFTERSALE_SOURCE,
                        entity=entity, shop_id=shop_id, code=exc.code)
         logger.warning("sync window failed entity=%s shop=%s code=%s", entity, shop_id, exc.code)
         raise
 
 
 def _backfill_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
-                   t0: datetime, t1: datetime) -> dict[str, int]:
-    """回填最近N天并补拉[T0,T1)；补齐成功后才发布data_as_of。"""
+                   t0: datetime, order_source: str = ORDER_SOURCE) -> dict[str, int]:
+    """回填最近N天并补拉[T0,T1)；T1 在回填窗口跑完后取固定时刻。
+
+    补拉扫描（upd_time）成功后才推进修改水位并发布 data_as_of，
+    使后续 incremental 能直接从水位续跑（原实现 t1=t0 使扫描为空转，
+    回填后的店永远无法进入增量）。"""
     if days > MAX_QUERY_DAYS:
         raise SystemExit(f"回填跨度最多{MAX_QUERY_DAYS}天")
     start = t0 - timedelta(days=days)
     stats = {"orders": 0, "aftersales_occurrence": 0, "cohort_windows": 0}
     for window in day_windows(start, t0):
         stats["orders"] += _run_window(conn, client, entity="orders", shop_id=shop_id,
-                                       window=window, mode="backfill")
+                                       window=window, mode="backfill",
+                                       order_source=order_source)
     for window in day_windows(start, t0):
         stats["aftersales_occurrence"] += _run_window(
             conn, client, entity="aftersales_occurrence", shop_id=shop_id,
@@ -1032,28 +1108,30 @@ def _backfill_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
         check_cohort_window(conn, client, shop_id=shop_id, window=window)
         stats["cohort_windows"] += 1
     # 补拉回填期间的变化：修改时间扫描推进水位
+    t1 = datetime.now(BEIJING)
     for window in day_windows(t0, t1):
         _run_window(conn, client, entity="orders", shop_id=shop_id,
-                    window=window, mode="scan")
+                    window=window, mode="scan", order_source=order_source)
         _run_window(conn, client, entity="aftersales_occurrence", shop_id=shop_id,
                     window=window, mode="scan")
     with conn.transaction():
         for entity in ("orders", "aftersales_occurrence", "aftersales_cohort"):
-            _ensure_state(conn, ORDER_SOURCE if entity == "orders" else AFTERSALE_SOURCE,
-                          entity, shop_id)
+            state_source = order_source if entity == "orders" else AFTERSALE_SOURCE
+            _ensure_state(conn, state_source, entity, shop_id)
             conn.execute(
                 "UPDATE bi.sync_state SET data_as_of=%s "
-                "WHERE source IN (%s, %s) AND entity=%s AND shop_id=%s",
-                (t1, ORDER_SOURCE, AFTERSALE_SOURCE, entity, shop_id),
+                "WHERE source=%s AND entity=%s AND shop_id=%s",
+                (t1, state_source, entity, shop_id),
             )
     return stats
 
 
 def _incremental_shop(conn, client: KuaimaiClient, *, shop_id: str,
-                      run_end: datetime) -> dict[str, int]:
+                      run_end: datetime,
+                      order_source: str = ORDER_SOURCE) -> dict[str, int]:
     """增量：从watermark-10分钟到本次固定run_end，逐日窗口推进。"""
     stats = {"orders": 0, "aftersales_occurrence": 0}
-    for entity, source in (("orders", ORDER_SOURCE),
+    for entity, source in (("orders", order_source),
                            ("aftersales_occurrence", AFTERSALE_SOURCE)):
         state = conn.execute(
             "SELECT watermark FROM bi.sync_state WHERE source=%s AND entity=%s AND shop_id=%s",
@@ -1064,16 +1142,19 @@ def _incremental_shop(conn, client: KuaimaiClient, *, shop_id: str,
         start = state[0] - SYNC_OVERLAP
         for window in day_windows(start, run_end):
             stats[entity] += _run_window(conn, client, entity=entity, shop_id=shop_id,
-                                         window=window, mode="incremental")
+                                         window=window, mode="incremental",
+                                         order_source=order_source)
     # 增量收到更早商业单退款时，按已发布的tid条件补拉原单
     missing = unmatched_commercials(conn, shop_id)
     if missing:
-        refetch_orders_for_commercials(conn, client, shop_id=shop_id, commercial_ids=missing)
+        refetch_orders_for_commercials(conn, client, shop_id=shop_id,
+                                       commercial_ids=missing, order_source=order_source)
     return stats
 
 
 def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
-                    run_end: datetime) -> dict[str, int]:
+                    run_end: datetime,
+                    order_source: str = ORDER_SOURCE) -> dict[str, int]:
     """按支付日/退款完成日重核最近N天，并刷新cohort覆盖与data_as_of。"""
     if days > MAX_QUERY_DAYS:
         raise SystemExit(f"重核跨度最多{MAX_QUERY_DAYS}天")
@@ -1081,7 +1162,8 @@ def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
     stats = {"orders": 0, "aftersales_occurrence": 0, "cohort_windows": 0}
     for window in day_windows(start, run_end):
         stats["orders"] += _run_window(conn, client, entity="orders", shop_id=shop_id,
-                                       window=window, mode="reconcile")
+                                       window=window, mode="reconcile",
+                                       order_source=order_source)
         stats["aftersales_occurrence"] += _run_window(
             conn, client, entity="aftersales_occurrence", shop_id=shop_id,
             window=window, mode="reconcile")
@@ -1089,18 +1171,21 @@ def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
         stats["cohort_windows"] += 1
     missing = unmatched_commercials(conn, shop_id)
     if missing:
-        refetch_orders_for_commercials(conn, client, shop_id=shop_id, commercial_ids=missing)
+        refetch_orders_for_commercials(conn, client, shop_id=shop_id,
+                                       commercial_ids=missing, order_source=order_source)
     return stats
 
 
 def _replay_entity(conn, client: KuaimaiClient, *, shop_id: str, entity: str,
-                   start: datetime, end: datetime) -> int:
+                   start: datetime, end: datetime,
+                   order_source: str = ORDER_SOURCE) -> int:
     """历史范围replay：业务时间窗口重跑并加入覆盖。"""
     count = 0
     if entity == "orders":
         for window in day_windows(start, end):
             count += _run_window(conn, client, entity="orders", shop_id=shop_id,
-                                 window=window, mode="replay")
+                                 window=window, mode="replay",
+                                 order_source=order_source)
     elif entity == "aftersales_occurrence":
         for window in day_windows(start, end):
             count += _run_window(conn, client, entity="aftersales_occurrence",
@@ -1114,7 +1199,7 @@ def _replay_entity(conn, client: KuaimaiClient, *, shop_id: str, entity: str,
 
 
 def _probe(client: KuaimaiClient, *, shop_id: str, start: datetime,
-           end: datetime) -> dict[str, object]:
+           end: datetime, order_source: str = ORDER_SOURCE) -> dict[str, object]:
     """拉全页但只输出数量、金额字段覆盖和质量统计，不输出客户/订单号。"""
     window = Window(start, end)
     pay_total = Decimal(0)
@@ -1124,7 +1209,8 @@ def _probe(client: KuaimaiClient, *, shop_id: str, start: datetime,
     commercial_ids: set[str] = set()
     tid_counts: dict[str, int] = {}
     for raw in fetch_window(client, entity="orders", shop_id=shop_id,
-                            window=window, mode="probe"):
+                            window=window, mode="probe",
+                            order_source=order_source):
         order_count += 1
         amount = to_decimal(raw.get("payAmount"))
         if amount is not None:
@@ -1262,27 +1348,49 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "probe":
                 shop_id = _require_single_shop(settings)
                 summary = _probe(client, shop_id=shop_id,
-                                 start=_parse_date(args.start), end=_parse_date(args.end))
+                                 start=_parse_date(args.start), end=_parse_date(args.end),
+                                 order_source=_shop_order_source(conn, shop_id))
                 print(json.dumps(summary, ensure_ascii=False))
             elif args.command == "backfill":
-                t0 = datetime.now(BEIJING)
-                t1 = t0
+                t0 = datetime.now(BEIJING)  # 回填开始前记录T0；完成后在_backfill_shop内补拉[T0,T1)
                 for shop_id in sorted(settings.shop_ids):
-                    stats = _backfill_shop(conn, client, shop_id=shop_id,
-                                           days=args.days, t0=t0, t1=t1)
+                    try:
+                        order_source = _shop_order_source(conn, shop_id)
+                        stats = _backfill_shop(conn, client, shop_id=shop_id,
+                                               days=args.days, t0=t0,
+                                               order_source=order_source)
+                    except (KuaimaiError, SystemExit) as exc:
+                        print(json.dumps({"action": "backfill", "shop_id": shop_id,
+                                          "error": _shop_error(exc)}, ensure_ascii=False))
+                        continue
                     print(json.dumps({"action": "backfill", "shop_id": shop_id,
-                                      "stats": stats}))
+                                      "order_source": order_source, "stats": stats}))
             elif args.command == "incremental":
                 run_end = datetime.now(BEIJING)
                 for shop_id in sorted(settings.shop_ids):
-                    stats = _incremental_shop(conn, client, shop_id=shop_id, run_end=run_end)
+                    try:
+                        order_source = _shop_order_source(conn, shop_id)
+                        stats = _incremental_shop(conn, client, shop_id=shop_id,
+                                                  run_end=run_end,
+                                                  order_source=order_source)
+                    except (KuaimaiError, SystemExit) as exc:
+                        print(json.dumps({"action": "incremental", "shop_id": shop_id,
+                                          "error": _shop_error(exc)}, ensure_ascii=False))
+                        continue
                     print(json.dumps({"action": "incremental", "shop_id": shop_id,
                                       "stats": stats}))
             elif args.command == "reconcile":
                 run_end = datetime.now(BEIJING)
                 for shop_id in sorted(settings.shop_ids):
-                    stats = _reconcile_shop(conn, client, shop_id=shop_id,
-                                            days=args.days, run_end=run_end)
+                    try:
+                        order_source = _shop_order_source(conn, shop_id)
+                        stats = _reconcile_shop(conn, client, shop_id=shop_id,
+                                                days=args.days, run_end=run_end,
+                                                order_source=order_source)
+                    except (KuaimaiError, SystemExit) as exc:
+                        print(json.dumps({"action": "reconcile", "shop_id": shop_id,
+                                          "error": _shop_error(exc)}, ensure_ascii=False))
+                        continue
                     print(json.dumps({"action": "reconcile", "shop_id": shop_id,
                                       "stats": stats}))
             elif args.command == "replay":
@@ -1291,8 +1399,15 @@ def main(argv: list[str] | None = None) -> int:
                 if (end - start).days > MAX_QUERY_DAYS:
                     raise SystemExit(f"replay跨度最多{MAX_QUERY_DAYS}天")
                 for shop_id in sorted(settings.shop_ids):
-                    count = _replay_entity(conn, client, shop_id=shop_id,
-                                           entity=args.entity, start=start, end=end)
+                    try:
+                        order_source = _shop_order_source(conn, shop_id)
+                        count = _replay_entity(conn, client, shop_id=shop_id,
+                                               entity=args.entity, start=start, end=end,
+                                               order_source=order_source)
+                    except (KuaimaiError, SystemExit) as exc:
+                        print(json.dumps({"action": "replay", "shop_id": shop_id,
+                                          "error": _shop_error(exc)}, ensure_ascii=False))
+                        continue
                     print(json.dumps({"action": "replay", "shop_id": shop_id,
                                       "entity": args.entity, "accepted": count}))
             elif args.command == "refresh-session":
