@@ -8,7 +8,7 @@
 2. **淘系售后走既有 `erp.aftersale.list.query` 通道直接可用**，无需改动路由（实测见下表；`tid/sid/rawRefundMoney/refundMoney/platformCompleteTime` 非空率高）。
 3. **口径限制（必须向使用者声明）**：淘系订单是 **ERP 销售出库口径，不是平台账单口径**。收件人姓名/手机/地址/省市区/街道/邮编、`buyerNick`、`buyerMessage`、发票、`taobaoId`、`platformPaymentAmount`、`ptConsignTime` 均不返回或为敏感字段；出库响应携带的 `shopName/sellerNick/openUid/mobileTail` **一律不入库**。实付、成本、毛利、佣金、邮费、状态、商品行齐全，可支撑经营分析；不宣称财务对账完成。
 4. 平台→源路由为模块常量 `ORDER_SOURCE_BY_PLATFORM = {"tb": OUTSTOCK_SOURCE, "tm": OUTSTOCK_SOURCE}`（`_shop_order_source` 查 `bi.shops.platform` 解析，缺档案直接报错防假覆盖），其余平台（含未知）回退 `erp.trade.list.query`；同步前先跑 `sync shops`。
-5. **重要口径后果（需口径负责人决策，§1.3/§5.1）**：出库通道会返回 `status=TRADE_CLOSED` 的已付款单，按任务书判定为 `active=false` 后，这批单（608 张、单头实付 ¥89,669.39）的支付事实退化为 orphan、664 笔 ¥91,290.42 成功退款无法回溯原单，淘系“退款匹配率 8.1%”对抖音同指标 95.8%。本轮未改判（属任务书规定的口径），但**淘系净支付/GMV 目现阶段不可与抖音直接相加比较**。
+5. **重要口径后果（需口径负责人决策，§1.3/§5.1）**：出库通道会返回 `status=TRADE_CLOSED` 的已付款单，按任务书判定为 `active=false` 后，这批单（608 张、单头实付 ¥89,669.39）的支付事实退化为 orphan、664 笔 ¥91,290.42 成功退款无法回溯原单，淘系“退款匹配率 8.1%”对抖音同指标 95.8%。本轮未改判（属任务书规定的口径），但**淘系净支付/GMV 目现阶段不可与抖音直接相加比较**；同时它令 619 个商业单的售后补拉集合永不收敛（§1.5）。
 
 ## 1. 实测结果（测试库 bi_agent_test@127.0.0.1:54329）
 
@@ -84,6 +84,17 @@
 | `last_error_code` | 全空 |
 | PII 只读探针（166520，08-20→08-21，31 单/8 售后） | 原始出库响应非空 PII 键 5 个（`buyerNick/mobileTail/openUid/sellerNick/shopName`）、售后原始响应 3 个（`buyerName/buyerPhone/shopName`）；规范化结果与商品行、售后行中命中数**均为 0**，键集无漂移（`logs/pii_probe_taoxi.out`） |
 
+### 1.5 衍生问题：`unmatched_commercials` 补拉集合永不收敛
+
+`_incremental_shop`（L1147）与 `_reconcile_shop`（L1172）结尾都会调 `unmatched_commercials()` 找“售后已到、原单未到”的 cid，再逐个 `refetch_orders_for_commercials(tid=…)` 补拉。实测当前存量：
+
+| 组 | 每轮补拉 cid | 其中“只有不活跃出库单”（永不可解析） | 其 `source_updated_at` 在 366 天补拉窗内 | 完全无单（可重试） |
+|---|---:|---:|---:|---:|
+| 淘系（11 店有售后） | **625** | **619（99.0%）** | 619（100%） | 6 |
+| 抖音 | 45 | **0** | 0 | 45 |
+
+机制：补拉能查到该单（服务端按 `upd_time` 命中），但 `apply_trade` 版本守卫严格 `>` → 同版本不写（`accepted` 不计数，jsonl 里看不出来）→ `refresh_aftersale_matched` 因 `o.active` 仍算出 `matched=false` → 下一轮再次入选。该集合**单调增长、永不排空**：每轮 incremental、每轮 reconcile 各至少 625 次单 tid 分页调用；淘系店越多、历史越长成本越高。抖音通道无此现象（45 个全部是“单未到”型，原单到达即收敛）。注：该集合含全部售后状态，不仅 §1.3 的 670 条成功退款（对应售后行：淘系 678 / 抖音 52）。
+
 ## 2. 实施要点与踩坑记录
 
 1. **分页复用**：出库通道直接复用 `_fetch_orders_cursor` / `_fetch_orders_paged`，仅把 method 参数化；响应形状 `{pageNo, pageSize, total, list}` 与交易查询一致。
@@ -110,7 +121,7 @@
 - 官方文档快照：`D:\Projects\bi-agent\logs\kuaimai-llms-full-fresh.txt` §销售出库查询（L11182 起）、§售后工单查询（L15575 起）。
 - 只读探针（2026-09-12）：`D:\Projects\bi-agent\logs\probe_tb.py` / `probe_tb2.py` / `probe_tb3.py`；PII 白名单探针 `logs/probe_taoxi_pii.py` → `logs/pii_probe_taoxi.out`。
 - 运行日志（本 worktree `logs/`，git 忽略）：`backfill_taoxi_30d.jsonl`（12 店逐店 orders/aftersales/cohort 计数与 `order_source` 路由证据）、`incr_taoxi.jsonl`、`recon_taoxi.jsonl`、`sync.log`（4356 次上游调用）。注：`backfill_taoxi_30d.err` 记录的是一次 `BI_SHOP_IDS` 缺失导致的启动失败（未配置环境，立即退出、未写库），成功重跑即上述 jsonl。
-- 验证 SQL：`logs/verify_taoxi.sql`、`logs/taoxi_v1.sql`（§1.1～§1.2 与覆盖/断层）、`logs/taoxi_v2.sql`（§1.4 完整性）、`logs/taoxi_v3.sql`（§1.3/§1.4 归因与覆盖分段），输出同名 `.out`。
+- 验证 SQL：`logs/verify_taoxi.sql`、`logs/taoxi_v1.sql`（§1.1～§1.2 与覆盖/断层）、`logs/taoxi_v2.sql`（§1.4 完整性）、`logs/taoxi_v3.sql`（§1.3/§1.4 归因与覆盖分段）、`logs/taoxi_v4.sql`（§1.5 补拉集合），输出同名 `.out`。
 
 ## 5. 未尽事项 / 人工复核点
 
@@ -119,6 +130,7 @@
    - B 出库通道改判"`paid_at` 非空且 `raw_pay_amount>0` 即活跃"（`sysStatus=CANCEL` 仍不活跃），抖音通道不变；
    - C 保留 `active=false`，但让 `refresh_aftersale_matched`（及支付归集）允许关联不活跃单——只修匹配率，不改 GMV。
    **任一改动都需要历史重述通道**：`apply_trade` 的版本守卫是严格 `>`（`test_replay_same_version_is_idempotent` 固化），CLI 幂等重放/`replay` 都不会重写同版本行，故改判后既有 608 行不会自愈，而 `DELETE`/手工 `UPDATE` 均越出本轮红线。建议由口径负责人决定后再排"同版本重述"专项。
+   另：§1.5 的补拉集合与此决策绑定——B/C 任选一项都会使 619 个 cid 自动收敛（matched 可算出 true）；**选项 A 不修复该集合**，需额外给 `unmatched_commercials` 加终止条件（例如“已存在同 cid 行即视为已解析”），否则每轮白跑 ≥625 次上游调用。
 2. **淘系 `verified` 88.7% 的剩余缺口**：348 条 `undetermined` 源于 162 张单"行级实付合计 > 单头实付"（优惠/运费分摊口径差），需与业务确认应以单头还是行级为准。
 3. **`timeType=pay_time` 在两个通道语义不一致（§3）**：回填/对账用 `timeType=pay_time` 分片。抖音通道严格（0/9414 行越界），出库通道不严格（83/8367 行 `paid_at` 早于 `covered` 起点，最早 2026-07-02，早 42 天）。后果：这些行的支付事实落在 `covered` 外，查询该更早区间时 metrics 会按覆盖率返回 partial/missing（设计行为，非数据丢失），但回填行数预估不能按窗口天数线性推。需确认是否补一段 `covered_from = min(paid_at)` 的存量重述（同类：需重述通道）。
 4. 拼多多订单需方舟 appkey，未接。1688（`1688`/`alibabac2b`→`alibabac2m`）本次范围外。
