@@ -121,14 +121,15 @@ def _effective_quality(status: object, rule: object) -> QualityStatus:
 
 
 def reconcile_source_quality(conn, *, shop_id: str, entity: str,
-                             start: datetime, end: datetime) -> QualityStatus:
+                             start: datetime, end: datetime,
+                             source: str | None = None) -> QualityStatus:
     """跑一次可审计的核验，并回写质量状态；返回新的状态。
 
     “同步成功”本身不是核验：只有本窗口内确实落了 reconcile 批次凭证，
     才有资格改质量状态。没凭证就维持 unknown，既不谎称已核验，
     也不凭空降级成 failed。
     """
-    source = ENTITY_SOURCES[entity]
+    source = source or ENTITY_SOURCES[entity]
     evidence = conn.execute(
         "SELECT count(*) FROM reporting.v_source_batches "
         "WHERE source=%s AND entity=%s AND shop_id=%s "

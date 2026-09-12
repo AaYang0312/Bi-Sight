@@ -5,7 +5,7 @@ import hmac
 import json
 import logging
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
@@ -2343,6 +2343,235 @@ class AgentTests(unittest.TestCase):
         public_payload = turn.artifacts[0]
         self.assertEqual(public_payload["data"][0]["basis"], "用户输入假设")
         self.assertNotIn("S1", json.dumps(public_payload, ensure_ascii=False))
+
+
+class OutstockSourceTests(unittest.TestCase):
+    """淘系出库通道（erp.trade.outstock.simple.query）：源路由、规范化、PII 红线。"""
+
+    TZ = timezone(timedelta(hours=8))
+
+    @staticmethod
+    def _ms(dt: datetime) -> int:
+        return int(dt.timestamp() * 1000)
+
+    def _raw(self, **overrides):
+        paid = datetime(2026, 8, 16, 10, 30, tzinfo=self.TZ)
+        modified = datetime(2026, 8, 20, 12, 0, tzinfo=self.TZ)
+        raw = {
+            "sid": 123, "tid": "T-1", "userId": 166520,
+            "payAmount": "16.90", "payment": "16.90", "cost": "10.00",
+            "grossProfit": "6.90", "postFee": "0.00",
+            "payTime": self._ms(paid), "modified": self._ms(modified),
+            "updTime": self._ms(modified),
+            "status": "WAIT_BUYER_CONFIRM_GOODS", "sysStatus": "SELLER_SEND_GOODS",
+            "orders": [{
+                "id": 9001, "oid": "O1", "tid": "T-1",
+                "itemSysId": 1350787, "skuSysId": 2204282, "skuId": "S1",
+                "num": "1", "giftNum": 0,
+                "payAmount": "16.90", "payment": "16.90", "cost": "10.00",
+                "status": "WAIT_BUYER_CONFIRM_GOODS",
+                "created": self._ms(paid), "modified": self._ms(modified),
+            }],
+        }
+        raw.update(overrides)
+        return raw
+
+    def test_outstock_normalise_field_mapping(self):
+        from bi_agent.sync import OUTSTOCK_SOURCE, normalise_trade
+        modified = datetime(2026, 8, 20, 12, 0, tzinfo=self.TZ)
+        paid = datetime(2026, 8, 16, 10, 30, tzinfo=self.TZ)
+        trade = normalise_trade(self._raw(), source=OUTSTOCK_SOURCE)
+        self.assertEqual(trade["source"], OUTSTOCK_SOURCE)
+        self.assertEqual(trade["erp_id"], "123")
+        self.assertEqual(trade["shop_id"], "166520")
+        self.assertEqual(trade["commercial_ids"], ["T-1"])
+        self.assertIsNone(trade["split_parent_id"])
+        self.assertEqual(trade["source_updated_at"], modified)
+        self.assertEqual(trade["paid_at"], paid)
+        self.assertEqual(trade["raw_pay_amount"], Decimal("16.90"))
+        self.assertEqual(trade["raw_payment"], Decimal("16.90"))
+        # 淘系不返回 platformPaymentAmount：列自然保持 NULL，verified 不依赖它
+        self.assertIsNone(trade["raw_platform_payment"])
+        self.assertEqual(trade["raw_cost"], Decimal("10.00"))
+        self.assertEqual(trade["raw_gross_profit"], Decimal("6.90"))
+        self.assertTrue(trade["active"])
+        self.assertEqual(trade["normalization_status"], "normal")
+        self.assertTrue(trade["items_present"])
+        item = trade["items"][0]
+        self.assertEqual(item["line_id"], "9001")
+        self.assertEqual(item["commercial_id"], "T-1")
+        self.assertEqual(item["product_id"], "1350787")
+        self.assertEqual(item["sku_id"], "2204282")
+        self.assertEqual(item["quantity"], Decimal("1"))
+        self.assertEqual(item["gift_quantity"], Decimal("0"))
+        self.assertEqual(item["raw_paid_amount"], Decimal("16.90"))
+        self.assertEqual(item["raw_payment"], Decimal("16.90"))
+        self.assertEqual(item["raw_unit_cost"], Decimal("10.00"))
+
+    def test_outstock_status_activity(self):
+        from bi_agent.sync import OUTSTOCK_SOURCE, normalise_trade
+        closed = normalise_trade(self._raw(status="TRADE_CLOSED",
+                                           sysStatus="CLOSED"), source=OUTSTOCK_SOURCE)
+        self.assertFalse(closed["active"])
+        sending = normalise_trade(self._raw(status="WAIT_SELLER_SEND_GOODS"),
+                                  source=OUTSTOCK_SOURCE)
+        self.assertTrue(sending["active"])
+        # 交易查询通道的 ERP 取消态仍按原规则判不活跃
+        cancelled = normalise_trade(self._raw(status="CANCELLED"), source=OUTSTOCK_SOURCE)
+        self.assertFalse(cancelled["active"])
+
+    def test_split_sid_maps_split_parent(self):
+        from bi_agent.sync import OUTSTOCK_SOURCE, normalise_trade
+        split = normalise_trade(self._raw(splitSid=999, splitType=1),
+                                source=OUTSTOCK_SOURCE)
+        self.assertEqual(split["split_parent_id"], "999")
+        for empty in (-1, "-1", "", None, "  "):
+            plain = normalise_trade(self._raw(splitSid=empty), source=OUTSTOCK_SOURCE)
+            self.assertIsNone(plain["split_parent_id"])
+        # 交易查询通道仍优先用 splitParentId
+        legacy = normalise_trade(self._raw(splitParentId="P1"), source=OUTSTOCK_SOURCE)
+        self.assertEqual(legacy["split_parent_id"], "P1")
+
+    def test_missing_user_id_is_invalid(self):
+        from bi_agent.sync import OUTSTOCK_SOURCE, normalise_trade
+        raw = self._raw()
+        raw.pop("userId")
+        trade = normalise_trade(raw, source=OUTSTOCK_SOURCE)
+        self.assertEqual(trade["normalization_status"], "invalid")
+
+    def test_platform_routing_table(self):
+        from bi_agent.sync import (
+            AFTERSALE_SOURCE, ORDER_SOURCE, ORDER_SOURCE_BY_PLATFORM, OUTSTOCK_SOURCE)
+        self.assertEqual(ORDER_SOURCE_BY_PLATFORM,
+                         {"tb": OUTSTOCK_SOURCE, "tm": OUTSTOCK_SOURCE})
+        self.assertEqual(ORDER_SOURCE_BY_PLATFORM.get("fxg", ORDER_SOURCE), ORDER_SOURCE)
+        self.assertNotIn(AFTERSALE_SOURCE, ORDER_SOURCE_BY_PLATFORM.values())
+
+    def test_shop_order_source_lookup(self):
+        from bi_agent.sync import (
+            ORDER_SOURCE, OUTSTOCK_SOURCE, _shop_order_source)
+
+        class Result:
+            def __init__(self, row):
+                self._row = row
+
+            def fetchone(self):
+                return self._row
+
+        class Conn:
+            def __init__(self, row):
+                self.row = row
+
+            def execute(self, sql, params=None):
+                assert "bi.shops" in sql
+                return Result(self.row)
+
+        self.assertEqual(_shop_order_source(Conn(("tb",)), "166520"), OUTSTOCK_SOURCE)
+        self.assertEqual(_shop_order_source(Conn(("TM",)), "166687"), OUTSTOCK_SOURCE)
+        self.assertEqual(_shop_order_source(Conn(("fxg",)), "166754"), ORDER_SOURCE)
+        self.assertEqual(_shop_order_source(Conn(("",)), "1"), ORDER_SOURCE)
+        with self.assertRaises(SystemExit):
+            _shop_order_source(Conn(None), "404")
+
+    def test_fetch_window_routes_method(self):
+        from bi_agent.sync import (
+            ORDER_SOURCE, OUTSTOCK_SOURCE, Window, fetch_window)
+        window = Window(datetime(2026, 8, 16, tzinfo=self.TZ),
+                        datetime(2026, 8, 17, tzinfo=self.TZ))
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append((method, dict(params)))
+                return {"success": True, "list": [], "total": 0}
+
+        client = Client()
+        list(fetch_window(client, entity="orders", shop_id="166520",
+                          window=window, mode="incremental",
+                          order_source=OUTSTOCK_SOURCE))
+        self.assertEqual([m for m, _ in client.calls], [OUTSTOCK_SOURCE])
+        self.assertEqual(client.calls[0][1]["timeType"], "upd_time")
+        self.assertEqual(client.calls[0][1]["queryType"], "0")
+
+        client = Client()
+        list(fetch_window(client, entity="orders", shop_id="166520",
+                          window=window, mode="backfill",
+                          order_source=OUTSTOCK_SOURCE))
+        self.assertEqual({m for m, _ in client.calls}, {OUTSTOCK_SOURCE})
+        self.assertEqual([p["queryType"] for _, p in client.calls], ["0", "1"])
+        self.assertEqual({p["timeType"] for _, p in client.calls}, {"pay_time"})
+
+        # 默认回退：不传 order_source 时仍走交易查询
+        client = Client()
+        list(fetch_window(client, entity="orders", shop_id="166754",
+                          window=window, mode="incremental"))
+        self.assertEqual([m for m, _ in client.calls], [ORDER_SOURCE])
+
+        # 售后不受路由影响
+        client = Client()
+        list(fetch_window(client, entity="aftersales_occurrence", shop_id="166520",
+                          window=window, mode="incremental",
+                          order_source=OUTSTOCK_SOURCE))
+        self.assertEqual([m for m, _ in client.calls], ["erp.aftersale.list.query"])
+
+    def test_normalised_key_set_frozen(self):
+        from bi_agent.sync import normalise_aftersale
+        trade = self._normalised_trade()
+        self.assertEqual(set(trade), {
+            "shop_id", "erp_id", "commercial_ids", "split_parent_id", "source",
+            "source_updated_at", "platform_modified_at", "paid_at", "raw_pay_amount",
+            "raw_payment", "raw_platform_payment", "raw_cost", "raw_gross_profit",
+            "unified_status", "system_status",
+            "active", "normalization_status", "items_present", "items"})
+        self.assertEqual(set(trade["items"][0]), {
+            "line_id", "commercial_id", "platform_line_id", "product_id", "sku_id",
+            "source_type", "product_name_snapshot", "sku_label_snapshot",
+            "paid_at", "quantity", "gift_quantity", "raw_paid_amount", "raw_payment",
+            "raw_unit_cost", "allocated_paid_amount", "allocation_verified",
+            "line_kind", "active"})
+        aftersale = normalise_aftersale({"id": "R1", "tid": "T-1"})
+        self.assertNotIn("buyerName", aftersale)
+        self.assertNotIn("buyerPhone", aftersale)
+
+    def _normalised_trade(self):
+        from bi_agent.sync import OUTSTOCK_SOURCE, normalise_trade
+        return normalise_trade(self._raw(), source=OUTSTOCK_SOURCE)
+
+    def test_pii_never_normalised_or_stored(self):
+        """PII 红线守护：出库/售后样本中塞满非空敏感字段，规范化结果不得出现。
+
+        出库接口响应含 buyerNick/收件人信息/openUid/shopName 等（部分脱敏
+        仍非空）；现表无对应列，本用例防的是未来扩列/改白名单时遗忘约定。"""
+        from bi_agent.sync import (
+            PII_FORBIDDEN_FIELDS, normalise_aftersale, normalise_trade)
+        sentinels = {key: f"PII-LEAK-{key}" for key in sorted(PII_FORBIDDEN_FIELDS)}
+        head = {**self._raw(**sentinels)}
+        head["orders"] = [{**self._raw()["orders"][0], **sentinels}]
+        trade = normalise_trade(head, source="erp.trade.outstock.simple.query")
+        blob = repr(trade)
+        self.assertNotIn("PII-LEAK-", blob)
+        for key in PII_FORBIDDEN_FIELDS:
+            self.assertNotIn(key, trade)
+            self.assertNotIn(key, trade["items"][0])
+        after_raw = {"id": "R1", "tid": "T-1", "sid": "123", **sentinels}
+        aftersale = normalise_aftersale(after_raw)
+        self.assertNotIn("PII-LEAK-", repr(aftersale))
+        for key in PII_FORBIDDEN_FIELDS:
+            self.assertNotIn(key, aftersale)
+
+    def test_order_columns_whitelist_frozen(self):
+        """入库列集合 = 现有列，一个不加；且与 PII 禁存清单不相交。"""
+        from bi_agent.sync import PII_FORBIDDEN_FIELDS, _ORDER_COLUMNS
+        columns = {part.strip() for part in _ORDER_COLUMNS.split(",")}
+        self.assertEqual(columns, {
+            "shop_id", "erp_id", "commercial_ids", "split_parent_id", "source",
+            "source_updated_at", "platform_modified_at", "paid_at", "raw_pay_amount",
+            "raw_payment", "raw_platform_payment", "raw_cost", "raw_gross_profit",
+            "unified_status", "system_status",
+            "active", "normalization_status", "batch_id"})
+        self.assertFalse(columns & PII_FORBIDDEN_FIELDS)
 
 
 if __name__ == "__main__":

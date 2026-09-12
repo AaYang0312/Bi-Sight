@@ -35,11 +35,11 @@ class DatabaseTests(unittest.TestCase):
         # 外层事务必须在这儿开：被测同步函数自己开 transaction()，否则它们会提交假数据。
         self.conn = connect_test_db(self)
 
-    def _seed_shop(self, shop_id: str = "S1"):
+    def _seed_shop(self, shop_id: str = "S1", platform: str = "fxg"):
         self.conn.execute(
-            "INSERT INTO bi.shops(shop_id, platform, display_name) VALUES (%s, 'fxg', %s) "
+            "INSERT INTO bi.shops(shop_id, platform, display_name) VALUES (%s, %s, %s) "
             "ON CONFLICT (shop_id) DO NOTHING",
-            (shop_id, "店铺A"),
+            (shop_id, platform, "店铺A"),
         )
 
     # -- 权限 ----------------------------------------------------------------
@@ -911,6 +911,58 @@ class DatabaseTests(unittest.TestCase):
                 "WHERE commercial_id='C_CLOSED_SPLIT'").fetchone()
         self.assertEqual(payment, (Decimal("100"), True, "items"))
 
+    def test_outstock_closed_payment_refund_and_refetch_converge(self):
+        """淘系关闭单仍保留收款，退款只扣一次，已到原单不再反复补拉。"""
+        from bi_agent.sync import (OUTSTOCK_SOURCE, apply_aftersale, apply_trade,
+                                   normalise_aftersale, normalise_trade,
+                                   unmatched_commercials)
+
+        self._seed_shop("TB_CLOSED", platform="tb")
+        paid = datetime(2026, 9, 2, 12, tzinfo=BEIJING)
+        trade = normalise_trade({
+            "sid": "E_TB", "userId": "TB_CLOSED", "tid": "C_TB",
+            "updTime": _ms(paid), "payTime": _ms(paid), "payAmount": "100",
+            "status": "TRADE_CLOSED", "sysStatus": "SELLER_SEND_GOODS",
+            "orders": [{"id": "L_TB", "tid": "C_TB", "itemSysId": "P_TB",
+                        "num": "1", "payAmount": "100"}],
+        }, source=OUTSTOCK_SOURCE)
+        self.assertFalse(trade["active"])
+        self.assertTrue(apply_trade(self.conn, trade, batch_id="tb-closed"))
+        refund = normalise_aftersale({
+            "aftersaleId": "A_TB", "userId": "TB_CLOSED", "tid": "C_TB",
+            "platformRefundId": "R_TB",
+            "onlineStatus": 7, "status": 9, "rawRefundMoney": "30",
+            "platformCompleteTime": _ms(paid), "modified": _ms(paid),
+        })
+        self.assertTrue(apply_aftersale(self.conn, refund, batch_id="tb-refund"))
+        self.assertEqual(self.conn.execute(
+            "SELECT paid_amount, refund_amount, cash_difference "
+            "FROM reporting.v_shop_daily WHERE shop_id='TB_CLOSED'"
+        ).fetchone(), (Decimal("100"), Decimal("30"), Decimal("70")))
+        self.assertTrue(self.conn.execute(
+            "SELECT matched FROM bi.aftersales WHERE aftersale_id='A_TB'"
+        ).fetchone()[0])
+        self.assertEqual(unmatched_commercials(self.conn, "TB_CLOSED"), set())
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM reporting.v_product_daily WHERE shop_id='TB_CLOSED'"
+        ).fetchone()[0], 0)
+
+    def test_outstock_reconcile_updates_only_its_source_quality(self):
+        """重核不能读取或修改淘系店遗留的交易查询源状态。"""
+        from bi_agent.sync import ORDER_SOURCE, OUTSTOCK_SOURCE, _reconcile_shop
+
+        self._seed_shop("TB_QUALITY", platform="tb")
+        base = datetime(2026, 9, 5, tzinfo=BEIJING)
+        self.conn.execute(
+            "INSERT INTO bi.sync_state(source, entity, shop_id) "
+            "VALUES (%s, 'orders', 'TB_QUALITY')", (ORDER_SOURCE,))
+        _reconcile_shop(self.conn, self._client(), shop_id="TB_QUALITY", days=1,
+                        run_end=base + timedelta(days=1), order_source=OUTSTOCK_SOURCE)
+        self.assertEqual(dict(self.conn.execute(
+            "SELECT source, quality_status FROM bi.sync_state "
+            "WHERE shop_id='TB_QUALITY' AND entity='orders'"
+        ).fetchall()), {ORDER_SOURCE: "unknown", OUTSTOCK_SOURCE: "passed"})
+
     def test_metric_semantics_migration_appends_line_kind_to_legacy_view(self):
         from pathlib import Path
 
@@ -1242,8 +1294,9 @@ class DatabaseTests(unittest.TestCase):
         return KuaimaiClient(settings, httpx.Client(transport=httpx.MockTransport(
             lambda request: httpx.Response(200, json={"success": True, "total": 0}))))
 
-    def _state_row(self, entity: str, shop_id: str = "S1"):
-        source = "erp.trade.list.query" if entity == "orders" else "erp.aftersale.list.query"
+    def _state_row(self, entity: str, shop_id: str = "S1", source: str | None = None):
+        if source is None:
+            source = "erp.trade.list.query" if entity == "orders" else "erp.aftersale.list.query"
         return self.conn.execute(
             "SELECT watermark, covered, data_as_of, last_error_code FROM bi.sync_state "
             "WHERE source=%s AND entity=%s AND shop_id=%s",
@@ -1567,6 +1620,65 @@ class DatabaseTests(unittest.TestCase):
 
         self.assertEqual(self._payment_row(), (None, False, "undetermined"))
         self.assertEqual(blocked, 0)
+
+    def test_outstock_channel_persists_and_isolates_state(self):
+        """淘系出库通道落库：PII字段不入库、状态行与交易查询通道互不干扰。"""
+        from bi_agent.sync import (
+            OUTSTOCK_SOURCE, PII_FORBIDDEN_FIELDS, Window, sync_window)
+
+        self._seed_shop("TB1", platform="tb")
+        base = datetime(2026, 8, 16, 0, 0, tzinfo=BEIJING)
+        for source in (OUTSTOCK_SOURCE, "erp.trade.list.query"):
+            self.conn.execute(
+                "INSERT INTO bi.sync_state(source, entity, shop_id, watermark) "
+                "VALUES (%s, 'orders', 'TB1', %s)", (source, base))
+        raw = {
+            "sid": 9001, "tid": "C-TB", "userId": "TB1",
+            "payAmount": "16.90", "payment": "16.90", "cost": "10.00",
+            "grossProfit": "6.90",
+            "payTime": _ms(base + timedelta(hours=1)),
+            "modified": _ms(base + timedelta(hours=2)),
+            "updTime": _ms(base + timedelta(hours=2)),
+            "status": "WAIT_BUYER_CONFIRM_GOODS", "sysStatus": "SELLER_SEND_GOODS",
+            "splitSid": 9000,
+            "buyerNick": "PII-buyerNick", "receiverName": "PII-receiverName",
+            "receiverMobile": "PII-receiverMobile", "openUid": "PII-openUid",
+            "shopName": "PII-shopName",
+            "orders": [{"id": 1, "oid": "L1", "tid": "C-TB", "itemSysId": 10,
+                         "skuSysId": 20, "num": "1", "giftNum": 0,
+                         "payAmount": "16.90", "payment": "16.90", "cost": "10.00",
+                         "buyerNick": "PII-buyerNick"}],
+        }
+        window = Window(base, base + timedelta(days=1))
+        with patch("bi_agent.sync.fetch_window",
+                   side_effect=lambda *a, **k: iter([raw])):
+            accepted = sync_window(self.conn, self._client(), entity="orders",
+                                   shop_id="TB1", window=window,
+                                   mode="incremental", order_source=OUTSTOCK_SOURCE)
+        self.assertEqual(accepted, 1)
+        # 出库通道水位前进；同店交易查询通道状态行不动（sync_state 主键含 source）
+        self.assertEqual(self._state_row("orders", "TB1", OUTSTOCK_SOURCE)[0], window.end)
+        self.assertEqual(self._state_row("orders", "TB1", "erp.trade.list.query")[0], base)
+        order = self.conn.execute(
+            "SELECT source, split_parent_id, commercial_ids, raw_pay_amount "
+            "FROM bi.orders WHERE shop_id='TB1' AND erp_id='9001'").fetchone()
+        self.assertEqual(order[0], OUTSTOCK_SOURCE)
+        self.assertEqual(order[1], "9000")
+        self.assertEqual(order[2], ["C-TB"])
+        self.assertEqual(order[3], Decimal("16.90"))
+        payment = self.conn.execute(
+            "SELECT basis, verified, amount FROM bi.order_payments "
+            "WHERE shop_id='TB1' AND commercial_id='C-TB'").fetchone()
+        self.assertEqual(payment[0], "head")
+        self.assertTrue(payment[1])
+        self.assertEqual(payment[2], Decimal("16.90"))
+        # 表列集合红线：任何事实表都不存在 PII 列，落库路径无从引用
+        pii_columns = self.conn.execute(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema='bi'").fetchall()
+        leaked = {column for _table, column in pii_columns
+                  if column in PII_FORBIDDEN_FIELDS}
+        self.assertEqual(leaked, set())
 
     def test_fetch_window_cursor_pagination_contract(self):
         """4.2：首请求不传cursor；后续传上一页cursor；hasNext=true无游标报错。"""

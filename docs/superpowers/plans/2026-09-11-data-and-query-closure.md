@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**2026-09-12 多来源修订：** 开发主线统一为 main；本计划任务编号保持不变。[原路线图 Task 5/11](2026-09-07-ecommerce-bi-agent.md) 和 [多来源指标设计](../specs/2026-09-12-multi-source-metrics-design.md) 是本计划基础验收及四工作流验收的前置。关闭单保留 inactive、独立认证支付；按平台解析源并求公共覆盖交集；capabilities 真门禁及逐结果 basis 必须进入验收。010–013保留给本计划现有任务，多来源登记如需迁移使用独立014，不形成对未实现010–013的依赖。
+
 **Goal:** 在当前真实名称与确定性查询基础上，交付商品跨店分析、平台 / 店铺图形对比、用户指定价格的上架复核，以及实物 / 店铺库存预警。
 
 **Architecture:** 保留 FastAPI / React、目录引用、固定指标引擎和现有业务图。向薄主 Agent 提供四个业务 Tool，商品与平台对比共用 CommercePerformanceGraph，价审与库存各自使用 ListingPriceAuditGraph / InventoryWatchGraph；授权、数据能力、版本、恢复、结果持久化为共享节点。
@@ -169,8 +171,11 @@ self.assertEqual(retry_deadlines, [original_deadline, original_deadline])
 
 ## Task 5：基础闭环端到端验收（保留，四类工作流最终验收见 Task 11）
 
+**新增前置：** 先完成原路线图 Task 5 的来源注册表、指标能力、时间覆盖、退款披露及 basis 全链路，使用修订后的26题验收。旧20题通过或真实模型14/20仅是历史基线，不代表多来源可用。
+
 **Files:** Modify `backend/tests/acceptance.py`、`docs/runbook.md`、`docs/metrics.md`、`docs/demo.md`；新增验收记录到 `docs/superpowers/research/`。
 
+- [ ] 先验 tb/tm 出库源、fxg 交易源、pdd 无支付能力、混合口径分列、multirange孔洞、未匹配退款可答披露、关闭单100/30/70与补拉收敛、时间语义未认证。
 - [ ] 先在合成库验收：真实名称、歧义澄清、改名追问、近期缺数据、零业务、停用 / 越权、超时、补答失败、重复请求、持久化失败。
 - [ ] 执行现有全量离线套件及新增用例，确认失败和跳过数；测试账号不能使用真实业务库。
 - [ ] 再针对固定店铺 / 窗口核对源报表与结果；支付额按 Decimal 精确比较，计数一致，差异必须有记录，不能用统一容差掩盖缺失字段。
@@ -336,6 +341,8 @@ cd backend
 
 ## Task 11：四工作流验收与首次用户交付
 
+**验收口径补充：** “五平台对比”必须逐店/逐结果标 basis 和能力缺口；fxg平台支付与tb/tm出库不得合为同口径总额或排名；pdd方舟前不计支付，成本/毛利与实耗门槛不变。跨领域 Artifact 继承来源、时间口径和能力版本，旧结果不得在换源后复用。先通过修订后的Q08/Q15与Q21–26，再执行原11个运营场景；逐店真实来源取证另记。
+
 **Files:** Modify `backend/tests/acceptance.py`、`backend/tests/questions.jsonl`、`docs/metrics.md`、`docs/runbook.md`、`docs/demo.md`；Create `backend/tests/test_operator_workflows.py` 与日期化验收报告。
 
 - [ ] 把 spec 第 10 节 11 个验收场景全部实现为集成测试；每领域包含正常、部分来源、无权限和持久化失败四类路径。
@@ -359,7 +366,7 @@ npm run build
 
 1. **接收 Task 2 收尾。** 完成现有 SKU 规格展示及回归；不把更大的渠道 SKU 主档塞回已交付名称任务。
 2. **Task 1 + Task 6。** 一条线核验多平台 / 成本 / 价格 / 库存来源，另一条线完成商品与渠道映射；共享 sync.py 由单一集成人维护。同步推进 Task 3 的契约设计，落地依赖两者字段。
-3. **Task 3 → Task 4 → Task 5。** 多领域状态、版本、Artifact 与恢复基础闭环先可测试。
+3. **Task 3 → Task 4 → 原路线图多来源Task 5 → 本计划Task 5。** 多领域状态、版本、Artifact 与恢复基础闭环先可测试。
 4. **Task 7 → Task 8。** 先交付商品跨店经营分析，再以相同图完成平台 / 店铺比较和图形下钻。可先启用已核验平台，其余平台始终保留能力缺口标签。
 5. **Task 9 与 Task 10。** 价格与库存各自按来源就绪并行推进；只读来源探针 / 导入契约可在第 2 步提前做，不等待经营图完成。
 6. **Task 11。** 四类业务验收；逐能力发布，防止等待所有接口而没有任何可用工作流。

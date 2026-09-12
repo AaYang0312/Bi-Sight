@@ -29,6 +29,16 @@ psql -d bi_agent -f backend/sql/008_data_readiness.sql
 psql -d bi_agent -f backend/sql/009_query_provenance.sql
 ```
 
+单实例：全程持有数据库 advisory 锁，重复启动立即失败。
+
+### 平台路由（淘系 tb/tm）
+
+当前开发基线为 main，旧分支的同步入口统一迁入 backend。淘系“入库完成”与“查询可用”分别验收：[多来源契约](superpowers/specs/2026-09-12-multi-source-metrics-design.md)及[任务5/11](superpowers/plans/2026-09-07-ecommerce-bi-agent.md)。现有查询仍有单源覆盖和退款硬门禁，源注册表/指标能力/basis尚待实现；pdd不得因档案或单据存在被宣称支付可用。
+
+- 订单源按 `bi.shops.platform` 路由：`tb`/`tm` 用 `erp.trade.outstock.simple.query`（销售出库·非敏感字段），当前其余平台（如抖音 fxg）仍回退 `erp.trade.list.query`；未知平台及pdd支付的fail-closed策略由任务5替换该旧回退；`sync_state` 主键含 source，两通道水位/覆盖互不干扰。
+- 先跑 `shops` 刷店铺档案再跑订单命令，缺档案的店会直接报错（防假覆盖）。
+- 淘系口径为 **ERP 出库非敏感字段**，非平台账单口径；收件人/买家昵称/手机号等 PII 字段在规范化入口即丢弃并有守护用例，不得扩列。详见 `docs/superpowers/research/2026-09-12-taoxi-onboarding.md`。
+
 分别启动后端和前端：
 
 ```powershell
