@@ -47,6 +47,12 @@ uv run --env-file .env.sync python -m bi_agent.sync refresh-session
 
 单实例：全程持有数据库 advisory 锁，重复启动立即失败。
 
+### 平台路由（淘系 tb/tm）
+
+- 订单源按 `bi.shops.platform` 路由：`tb`/`tm` 用 `erp.trade.outstock.simple.query`（销售出库·非敏感字段），其余平台（如抖音 fxg）继续用 `erp.trade.list.query`；`sync_state` 主键含 source，两通道水位/覆盖互不干扰。
+- 先跑 `shops` 刷店铺档案再跑订单命令，缺档案的店会直接报错（防假覆盖）。
+- 淘系口径为 **ERP 出库非敏感字段**，非平台账单口径；收件人/买家昵称/手机号等 PII 字段在规范化入口即丢弃并有守护用例，不得扩列。详见 `docs/superpowers/research/2026-09-12-taoxi-onboarding.md`。
+
 ## 页面启动
 
 ```powershell
